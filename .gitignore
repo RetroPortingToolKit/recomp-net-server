@@ -1,0 +1,31 @@
+# Local secrets and environment (never commit)
+.env
+.env.local
+.env.*
+!.env.example
+
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Local databases that may contain real or test PII
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
