@@ -32,6 +32,31 @@ for operators and clients.
   configure log retention accordingly.
 - This server does not write lobby passwords to logs.
 
+## Metrics / usage
+
+Operators can review aggregate usage without scraping application logs:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /stats` | JSON snapshot: live client/lobby/room counts, live counts by `game_name` / `game_id`, process-lifetime totals |
+| `GET /stats/ui` | Small browser page that polls `/stats` |
+| `GET /metrics` | Prometheus text exposition (HTTP request metrics + recomp_* counters/gauges) |
+
+What metrics include:
+
+- Counts of connects, lobby/room creates, joins, join failures (by result code),
+  match starts, TURN credential mints, and ICE signal relays
+- Gauges for currently connected WS clients, open WS lobbies, open HTTP rooms
+
+What metrics intentionally omit:
+
+- Display names, player ids, peer IPs, lobby passwords, and ICE SDP payloads
+- Per-game labels on Prometheus series (game breakdowns are only in `/stats`
+  from current in-memory lobbies/rooms, bounded by active lobby limits)
+
+Process-lifetime totals reset on restart unless scraped into an external
+time-series store (e.g. Prometheus + Grafana).
+
 ## Operator responsibilities
 
 - Run over TLS at the reverse-proxy edge for public deployments.

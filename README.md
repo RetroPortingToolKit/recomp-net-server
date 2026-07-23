@@ -24,6 +24,16 @@ Coturn / ICE TURN: [docs/COTURN.md](docs/COTURN.md)
 Privacy: [docs/PRIVACY.md](docs/PRIVACY.md)  
 Secrets: [docs/SECURITY.md](docs/SECURITY.md)
 
+## Usage metrics
+
+| Endpoint | Use |
+|----------|-----|
+| `GET /stats` | JSON live counts + process totals |
+| `GET /stats/ui` | Browser glance page (auto-refresh) |
+| `GET /metrics` | Prometheus scrape |
+
+See [docs/PRIVACY.md](docs/PRIVACY.md) for what is (and is not) recorded.
+
 ## Quick start (local)
 
 Clients often default to `ws://127.0.0.1:8765` for local bring-up.

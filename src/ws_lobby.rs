@@ -14,13 +14,14 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::metrics;
 use crate::AppState;
 
 const MAX_SLOTS: usize = 5;
@@ -88,6 +89,24 @@ impl Default for HubInner {
 impl WsLobbyHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn client_count(&self) -> usize {
+        self.inner.lock().await.clients.len()
+    }
+
+    pub async fn lobby_count(&self) -> usize {
+        self.inner.lock().await.lobbies.len()
+    }
+
+    /// Live lobby counts keyed by `game_name` (for `/stats` only).
+    pub async fn counts_by_game(&self) -> BTreeMap<String, usize> {
+        let g = self.inner.lock().await;
+        let mut out = BTreeMap::new();
+        for lobby in g.lobbies.values() {
+            *out.entry(lobby.game_name.clone()).or_insert(0) += 1;
+        }
+        out
     }
 }
 
@@ -327,6 +346,7 @@ async fn destroy_lobby(hub: &WsLobbyHub, lobby_id: &str) {
         let Some(l) = g.lobbies.remove(lobby_id) else {
             return;
         };
+        metrics::ws_lobby_destroyed();
         let members: Vec<String> = l
             .slots
             .iter()
@@ -408,6 +428,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
         return;
     }
     info!(%player_id, %peer_ip, "ws lobby client connected");
+    metrics::ws_connected();
 
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
@@ -459,6 +480,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
         g.clients.remove(&player_id);
     }
     info!(%player_id, "ws lobby client disconnected");
+    metrics::ws_disconnected();
 }
 
 async fn handle_text(
@@ -670,6 +692,7 @@ async fn handle_create(
     }
     send_to(hub, player_id, created.to_string()).await;
     broadcast_list(hub).await;
+    metrics::ws_lobby_created();
     Ok(())
 }
 
@@ -754,6 +777,7 @@ async fn handle_join(
 
     match outcome {
         SeatResult::Err(code) => {
+            metrics::ws_lobby_join_fail(code);
             send_to(
                 hub,
                 player_id,
@@ -784,6 +808,7 @@ async fn handle_join(
             send_to(hub, player_id, joined.to_string()).await;
             emit_lobby_update(hub, &lobby_id).await;
             broadcast_list(hub).await;
+            metrics::ws_lobby_join_ok();
             Ok(())
         }
     }
@@ -1235,6 +1260,7 @@ async fn handle_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(
             for m in members {
                 send_to(hub, &m, msg.clone()).await;
             }
+            metrics::ws_lobby_started();
         }
     }
     Ok(())
@@ -1271,6 +1297,9 @@ async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<
             .collect();
         (fwd, targets)
     };
+    if !targets.is_empty() {
+        metrics::ws_signal_relayed();
+    }
     for t in targets {
         send_to(hub, &t, fwd.clone()).await;
     }

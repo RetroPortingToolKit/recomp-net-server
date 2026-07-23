@@ -65,6 +65,17 @@ this server relays signaling and can mint TURN credentials. Coturn runs
 beside the lobby — configure it per [COTURN.md](COTURN.md). The secret that
 must stay in lockstep is `COTURN_STATIC_AUTH_SECRET` ↔ `static-auth-secret`.
 
+## Usage metrics
+
+| Endpoint | Use |
+|----------|-----|
+| `GET /stats` | JSON: live WS/HTTP lobby counts, by-game breakdown, process totals |
+| `GET /stats/ui` | Small HTML dashboard that polls `/stats` |
+| `GET /metrics` | Prometheus (`recomp_*` counters/gauges + HTTP request metrics) |
+
+Aggregates only — no display names, IPs, or ICE payloads. Details:
+[PRIVACY.md](PRIVACY.md).
+
 ## Configuration
 
 - Copy [`.env.example`](../.env.example) → `.env` for local runs.
