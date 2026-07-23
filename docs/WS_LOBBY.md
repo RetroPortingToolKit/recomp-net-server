@@ -223,11 +223,32 @@ Each client then starts delay-sync with the LAN endpoints from the message
 to boot netplay when the peer endpoint is empty. Guests apply `match_caps`
 (when present) before booting so both peers share sim-affecting settings.
 
-## Leave / close
+## Leave / close / kick
 
 ```json
 { "op": "leave" }
 ```
+
+Host may remove a guest (not the host player / not self):
+
+```json
+{ "op": "kick", "slot": 1 }
+```
+
+Errors: `not_host`, `bad_slot`, `empty_slot`, `cannot_kick`.
+
+The kicked player receives `{ "op": "kicked", "ok": true, "lobby_id": "…" }`.
+Remaining members get `lobby_update` (ready flags cleared, like guest leave).
+
+Host may swap (or move into an empty) seat. Clears ready flags and broadcasts
+`lobby_update` so every peer refreshes the member table and `local_slot`:
+
+```json
+{ "op": "move", "from_slot": 0, "to_slot": 1 }
+```
+
+`slot` is accepted as an alias for `from_slot`. Errors: `not_in_lobby`,
+`not_host`, `gone`, `bad_slot`, `empty_slot`.
 
 Host disconnect or `{ "op": "close" }` destroys the lobby and notifies members
 with `lobby_closed`.

@@ -141,6 +141,14 @@ struct InMsg {
     /// Host sim settings blob (aspect, turbo_loads, bios_hle, input_delay, …).
     #[serde(default)]
     match_caps: Option<Value>,
+    #[serde(default)]
+    slot: Option<usize>,
+    /// Host slot move: source index (paired with `to_slot`).
+    #[serde(default)]
+    from_slot: Option<usize>,
+    /// Host slot move: destination index (paired with `from_slot` or `slot`).
+    #[serde(default)]
+    to_slot: Option<usize>,
 }
 
 fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
@@ -495,6 +503,8 @@ async fn handle_text(
             client_leave(hub, player_id).await;
             send_to(hub, player_id, json!({ "op": "left", "ok": true }).to_string()).await;
         }
+        "kick" => handle_kick(hub, player_id, msg).await?,
+        "move" => handle_move(hub, player_id, msg).await?,
         "close" => {
             let lid = {
                 let g = hub.inner.lock().await;
@@ -645,10 +655,14 @@ async fn handle_create(
         "local_slot": 0,
         "host_endpoint": host_endpoint,
         "guest_endpoint": "",
+        "host_player_id": player_id,
+        "player_count": 1,
+        "max_slots": max_slots,
         "slots": [{
             "slot": 0,
             "player_id": player_id,
             "display_name": display_name,
+            "ready": false,
         }],
     });
     if let Some(caps) = match_caps {
@@ -851,6 +865,177 @@ fn seat_joiner_locked(
     }
 }
 
+async fn handle_kick(
+    hub: &WsLobbyHub,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let slot = msg.slot.ok_or("missing slot")?;
+    struct KickOk {
+        lid: String,
+        victim: String,
+    }
+    let outcome: Option<KickOk> = {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = g
+            .clients
+            .get(player_id)
+            .and_then(|c| c.lobby_id.clone())
+        else {
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get_mut(&lid) else {
+            return Ok(());
+        };
+        if lobby.host_player_id != player_id {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_host", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        if slot >= lobby.slots.len() {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "bad_slot", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        let Some(victim) = lobby.slots[slot].as_ref().map(|s| s.player_id.clone()) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "empty_slot", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        if victim == lobby.host_player_id || victim == player_id {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "cannot_kick", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        lobby.slots[slot] = None;
+        lobby.guest_endpoint.clear();
+        for s in lobby.slots.iter_mut().flatten() {
+            s.ready = false;
+        }
+        if let Some(c) = g.clients.get_mut(&victim) {
+            c.lobby_id = None;
+        }
+        Some(KickOk { lid, victim })
+    };
+    if let Some(KickOk { lid, victim }) = outcome {
+        send_to(
+            hub,
+            &victim,
+            json!({ "op": "kicked", "ok": true, "lobby_id": lid }).to_string(),
+        )
+        .await;
+        emit_lobby_update(hub, &lid).await;
+        broadcast_list(hub).await;
+    }
+    Ok(())
+}
+
+/// Host-only: swap (or move into an empty) seat. Broadcasts `lobby_update`.
+async fn handle_move(
+    hub: &WsLobbyHub,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let from = msg.from_slot.or(msg.slot);
+    let to = msg.to_slot;
+    let (Some(from), Some(to)) = (from, to) else {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "bad_slot", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+    if from == to {
+        return Ok(());
+    }
+    let lid = {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = g
+            .clients
+            .get(player_id)
+            .and_then(|c| c.lobby_id.clone())
+        else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_in_lobby", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get_mut(&lid) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "gone", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        if lobby.host_player_id != player_id {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_host", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        if from >= lobby.slots.len() || to >= lobby.slots.len() {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "bad_slot", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        if lobby.slots[from].is_none() {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "empty_slot", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        lobby.slots.swap(from, to);
+        for s in lobby.slots.iter_mut().flatten() {
+            s.ready = false;
+        }
+        lid
+    };
+    emit_lobby_update(hub, &lid).await;
+    Ok(())
+}
+
 async fn handle_set_match_caps(
     hub: &WsLobbyHub,
     player_id: &str,
@@ -977,9 +1162,9 @@ async fn handle_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(
             if n < 2 {
                 break 'out StartOut::Err("need_players");
             }
-            if !lobby.slots.iter().flatten().all(|s| s.ready) {
-                break 'out StartOut::Err("not_all_ready");
-            }
+            /* Host Start Lobby is the launch authority. Ready flags remain for
+             * lobby_update / UI, but must not block start when the client has
+             * no Ready toggle (and rematch clears ready on soft-return). */
             if lobby.host_endpoint.is_empty() || lobby.guest_endpoint.is_empty() {
                 /* Guest never completed join endpoint rewrite — refuse rather
                  * than launch into a HELLO hang (host peer would be empty). */
