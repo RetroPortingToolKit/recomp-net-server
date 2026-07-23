@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-const MAX_SLOTS: usize = 4;
+const MAX_SLOTS: usize = 5;
 const MAX_LOBBIES: usize = 64;
 
 #[derive(Clone)]
