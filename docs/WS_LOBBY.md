@@ -186,7 +186,9 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
-Client → server (host only; requires `player_count >= 2` and every slot ready):
+Client → server (host only; requires `player_count >= 2` and both peer
+endpoints). Ready flags are informational only — host Play is the launch
+authority (no Ready toggle in recomp-ui):
 
 ```json
 { "op": "start", "match_caps": { "v": 1, "…": "…" } }
@@ -194,13 +196,13 @@ Client → server (host only; requires `player_count >= 2` and every slot ready)
 
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
-`need_players`, `not_all_ready`, `missing_endpoints`.
+`need_players`, `missing_endpoints`.
 
 On success the server:
 
 1. Allocates a **new** `session_id` (monotonic) for this match — rematch after
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
-2. Clears every slot’s `ready` so rematch requires Ready again.
+2. Clears every slot’s `ready` (clients auto-ready again for rematch).
 3. Broadcasts to **all** members:
 
 ```json
