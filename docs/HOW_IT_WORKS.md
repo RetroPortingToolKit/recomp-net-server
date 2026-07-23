@@ -58,10 +58,18 @@ See [LOBBY.md](LOBBY.md). Used by hosts that prefer REST room create/join and
 push ICE envelopes through `/v1/rooms/.../signals`. Same trust boundary: server
 authoritative for membership and `session_id`, not for sim state.
 
+## ICE / TURN (optional)
+
+LAN UDP works without Coturn. For NAT traversal, peers use ICE (libjuice);
+this server relays signaling and can mint TURN credentials. Coturn runs
+beside the lobby — configure it per [COTURN.md](COTURN.md). The secret that
+must stay in lockstep is `COTURN_STATIC_AUTH_SECRET` ↔ `static-auth-secret`.
+
 ## Configuration
 
 - Copy [`.env.example`](../.env.example) → `.env` for local runs.
 - Secrets and auth: [SECURITY.md](SECURITY.md).
+- Coturn / TURNS / nginx TLS: [COTURN.md](COTURN.md).
 - Privacy of collected fields: [PRIVACY.md](PRIVACY.md).
 
 ## Running for MotK
