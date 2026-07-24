@@ -545,12 +545,93 @@ async fn handle_text(
             }
         }
         "signal" => handle_signal(hub, player_id, msg).await?,
+        "get_turn_credentials" => handle_get_turn_credentials(hub, player_id).await?,
         other => {
             send_to(
                 hub,
                 player_id,
                 json!({ "op": "error", "code": "unknown_op", "detail": other, "ok": false })
                     .to_string(),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_get_turn_credentials(
+    hub: &WsLobbyHub,
+    player_id: &str,
+) -> Result<(), String> {
+    use crate::turn_credentials;
+
+    let Ok(uuid) = Uuid::parse_str(player_id) else {
+        send_to(
+            hub,
+            player_id,
+            json!({
+                "op": "turn_credentials",
+                "ok": false,
+                "error": "bad_player_id"
+            })
+            .to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+
+    let cfg = match turn_credentials::TurnCredentialConfig::from_env() {
+        Some(c) => c,
+        None => {
+            send_to(
+                hub,
+                player_id,
+                json!({
+                    "op": "turn_credentials",
+                    "ok": false,
+                    "error": "coturn_unconfigured"
+                })
+                .to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    match turn_credentials::issue_credentials(&cfg, &uuid) {
+        Ok((username, password)) => {
+            metrics::http_turn_credentials_issued();
+            send_to(
+                hub,
+                player_id,
+                json!({
+                    "op": "turn_credentials",
+                    "ok": true,
+                    "stun_host": cfg.stun_host,
+                    "stun_port": cfg.stun_port,
+                    "turn_host": cfg.turn_host,
+                    "turn_port": cfg.turn_port,
+                    "turns_port": cfg.turns_port,
+                    "realm": cfg.realm,
+                    "username": username,
+                    "password": password,
+                    "ttl_secs": cfg.ttl_secs
+                })
+                .to_string(),
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(%player_id, error = %e, "ws turn credential mint failed");
+            send_to(
+                hub,
+                player_id,
+                json!({
+                    "op": "turn_credentials",
+                    "ok": false,
+                    "error": "mint_failed"
+                })
+                .to_string(),
             )
             .await;
         }

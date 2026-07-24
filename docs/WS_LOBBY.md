@@ -271,6 +271,45 @@ with `lobby_closed`.
 Server forwards to the other member(s). Used for ICE (`RNetSignal`);
 LAN delay-sync does not require it.
 
+## TURN credentials (ICE)
+
+WS lobby sessions only receive `player_id` on `welcome` (no HTTP Bearer
+token), so snesrecomp mints Coturn credentials over the socket instead of
+`GET /v1/turn-credentials`.
+
+Client → server:
+
+```json
+{ "op": "get_turn_credentials" }
+```
+
+Server → client (Coturn configured):
+
+```json
+{
+  "op": "turn_credentials",
+  "ok": true,
+  "stun_host": "coturn.example.com",
+  "stun_port": 3478,
+  "turn_host": "coturn.example.com",
+  "turn_port": 3478,
+  "turns_port": 5349,
+  "realm": "recomp-net",
+  "username": "<expiry>:<player_id>",
+  "password": "<base64 HMAC>",
+  "ttl_secs": 86400
+}
+```
+
+Server → client when Coturn env is missing or mint fails:
+
+```json
+{ "op": "turn_credentials", "ok": false, "error": "coturn_unconfigured" }
+```
+
+Same HMAC mint as HTTP (`docs/COTURN.md`). Clients should request after
+`welcome` / before ICE gather; ICE still prefers host/srflx over relay.
+
 ## Keepalive
 
 Either side may send `{ "op": "ping" }`; reply is `{ "op": "pong" }`.

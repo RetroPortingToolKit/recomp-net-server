@@ -119,9 +119,14 @@ COTURN_HOST=coturn.technicallycomputers.ca
 # COTURN_CREDENTIAL_TTL_SECS=86400
 ```
 
-After both sides share the secret and realm, `GET /v1/turn-credentials` (with
-a valid player identity per [LOBBY.md](LOBBY.md)) should return hosts/ports plus
-ephemeral `username` / `password` for `RNetIceConfig`.
+After both sides share the secret and realm, clients can mint credentials via:
+
+- HTTP `GET /v1/turn-credentials` (Bearer auth — [LOBBY.md](LOBBY.md))
+- WebSocket `{ "op": "get_turn_credentials" }` for snesrecomp WS lobby
+  sessions that only have `player_id` ([WS_LOBBY.md](WS_LOBBY.md))
+
+Both return hosts/ports plus ephemeral `username` / `password` for
+`RNetIceConfig`.
 
 ## Checklist
 
