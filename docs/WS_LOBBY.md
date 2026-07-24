@@ -186,9 +186,12 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
-Client → server (host only; requires `player_count >= 2` and both peer
-endpoints). Ready flags are informational only — host Play is the launch
-authority (no Ready toggle in recomp-ui):
+Client → server (host only; requires `player_count >= 2`). Direct 2P P2P needs
+both rewritten peer endpoints. Host-as-relay (`max_slots >= 3`, default when
+`force_input_relay` is false) only requires `host_endpoint` — guests dial the
+host hub. When `match_caps.force_input_relay` is true, the server opens its
+UDP input relay and rewrites endpoints on launch. Ready flags are
+informational only — host Play is the launch authority:
 
 ```json
 { "op": "start", "match_caps": { "v": 1, "…": "…" } }
@@ -196,14 +199,18 @@ authority (no Ready toggle in recomp-ui):
 
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
-`need_players`, `missing_endpoints`.
+`need_players`, `missing_endpoints`, `relay_unavailable`.
 
 On success the server:
 
 1. Allocates a **new** `session_id` (monotonic) for this match — rematch after
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
-2. Clears every slot’s `ready` (clients auto-ready again for rematch).
-3. Broadcasts to **all** members:
+2. If `match_caps.force_input_relay` is true, opens a UDP relay session and
+   sets `host_endpoint` / `guest_endpoint` (and `relay_endpoint`) to the
+   advertised relay address (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`).
+   Otherwise 3+ clients use host-as-relay (no server rewrite).
+3. Clears every slot’s `ready` (clients auto-ready again for rematch).
+4. Broadcasts to **all** members:
 
 ```json
 {
@@ -213,6 +220,7 @@ On success the server:
   "session_id": 2,
   "host_endpoint": "…",
   "guest_endpoint": "…",
+  "relay_endpoint": "public.example:8777",
   "player_count": 2,
   "max_slots": 2,
   "slots": [ … ],
@@ -220,9 +228,11 @@ On success the server:
 }
 ```
 
-Each client then starts delay-sync with the LAN endpoints from the message
-(local bind from create/join; peer = the other endpoint). Clients must refuse
-to boot netplay when the peer endpoint is empty. Guests apply `match_caps`
+`relay_endpoint` is present only when the server opened an input-relay
+session. Each client then starts delay-sync with the LAN endpoints from the
+message (local bind from create/join; peer = the other endpoint, or the
+relay when `relay_endpoint` / force-relay is set). Clients must refuse to
+boot netplay when the peer endpoint is empty. Guests apply `match_caps`
 (when present) before booting so both peers share sim-affecting settings.
 
 ## Leave / close / kick

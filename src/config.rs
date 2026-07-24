@@ -27,6 +27,14 @@ pub struct Config {
     pub protocol_magic: u32,
     /// Empty = allow any non-empty game_id (dev). Otherwise exact match allowlist.
     pub game_allowlist: Vec<String>,
+    /// UDP delay-sync input relay (star fan-out). Off disables open_session.
+    pub input_relay_enabled: bool,
+    /// Socket bind for the input relay (e.g. `0.0.0.0:8777`).
+    pub input_relay_bind: String,
+    /// Host string written into launch endpoints (public DNS / IP clients dial).
+    pub input_relay_advertise_host: String,
+    /// Port written into launch endpoints (may differ from bind when NAT'd).
+    pub input_relay_advertise_port: u16,
 }
 
 impl Config {
@@ -68,6 +76,23 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let input_relay_enabled = match env::var("INPUT_RELAY_ENABLED") {
+            Ok(s) if !s.trim().is_empty() => parse_bool_env(&s),
+            _ => true,
+        };
+        let input_relay_bind =
+            env::var("INPUT_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8777".to_string());
+        let advertise_port_default = input_relay_bind
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(8777);
+        let input_relay_advertise_port =
+            parse_u16_env("INPUT_RELAY_ADVERTISE_PORT", advertise_port_default)?;
+        let input_relay_advertise_host = env::var("INPUT_RELAY_ADVERTISE_HOST")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
         Ok(Config {
             bind_addr,
             database_url,
@@ -80,6 +105,10 @@ impl Config {
             heartbeat_timeout_secs,
             protocol_magic,
             game_allowlist,
+            input_relay_enabled,
+            input_relay_bind,
+            input_relay_advertise_host,
+            input_relay_advertise_port,
         })
     }
 
@@ -130,6 +159,15 @@ fn parse_u64_env(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+fn parse_u16_env(name: &str, default: u16) -> Result<u16> {
+    match env::var(name) {
+        Ok(s) if !s.is_empty() => s
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("{name} must be a u16")),
+        _ => Ok(default),
+    }
 }
 
 fn parse_u32_env(name: &str, default: u32) -> Result<u32> {

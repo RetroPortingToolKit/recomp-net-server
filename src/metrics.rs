@@ -22,6 +22,10 @@ static HTTP_ROOM_JOINS: AtomicU64 = AtomicU64::new(0);
 static HTTP_ROOM_JOIN_FAILURES: AtomicU64 = AtomicU64::new(0);
 static HTTP_ROOM_STARTS: AtomicU64 = AtomicU64::new(0);
 static HTTP_TURN_CREDENTIALS: AtomicU64 = AtomicU64::new(0);
+static INPUT_RELAY_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
+static INPUT_RELAY_SESSIONS_CLOSED: AtomicU64 = AtomicU64::new(0);
+static INPUT_RELAY_FORWARDS: AtomicU64 = AtomicU64::new(0);
+static INPUT_RELAY_DROPS: AtomicU64 = AtomicU64::new(0);
 
 pub fn describe() {
     describe_counter!(
@@ -78,6 +82,26 @@ pub fn describe() {
     );
     describe_gauge!("recomp_ws_lobbies", "Currently open WebSocket lobbies");
     describe_gauge!("recomp_http_rooms", "Currently open HTTP /v1 rooms");
+    describe_counter!(
+        "recomp_input_relay_sessions_opened_total",
+        "Input-relay sessions allocated at match start"
+    );
+    describe_counter!(
+        "recomp_input_relay_sessions_closed_total",
+        "Input-relay sessions closed (lobby destroy / rematch)"
+    );
+    describe_counter!(
+        "recomp_input_relay_forwards_total",
+        "Datagrams successfully fan-out to peer seats"
+    );
+    describe_counter!(
+        "recomp_input_relay_drops_total",
+        "Datagrams dropped by the input relay"
+    );
+    describe_gauge!(
+        "recomp_input_relay_sessions",
+        "Live input-relay sessions"
+    );
 }
 
 fn bump(atomic: &AtomicU64) -> u64 {
@@ -154,6 +178,33 @@ pub fn http_turn_credentials_issued() {
     counter!("recomp_http_turn_credentials_total").increment(1);
 }
 
+pub fn input_relay_session_opened() {
+    bump(&INPUT_RELAY_SESSIONS_OPENED);
+    counter!("recomp_input_relay_sessions_opened_total").increment(1);
+}
+
+pub fn input_relay_session_closed() {
+    bump(&INPUT_RELAY_SESSIONS_CLOSED);
+    counter!("recomp_input_relay_sessions_closed_total").increment(1);
+}
+
+pub fn input_relay_forwarded(n: u64) {
+    if n == 0 {
+        return;
+    }
+    INPUT_RELAY_FORWARDS.fetch_add(n, Ordering::Relaxed);
+    counter!("recomp_input_relay_forwards_total").increment(n);
+}
+
+pub fn input_relay_drop(reason: &'static str) {
+    bump(&INPUT_RELAY_DROPS);
+    counter!("recomp_input_relay_drops_total", "reason" => reason).increment(1);
+}
+
+pub fn set_input_relay_sessions(n: usize) {
+    gauge!("recomp_input_relay_sessions").set(n as f64);
+}
+
 pub fn set_gauges(ws_clients: usize, ws_lobbies: usize, http_rooms: usize) {
     gauge!("recomp_ws_clients").set(ws_clients as f64);
     gauge!("recomp_ws_lobbies").set(ws_lobbies as f64);
@@ -176,6 +227,10 @@ pub struct Totals {
     pub http_room_join_failures: u64,
     pub http_room_starts: u64,
     pub http_turn_credentials: u64,
+    pub input_relay_sessions_opened: u64,
+    pub input_relay_sessions_closed: u64,
+    pub input_relay_forwards: u64,
+    pub input_relay_drops: u64,
 }
 
 pub fn totals() -> Totals {
@@ -194,6 +249,10 @@ pub fn totals() -> Totals {
         http_room_join_failures: HTTP_ROOM_JOIN_FAILURES.load(Ordering::Relaxed),
         http_room_starts: HTTP_ROOM_STARTS.load(Ordering::Relaxed),
         http_turn_credentials: HTTP_TURN_CREDENTIALS.load(Ordering::Relaxed),
+        input_relay_sessions_opened: INPUT_RELAY_SESSIONS_OPENED.load(Ordering::Relaxed),
+        input_relay_sessions_closed: INPUT_RELAY_SESSIONS_CLOSED.load(Ordering::Relaxed),
+        input_relay_forwards: INPUT_RELAY_FORWARDS.load(Ordering::Relaxed),
+        input_relay_drops: INPUT_RELAY_DROPS.load(Ordering::Relaxed),
     }
 }
 

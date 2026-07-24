@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::metrics;
 use crate::AppState;
 
-const MAX_SLOTS: usize = 5;
+const MAX_SLOTS: usize = 8;
 const MAX_LOBBIES: usize = 64;
 
 #[derive(Clone)]
@@ -53,6 +53,8 @@ struct Lobby {
     slots: Vec<Option<Slot>>,
     /* Host-authoritative sim-affecting settings (opaque JSON object). */
     match_caps: Option<Value>,
+    /// Active UDP input-relay session (closed on destroy / rematch).
+    relay_session_id: Option<u32>,
 }
 
 struct ClientMeta {
@@ -267,6 +269,38 @@ fn player_count(lobby: &Lobby) -> usize {
     lobby.slots.iter().filter(|s| s.is_some()).count()
 }
 
+/// Make `requested` unique among occupied lobby seats (`Alex`, `Alex (2)`, …).
+fn unique_display_name(lobby: &Lobby, requested: &str, skip_player_id: Option<&str>) -> String {
+    let base = {
+        let t = requested.trim();
+        if t.is_empty() {
+            "Guest"
+        } else {
+            t
+        }
+    };
+    let taken = |name: &str| {
+        lobby.slots.iter().flatten().any(|s| {
+            if let Some(skip) = skip_player_id {
+                if s.player_id == skip {
+                    return false;
+                }
+            }
+            s.display_name == name
+        })
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for n in 2..=64 {
+        let candidate = format!("{base} ({n})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{base} ({})", &Uuid::new_v4().to_string()[..8])
+}
+
 fn lobby_list_json(hub: &HubInner) -> String {
     lobby_list_json_filtered(hub, None, None)
 }
@@ -340,8 +374,9 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
     }
 }
 
-async fn destroy_lobby(hub: &WsLobbyHub, lobby_id: &str) {
-    let members = {
+async fn destroy_lobby(state: &AppState, lobby_id: &str) {
+    let hub = &state.ws_lobby;
+    let (members, relay_sid) = {
         let mut g = hub.inner.lock().await;
         let Some(l) = g.lobbies.remove(lobby_id) else {
             return;
@@ -357,8 +392,11 @@ async fn destroy_lobby(hub: &WsLobbyHub, lobby_id: &str) {
                 c.lobby_id = None;
             }
         }
-        members
+        (members, l.relay_session_id)
     };
+    if let Some(sid) = relay_sid {
+        state.input_relay.close_session(sid).await;
+    }
     let note = json!({ "op": "lobby_closed", "lobby_id": lobby_id, "ok": true }).to_string();
     for m in members {
         send_to(hub, &m, note.clone()).await;
@@ -366,7 +404,8 @@ async fn destroy_lobby(hub: &WsLobbyHub, lobby_id: &str) {
     broadcast_list(hub).await;
 }
 
-async fn client_leave(hub: &WsLobbyHub, player_id: &str) {
+async fn client_leave(state: &AppState, player_id: &str) {
+    let hub = &state.ws_lobby;
     let action = {
         let mut g = hub.inner.lock().await;
         let Some(c) = g.clients.get_mut(player_id) else {
@@ -394,7 +433,7 @@ async fn client_leave(hub: &WsLobbyHub, player_id: &str) {
     };
     if let Some((lid, is_host)) = action {
         if is_host {
-            destroy_lobby(hub, &lid).await;
+            destroy_lobby(state, &lid).await;
         } else {
             emit_lobby_update(hub, &lid).await;
             broadcast_list(hub).await;
@@ -459,7 +498,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
             Message::Text(text) => {
-                if let Err(e) = handle_text(&hub, &player_id, &peer_ip, &text).await {
+                if let Err(e) = handle_text(&state, &player_id, &peer_ip, &text).await {
                     warn!(%player_id, error = %e, "ws lobby handler error");
                 }
             }
@@ -474,7 +513,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
 
     send_task.abort();
     tick_task.abort();
-    client_leave(&hub, &player_id).await;
+    client_leave(&state, &player_id).await;
     {
         let mut g = hub.inner.lock().await;
         g.clients.remove(&player_id);
@@ -484,11 +523,12 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
 }
 
 async fn handle_text(
-    hub: &WsLobbyHub,
+    state: &AppState,
     player_id: &str,
     peer_ip: &str,
     text: &str,
 ) -> Result<(), String> {
+    let hub = &state.ws_lobby;
     let msg: InMsg = serde_json::from_str(text).map_err(|e| e.to_string())?;
     match msg.op.as_str() {
         "hello" => {
@@ -520,9 +560,9 @@ async fn handle_text(
         "join" => handle_join(hub, player_id, peer_ip, msg).await?,
         "set_ready" => handle_set_ready(hub, player_id, msg).await?,
         "set_match_caps" => handle_set_match_caps(hub, player_id, msg).await?,
-        "start" => handle_start(hub, player_id, msg).await?,
+        "start" => handle_start(state, player_id, msg).await?,
         "leave" => {
-            client_leave(hub, player_id).await;
+            client_leave(state, player_id).await;
             send_to(hub, player_id, json!({ "op": "left", "ok": true }).to_string()).await;
         }
         "kick" => handle_kick(hub, player_id, msg).await?,
@@ -541,7 +581,7 @@ async fn handle_text(
                     })
             };
             if let Some(lid) = lid {
-                destroy_lobby(hub, &lid).await;
+                destroy_lobby(state, &lid).await;
             }
         }
         "signal" => handle_signal(hub, player_id, msg).await?,
@@ -742,6 +782,7 @@ async fn handle_create(
                 session_id,
                 slots,
                 match_caps: match_caps.clone(),
+                relay_session_id: None,
             },
         );
         if let Some(c) = g.clients.get_mut(player_id) {
@@ -914,7 +955,7 @@ fn seat_joiner_locked(
     guest_bind: &str,
     password: Option<&str>,
 ) -> SeatResult {
-    let display_name = g
+    let requested_name = g
         .clients
         .get(player_id)
         .map(|c| c.display_name.clone())
@@ -941,10 +982,11 @@ fn seat_joiner_locked(
         if player_count(lobby) >= lobby.max_slots || lobby.slots.iter().all(|s| s.is_some()) {
             return SeatResult::Err("full");
         }
+        let display_name = unique_display_name(lobby, &requested_name, Some(player_id));
         let slot = lobby.slots.iter().position(|s| s.is_none()).unwrap();
         lobby.slots[slot] = Some(Slot {
             player_id: player_id.to_string(),
-            display_name,
+            display_name: display_name.clone(),
             ready: false,
         });
         for s in lobby.slots.iter_mut().flatten() {
@@ -957,10 +999,12 @@ fn seat_joiner_locked(
             lobby.host_endpoint.clone(),
             lobby.guest_endpoint.clone(),
             lobby.match_caps.clone(),
+            display_name,
         )
     };
     if let Some(c) = g.clients.get_mut(player_id) {
         c.lobby_id = Some(lobby_id.to_string());
+        c.display_name = seated.5.clone();
     }
     SeatResult::Ok {
         slot: seated.0,
@@ -1242,45 +1286,97 @@ async fn handle_set_ready(
     Ok(())
 }
 
-async fn handle_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
     enum StartOut {
         Err(&'static str),
         Ok { msg: String, members: Vec<String> },
     }
+    let hub = &state.ws_lobby;
     let fresh_caps = sanitize_match_caps(msg.match_caps);
-    let outcome = 'out: {
+
+    // Phase 1: validate + allocate session_id (hold lobby lock briefly).
+    let prepared = 'prep: {
         let mut g = hub.inner.lock().await;
         let Some(lid) = g
             .clients
             .get(player_id)
             .and_then(|c| c.lobby_id.clone())
         else {
-            break 'out StartOut::Err("not_in_lobby");
+            break 'prep Err("not_in_lobby");
         };
-        {
-            let Some(lobby) = g.lobbies.get(&lid) else {
-                break 'out StartOut::Err("gone");
-            };
-            if lobby.host_player_id != player_id {
-                break 'out StartOut::Err("not_host");
+        let Some(lobby) = g.lobbies.get(&lid) else {
+            break 'prep Err("gone");
+        };
+        if lobby.host_player_id != player_id {
+            break 'prep Err("not_host");
+        }
+        let n = player_count(lobby);
+        if n < 2 {
+            break 'prep Err("need_players");
+        }
+        let caps_for_relay = fresh_caps.as_ref().or(lobby.match_caps.as_ref()).cloned();
+        let use_relay = crate::input_relay::wants_input_relay(&caps_for_relay, lobby.max_slots);
+        if use_relay && !state.input_relay.enabled() {
+            break 'prep Err("relay_unavailable");
+        }
+        /* 2P P2P needs both rewritten endpoints. Host-as-relay (max_slots >= 3,
+         * no force_input_relay) only needs host_endpoint — guests dial the host
+         * hub; guest_endpoint is a single last-joiner field and must not gate. */
+        let host_as_relay = !use_relay && lobby.max_slots >= 3;
+        if !use_relay {
+            if lobby.host_endpoint.is_empty() {
+                break 'prep Err("missing_endpoints");
             }
-            let n = player_count(lobby);
-            if n < 2 {
-                break 'out StartOut::Err("need_players");
-            }
-            /* Host Start Lobby is the launch authority. Ready flags remain for
-             * lobby_update / UI, but must not block start when the client has
-             * no Ready toggle (and rematch clears ready on soft-return). */
-            if lobby.host_endpoint.is_empty() || lobby.guest_endpoint.is_empty() {
-                /* Guest never completed join endpoint rewrite — refuse rather
-                 * than launch into a HELLO hang (host peer would be empty). */
-                break 'out StartOut::Err("missing_endpoints");
+            if !host_as_relay && lobby.guest_endpoint.is_empty() {
+                break 'prep Err("missing_endpoints");
             }
         }
+        let old_relay = lobby.relay_session_id;
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
+        Ok((lid, sid, n, use_relay, old_relay))
+    };
+
+    let (lid, sid, n, use_relay, old_relay) = match prepared {
+        Ok(v) => v,
+        Err(code) => {
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": code, "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    // Phase 2: open/close UDP relay outside the lobby lock.
+    if let Some(prev) = old_relay {
+        state.input_relay.close_session(prev).await;
+    }
+    let relay_endpoint = if use_relay {
+        match state.input_relay.open_session(sid, n as u8).await {
+            Ok(ep) => Some(ep),
+            Err(e) => {
+                warn!(error = %e, session_id = sid, "input relay open_session failed");
+                send_to(
+                    hub,
+                    player_id,
+                    json!({ "op": "error", "code": "relay_unavailable", "ok": false }).to_string(),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 3: commit lobby state + build launch payload.
+    let outcome = 'out: {
+        let mut g = hub.inner.lock().await;
         let Some(lobby) = g.lobbies.get_mut(&lid) else {
             break 'out StartOut::Err("gone");
         };
@@ -1288,6 +1384,13 @@ async fn handle_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(
             lobby.match_caps = Some(caps);
         }
         lobby.session_id = sid;
+        if let Some(ref ep) = relay_endpoint {
+            lobby.host_endpoint = ep.clone();
+            lobby.guest_endpoint = ep.clone();
+            lobby.relay_session_id = Some(sid);
+        } else {
+            lobby.relay_session_id = None;
+        }
         /* Match start clears ready so a return-to-lobby rematch must re-confirm. */
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
@@ -1323,6 +1426,9 @@ async fn handle_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(
         if let Some(caps) = &lobby.match_caps {
             launch["match_caps"] = caps.clone();
         }
+        if let Some(ep) = &relay_endpoint {
+            launch["relay_endpoint"] = json!(ep);
+        }
         StartOut::Ok {
             msg: launch.to_string(),
             members,
@@ -1330,6 +1436,9 @@ async fn handle_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(
     };
     match outcome {
         StartOut::Err(code) => {
+            if let Some(ep_sid) = relay_endpoint.as_ref().map(|_| sid) {
+                state.input_relay.close_session(ep_sid).await;
+            }
             send_to(
                 hub,
                 player_id,

@@ -19,10 +19,14 @@ for operators and clients.
 
 ## What we do **not** process
 
-- Gameplay pad / input streams (those go peer-to-peer via `recomp-net`)
+- Interpreted pad / sim state (relay forwards opaque `recomp-net` datagrams
+  when input relay is enabled; bytes are not decoded or stored)
 - Disc / ROM contents
 - Screenshots, audio, or video from the guest
 - Long-term plaintext lobby passwords
+
+When input relay is active, ephemeral UDP datagrams for a match traverse the
+server process for fan-out only and are not persisted.
 
 ## Logging
 

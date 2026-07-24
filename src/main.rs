@@ -178,12 +178,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("migrations run")?;
 
+    let input_relay = recomp_net_server::input_relay::InputRelay::start(&config)
+        .await
+        .context("input relay")?;
+
     let state = AppState {
         pool: pool.clone(),
         config: Arc::new(config.clone()),
         rooms: Arc::new(Mutex::new(RoomRegistry::default())),
         signals: Arc::new(Mutex::new(SignalStore::default())),
         ws_lobby: recomp_net_server::ws_lobby::WsLobbyHub::new(),
+        input_relay,
         debug: debug_cli,
     };
 
@@ -212,6 +217,12 @@ async fn main() -> anyhow::Result<()> {
         jwt_configured = config.jwt_secret_current.is_some(),
         database = %db_url,
         turn_configured,
+        input_relay = config.input_relay_enabled,
+        input_relay_bind = %config.input_relay_bind,
+        input_relay_advertise = %format!(
+            "{}:{}",
+            config.input_relay_advertise_host, config.input_relay_advertise_port
+        ),
         allowlist_len = config.game_allowlist.len(),
         debug = debug_cli,
         "starting recomp-net-server"
