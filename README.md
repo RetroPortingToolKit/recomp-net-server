@@ -20,8 +20,19 @@ This server owns:
 It does **not** run the guest sim and never sees gameplay inputs.
 
 Architecture: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)  
+Coturn / ICE TURN: [docs/COTURN.md](docs/COTURN.md)  
 Privacy: [docs/PRIVACY.md](docs/PRIVACY.md)  
 Secrets: [docs/SECURITY.md](docs/SECURITY.md)
+
+## Usage metrics
+
+| Endpoint | Use |
+|----------|-----|
+| `GET /stats` | JSON live counts + process totals |
+| `GET /stats/ui` | Browser glance page (auto-refresh) |
+| `GET /metrics` | Prometheus scrape |
+
+See [docs/PRIVACY.md](docs/PRIVACY.md) for what is (and is not) recorded.
 
 ## Quick start (local)
 
@@ -44,8 +55,14 @@ testing.
 1. Copy [`.env.example`](.env.example) → `.env` and set `BIND_ADDR`.
 2. Optional auth: set `REQUIRE_AUTH=true` and `JWT_SECRET_CURRENT` (see
    [docs/SECURITY.md](docs/SECURITY.md)).
-3. Optional Coturn: set `COTURN_*` for `GET /v1/turn-credentials`.
-4. Put TLS at a reverse proxy in front of public deployments.
+3. Optional Coturn for ICE/TURN: run coturn separately, then set `COTURN_*`
+   so `GET /v1/turn-credentials` can mint short-lived creds. **Critical:**
+   `COTURN_STATIC_AUTH_SECRET` must match coturn’s `static-auth-secret`.
+   Full turnserver example and TLS notes: [docs/COTURN.md](docs/COTURN.md).
+4. Put TLS at a reverse proxy (e.g. nginx) in front of public lobby
+   deployments (`wss://` / `https://`). Give coturn its own valid certs for
+   TURNS (`tls-listening-port`, usually `5349`) so peers get secure relay
+   globally — see [docs/COTURN.md](docs/COTURN.md).
 5. Point game clients at `ws://your-host:8765` (or `wss://…` behind TLS).
 
 Never commit `.env` — it is gitignored.

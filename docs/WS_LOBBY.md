@@ -186,7 +186,12 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
-Client → server (host only; requires `player_count >= 2` and every slot ready):
+Client → server (host only; requires `player_count >= 2`). Direct 2P P2P needs
+both rewritten peer endpoints. Host-as-relay (`max_slots >= 3`, default when
+`force_input_relay` is false) only requires `host_endpoint` — guests dial the
+host hub. When `match_caps.force_input_relay` is true, the server opens its
+UDP input relay and rewrites endpoints on launch. Ready flags are
+informational only — host Play is the launch authority:
 
 ```json
 { "op": "start", "match_caps": { "v": 1, "…": "…" } }
@@ -194,14 +199,18 @@ Client → server (host only; requires `player_count >= 2` and every slot ready)
 
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
-`need_players`, `not_all_ready`, `missing_endpoints`.
+`need_players`, `missing_endpoints`, `relay_unavailable`.
 
 On success the server:
 
 1. Allocates a **new** `session_id` (monotonic) for this match — rematch after
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
-2. Clears every slot’s `ready` so rematch requires Ready again.
-3. Broadcasts to **all** members:
+2. If `match_caps.force_input_relay` is true, opens a UDP relay session and
+   sets `host_endpoint` / `guest_endpoint` (and `relay_endpoint`) to the
+   advertised relay address (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`).
+   Otherwise 3+ clients use host-as-relay (no server rewrite).
+3. Clears every slot’s `ready` (clients auto-ready again for rematch).
+4. Broadcasts to **all** members:
 
 ```json
 {
@@ -211,6 +220,7 @@ On success the server:
   "session_id": 2,
   "host_endpoint": "…",
   "guest_endpoint": "…",
+  "relay_endpoint": "public.example:8777",
   "player_count": 2,
   "max_slots": 2,
   "slots": [ … ],
@@ -218,9 +228,11 @@ On success the server:
 }
 ```
 
-Each client then starts delay-sync with the LAN endpoints from the message
-(local bind from create/join; peer = the other endpoint). Clients must refuse
-to boot netplay when the peer endpoint is empty. Guests apply `match_caps`
+`relay_endpoint` is present only when the server opened an input-relay
+session. Each client then starts delay-sync with the LAN endpoints from the
+message (local bind from create/join; peer = the other endpoint, or the
+relay when `relay_endpoint` / force-relay is set). Clients must refuse to
+boot netplay when the peer endpoint is empty. Guests apply `match_caps`
 (when present) before booting so both peers share sim-affecting settings.
 
 ## Leave / close / kick
@@ -268,6 +280,45 @@ with `lobby_closed`.
 
 Server forwards to the other member(s). Used for ICE (`RNetSignal`);
 LAN delay-sync does not require it.
+
+## TURN credentials (ICE)
+
+WS lobby sessions only receive `player_id` on `welcome` (no HTTP Bearer
+token), so snesrecomp mints Coturn credentials over the socket instead of
+`GET /v1/turn-credentials`.
+
+Client → server:
+
+```json
+{ "op": "get_turn_credentials" }
+```
+
+Server → client (Coturn configured):
+
+```json
+{
+  "op": "turn_credentials",
+  "ok": true,
+  "stun_host": "coturn.example.com",
+  "stun_port": 3478,
+  "turn_host": "coturn.example.com",
+  "turn_port": 3478,
+  "turns_port": 5349,
+  "realm": "recomp-net",
+  "username": "<expiry>:<player_id>",
+  "password": "<base64 HMAC>",
+  "ttl_secs": 86400
+}
+```
+
+Server → client when Coturn env is missing or mint fails:
+
+```json
+{ "op": "turn_credentials", "ok": false, "error": "coturn_unconfigured" }
+```
+
+Same HMAC mint as HTTP (`docs/COTURN.md`). Clients should request after
+`welcome` / before ICE gather; ICE still prefers host/srflx over relay.
 
 ## Keepalive
 

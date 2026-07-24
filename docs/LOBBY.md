@@ -29,7 +29,10 @@ delay-sync INPUT exchange after this server hands out `RNetConfig` fields and
 | `LOBBY_PROTOCOL_MAGIC` | Hex or decimal `protocol_magic` (default `0x524E4554` / `"RNET"`). |
 | `LOBBY_GAME_ALLOWLIST` | Comma-separated `game_id` values; empty = allow any non-empty id (dev). |
 
-Coturn variables match BattleShip-Server’s TURN credential shape; see `.env.example`.
+Coturn variables match BattleShip-Server’s TURN credential shape; see
+[`.env.example`](../.env.example) and the full Coturn / TLS guide in
+[COTURN.md](COTURN.md). **`COTURN_STATIC_AUTH_SECRET` must equal coturn’s
+`static-auth-secret`.**
 
 ## Game identity
 
@@ -156,7 +159,9 @@ upgrade on the same path family.
 ### `GET /v1/turn-credentials`
 
 When coturn is configured, returns STUN/TURN hosts/ports plus ephemeral
-username/password for libjuice (`RNetIceConfig`).
+username/password for libjuice (`RNetIceConfig`). Requires
+`COTURN_STATIC_AUTH_SECRET` + `COTURN_HOST` (and matching coturn
+`use-auth-secret` / `static-auth-secret`). Setup: [COTURN.md](COTURN.md).
 
 ## Mapping to recomp-net
 

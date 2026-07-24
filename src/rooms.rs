@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -110,7 +110,7 @@ impl RoomRegistry {
         protocol_magic: u32,
         is_private: bool,
     ) -> Result<Room, RoomError> {
-        if !(2..=4).contains(&slot_count) {
+        if !(2..=5).contains(&slot_count) {
             return Err(RoomError::BadSlotCount);
         }
         let now = Utc::now();
@@ -339,6 +339,23 @@ impl RoomRegistry {
             .get(room_id)
             .map(|r| r.members.iter().map(|m| m.player_id).collect())
             .unwrap_or_default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rooms.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rooms.is_empty()
+    }
+
+    /// Live room counts keyed by `game_id` (for `/stats` only).
+    pub fn counts_by_game(&self) -> BTreeMap<String, usize> {
+        let mut out = BTreeMap::new();
+        for room in self.rooms.values() {
+            *out.entry(room.game_id.clone()).or_insert(0) += 1;
+        }
+        out
     }
 }
 

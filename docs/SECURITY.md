@@ -27,7 +27,7 @@ platform’s secrets injector).
 | `REQUIRE_AUTH` | No | If `1`/`true`, server refuses to start unless JWT signing secrets are set. |
 | `JWT_SECRET_CURRENT` | **Yes** | HMAC key for signing **short-lived** session/player tokens. |
 | `JWT_SECRET_PREVIOUS` | **Yes** | Optional second key still accepted while rotating `JWT_SECRET_CURRENT`. |
-| `COTURN_STATIC_AUTH_SECRET` | **Yes** | Shared secret for coturn `use-auth-secret` / REST HMAC passwords. |
+| `COTURN_STATIC_AUTH_SECRET` | **Yes** | Shared secret for coturn `use-auth-secret` / REST HMAC passwords. **Must match** coturn `static-auth-secret` exactly (see [COTURN.md](COTURN.md)). |
 
 Rules implemented in code:
 
@@ -56,3 +56,5 @@ Rules implemented in code:
 - Never commit `.env`, `*.pem`, or production `DATABASE_URL`.
 - Keep CI logs free of printed secrets and internal stack traces where possible.
 - Rotate Coturn / JWT secrets if they were ever shared outside a trusted host.
+  When rotating Coturn, update **both** `COTURN_STATIC_AUTH_SECRET` and the
+  daemon’s `static-auth-secret` in the same change window.

@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["macros", "ws"] }
+axum-prometheus = "0.10"
 base64 = "0.22"
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
@@ -16,6 +17,7 @@ dotenvy = "0.15"
 hex = "0.4"
 hmac = "0.12"
 jsonwebtoken = "9"
+metrics = "0.24"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,7 +32,7 @@ sqlx = { version = "0.8", features = [
     "uuid",
 ] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

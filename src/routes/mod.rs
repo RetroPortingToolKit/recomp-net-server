@@ -1,5 +1,6 @@
 //! HTTP routes for lobby, players, ICE signal relay, and TURN credentials.
 
+use crate::metrics;
 use crate::players;
 use crate::rooms::{Room, RoomError, RoomRegistry, RnetBootstrap};
 use crate::signal::SignalEnvelope;
@@ -39,6 +40,7 @@ async fn create_player(State(state): State<AppState>) -> Result<Json<PlayerCreat
     let (player_id, api_token) = players::create_player(&state.pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    metrics::http_player_created();
     Ok(Json(PlayerCreated {
         player_id,
         api_token,
@@ -129,6 +131,7 @@ async fn create_room(
             body.is_private,
         )
         .map_err(ApiError::from)?;
+    metrics::http_room_created();
 
     Ok((StatusCode::CREATED, Json(RoomView::from_room(&room, player_id))))
 }
@@ -162,15 +165,22 @@ async fn join_room(
 ) -> Result<Json<RoomView>, ApiError> {
     let player_id = require_auth(&state, &headers).await?;
     let mut rooms = state.rooms.lock().await;
-    let room = rooms
-        .join(
-            &room_id,
-            player_id,
-            &body.game_id,
-            &body.client_version,
-            body.join_code.as_deref(),
-        )
-        .map_err(ApiError::from)?;
+    let room = match rooms.join(
+        &room_id,
+        player_id,
+        &body.game_id,
+        &body.client_version,
+        body.join_code.as_deref(),
+    ) {
+        Ok(room) => {
+            metrics::http_room_join_ok();
+            room
+        }
+        Err(e) => {
+            metrics::http_room_join_fail(metrics::room_error_code(&e));
+            return Err(ApiError::from(e));
+        }
+    };
     Ok(Json(RoomView::from_room(&room, player_id)))
 }
 
@@ -228,6 +238,7 @@ async fn mark_running(
     let room = rooms
         .mark_running(&room_id, player_id)
         .map_err(ApiError::from)?;
+    metrics::http_room_started();
     Ok(Json(RoomView::from_room(&room, player_id)))
 }
 
@@ -339,6 +350,7 @@ async fn turn_creds(
     })?;
     let (username, password) = turn_credentials::issue_credentials(&cfg, &player_id)
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    metrics::http_turn_credentials_issued();
     Ok(Json(TurnCredsResponse {
         stun_host: cfg.stun_host,
         stun_port: cfg.stun_port,
