@@ -51,13 +51,37 @@ Server → clients (on request, on change, and ~1 Hz while anyone is connected):
       "game_version": "0.1.0",
       "player_count": 1,
       "max_slots": 2,
-      "has_password": true
+      "has_password": true,
+      "host_endpoint": "203.0.113.10:7777",
+      "lan_endpoints": ["192.168.1.42:7777"]
     }
   ]
 }
 ```
 
 Passwords are never listed — only `has_password`.
+`host_endpoint` is the public/STUN UDP address for list latency.
+`lan_endpoints` is deprecated for privacy: current clients discover same-LAN
+hosts via a local UDP broadcast beacon (`RNETBC1`) keyed by `lobby_id`, and
+omit private IPs from the hub. The field remains accepted/echoed for older
+clients. At create, `host_endpoint` is the TCP-peer rewrite of `host_bind`;
+the host should follow up with `set_host_endpoint` after STUN.
+
+## Set host endpoint (STUN + LAN advertise)
+
+Host-only, while in a lobby (before launch / input-relay rewrite):
+
+```json
+{
+  "op": "set_host_endpoint",
+  "host_endpoint": "203.0.113.10:54321"
+}
+```
+
+Success: `{ "op": "host_endpoint_ok", "ok": true }` plus `lobby_update` and a
+list broadcast. Rejects `0.0.0.0`, port `0`, and updates after the server has
+opened an input-relay session (`relay_locked`). `lan_endpoints` are capped at
+4 and filtered to RFC1918 only.
 
 `list` may optionally include `game_name` and/or `game_version` to filter
 the response (exact match). Broadcast / periodic list pushes remain

@@ -102,6 +102,33 @@ log-file=/var/log/turnserver.log
 `allowed-peer-ip` / drop loopback allowance on a hostile public edge if you
 do not need it.
 
+## CreatePermission 403 (Forbidden IP)
+
+libjuice may log:
+
+```text
+Got TURN CreatePermission error response, code=403
+```
+
+With the example `denied-peer-ip=` ranges above, that is **expected** whenever
+ICE asks TURN to open a permission toward a **private** peer candidate
+(RFC1918 / link-local). Coturn is refusing to be used as a relay into your
+LAN — that is the point of those directives.
+
+What to do:
+
+| Situation | Action |
+|-----------|--------|
+| CGNAT / internet (host candidates RFC1918-only at first) | 403s for private **host** candidates are noise. recomp-net still runs automatic `force_relay` fallback so both sides gather `typ relay`; CreatePermission then targets public relay addresses. |
+| Internet peers (srflx/public remotes) | Same: host-candidate 403s are noise; relay/srflx permissions should succeed. |
+| Same-LAN with hardened `denied-peer-ip` | Prefer **host** ICE (or LAN transport). Force TURN / `force_relay` is a poor fit if coturn will not CreatePermission into your LAN. |
+| Lab coturn on a trusted LAN | You may omit or narrow `denied-peer-ip` for that subnet. **Do not** remove all RFC1918 denials on a hostile public edge unless you accept the SSRF-style relay risk. |
+| Auth / secret mismatch | Failures look different (Allocate 401/438, etc.). See secret checklist below. |
+
+`force_relay` / Force TURN is the reliable path for hard CGNAT. Automatic
+fallback (without Force TURN from the start) restarts ICE once onto relay
+after host/srflx stalls.
+
 ## Matching `.env` on recomp-net-server
 
 ```bash

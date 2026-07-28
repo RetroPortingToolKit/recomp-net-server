@@ -45,6 +45,8 @@ struct Lobby {
     #[allow(dead_code)]
     host_bind: String,
     host_endpoint: String,
+    /// Private RFC1918 UDP endpoints for same-LAN list RTT (no loopback).
+    lan_endpoints: Vec<String>,
     guest_endpoint: String,
     password_hash: Option<[u8; 32]>,
     password_salt: Option<[u8; 16]>,
@@ -145,6 +147,12 @@ struct InMsg {
     max_slots: Option<u32>,
     #[serde(default)]
     host_bind: Option<String>,
+    /// Host STUN advertise update (`set_host_endpoint`).
+    #[serde(default)]
+    host_endpoint: Option<String>,
+    /// Optional LAN UDP endpoints alongside `set_host_endpoint`.
+    #[serde(default)]
+    lan_endpoints: Option<Vec<String>>,
     #[serde(default)]
     guest_bind: Option<String>,
     #[serde(default)]
@@ -195,6 +203,10 @@ struct LobbyListRow<'a> {
     player_count: usize,
     max_slots: usize,
     has_password: bool,
+    /// Host UDP game endpoint (rewritten for peers). Clients probe RTT here.
+    host_endpoint: &'a str,
+    /// Same-LAN probe candidates (RFC1918 host:port).
+    lan_endpoints: &'a [String],
 }
 
 /// Normalize empty / missing version to `"dev"` (local builds).
@@ -233,6 +245,8 @@ fn lobby_list_json_filtered(
             player_count: player_count(l),
             max_slots: l.max_slots,
             has_password: l.password_hash.is_some(),
+            host_endpoint: &l.host_endpoint,
+            lan_endpoints: &l.lan_endpoints,
         })
         .collect();
     json!({ "op": "lobby_list", "lobbies": rows }).to_string()
@@ -263,6 +277,72 @@ fn rewrite_endpoint(bind: &str, peer_ip: &str) -> String {
         host
     };
     format!("{use_host}:{port}")
+}
+
+/// Validate a host-advertised UDP endpoint for list / waiting-room RTT.
+fn parse_advertise_endpoint(raw: &str) -> Option<String> {
+    let ep = raw.trim();
+    if ep.is_empty() || ep.len() > 64 {
+        return None;
+    }
+    let (host, port_s) = ep.rsplit_once(':')?;
+    if host.is_empty()
+        || host == "0.0.0.0"
+        || host == "*"
+        || host == "::"
+        || host.contains([' ', '"', '\'', '{', '}', '\\'])
+    {
+        return None;
+    }
+    let port: u16 = port_s.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some(format!("{host}:{port}"))
+}
+
+fn is_rfc1918_host(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let Ok(a) = parts[0].parse::<u8>() else {
+        return false;
+    };
+    let Ok(b) = parts[1].parse::<u8>() else {
+        return false;
+    };
+    if parts[2].parse::<u8>().is_err() || parts[3].parse::<u8>().is_err() {
+        return false;
+    }
+    a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+}
+
+/// Cap and validate LAN advertise list (RFC1918 only, no loopback).
+fn sanitize_lan_endpoints(raw: Option<Vec<String>>) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(list) = raw else {
+        return out;
+    };
+    for item in list {
+        let Some(ep) = parse_advertise_endpoint(&item) else {
+            continue;
+        };
+        let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+        if host.starts_with("127.") || host == "localhost" || !is_rfc1918_host(host) {
+            continue;
+        }
+        if out.iter().any(|e| e == &ep) {
+            continue;
+        }
+        out.push(ep);
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
 }
 
 fn player_count(lobby: &Lobby) -> usize {
@@ -346,11 +426,12 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
         }
         let all_ready = l.slots.iter().flatten().all(|s| s.ready)
             && player_count(l) >= 2;
-        let mut msg = json!({
+            let mut msg = json!({
             "op": "lobby_update",
             "lobby_id": l.lobby_id,
             "session_id": l.session_id,
             "host_endpoint": l.host_endpoint,
+            "lan_endpoints": l.lan_endpoints,
             "guest_endpoint": l.guest_endpoint,
             "player_count": player_count(l),
             "max_slots": l.max_slots,
@@ -560,6 +641,7 @@ async fn handle_text(
         "join" => handle_join(hub, player_id, peer_ip, msg).await?,
         "set_ready" => handle_set_ready(hub, player_id, msg).await?,
         "set_match_caps" => handle_set_match_caps(hub, player_id, msg).await?,
+        "set_host_endpoint" => handle_set_host_endpoint(hub, player_id, msg).await?,
         "start" => handle_start(state, player_id, msg).await?,
         "leave" => {
             client_leave(state, player_id).await;
@@ -775,6 +857,7 @@ async fn handle_create(
                 host_player_id: player_id.to_string(),
                 host_bind,
                 host_endpoint: host_endpoint.clone(),
+                lan_endpoints: Vec::new(),
                 guest_endpoint: String::new(),
                 password_hash,
                 password_salt,
@@ -1183,6 +1266,92 @@ async fn handle_move(
         lid
     };
     emit_lobby_update(hub, &lid).await;
+    Ok(())
+}
+
+/// Host publishes a STUN-discovered UDP endpoint for list / pre-join RTT.
+async fn handle_set_host_endpoint(
+    hub: &WsLobbyHub,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let Some(raw) = msg.host_endpoint.filter(|s| !s.trim().is_empty()) else {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "bad_host_endpoint", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(endpoint) = parse_advertise_endpoint(&raw) else {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "bad_host_endpoint", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+    let lid = {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = g
+            .clients
+            .get(player_id)
+            .and_then(|c| c.lobby_id.clone())
+        else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_in_lobby", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get_mut(&lid) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "gone", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        if lobby.host_player_id != player_id {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_host", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        /* Launch already rewrote endpoints to the input relay — leave them. */
+        if lobby.relay_session_id.is_some() {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "relay_locked", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        lobby.host_endpoint = endpoint;
+        lobby.lan_endpoints = sanitize_lan_endpoints(msg.lan_endpoints);
+        lid
+    };
+    emit_lobby_update(hub, &lid).await;
+    broadcast_list(hub).await;
+    send_to(
+        hub,
+        player_id,
+        json!({ "op": "host_endpoint_ok", "ok": true }).to_string(),
+    )
+    .await;
     Ok(())
 }
 
