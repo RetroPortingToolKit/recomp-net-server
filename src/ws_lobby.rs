@@ -1259,6 +1259,18 @@ async fn handle_move(
             .await;
             return Ok(());
         }
+        /* Slot 0 is the session host / sim authority. Guests may rearrange
+         * among seats 1..max-1; the lobby host stays pinned at slot 0. */
+        if from == 0 || to == 0 {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "host_slot_fixed", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
         lobby.slots.swap(from, to);
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
@@ -1484,21 +1496,11 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             break 'prep Err("need_players");
         }
         let caps_for_relay = fresh_caps.as_ref().or(lobby.match_caps.as_ref()).cloned();
-        let use_relay = crate::input_relay::wants_input_relay(&caps_for_relay, lobby.max_slots);
-        if use_relay && !state.input_relay.enabled() {
+        /* Online start always opens the lobby UDP SFU (star). Peers never mesh. */
+        let use_relay =
+            crate::input_relay::wants_input_relay(&caps_for_relay, lobby.max_slots);
+        if !state.input_relay.enabled() {
             break 'prep Err("relay_unavailable");
-        }
-        /* 2P P2P needs both rewritten endpoints. Host-as-relay (max_slots >= 3,
-         * no force_input_relay) only needs host_endpoint — guests dial the host
-         * hub; guest_endpoint is a single last-joiner field and must not gate. */
-        let host_as_relay = !use_relay && lobby.max_slots >= 3;
-        if !use_relay {
-            if lobby.host_endpoint.is_empty() {
-                break 'prep Err("missing_endpoints");
-            }
-            if !host_as_relay && lobby.guest_endpoint.is_empty() {
-                break 'prep Err("missing_endpoints");
-            }
         }
         let old_relay = lobby.relay_session_id;
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be

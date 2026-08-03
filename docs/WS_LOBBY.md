@@ -210,12 +210,13 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
-Client → server (host only; requires `player_count >= 2`). Direct 2P P2P needs
-both rewritten peer endpoints. Host-as-relay (`max_slots >= 3`, default when
-`force_input_relay` is false) only requires `host_endpoint` — guests dial the
-host hub. When `match_caps.force_input_relay` is true, the server opens its
-UDP input relay and rewrites endpoints on launch. Ready flags are
-informational only — host Play is the launch authority:
+Client → server (host only; requires `player_count >= 2`). Online start always
+opens the lobby UDP SFU star (`INPUT_RELAY_*`) and rewrites
+`host_endpoint` / `guest_endpoint` / `relay_endpoint` to the advertise address.
+Peers dial the SFU only — no host-as-relay and no guest↔guest mesh on the
+WebSocket path. `match_caps.force_input_relay` is retained for older clients
+but does not gate relay open. Ready flags are informational only — host Play
+is the launch authority:
 
 ```json
 { "op": "start", "match_caps": { "v": 1, "…": "…" } }
@@ -223,16 +224,15 @@ informational only — host Play is the launch authority:
 
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
-`need_players`, `missing_endpoints`, `relay_unavailable`.
+`need_players`, `relay_unavailable`.
 
 On success the server:
 
 1. Allocates a **new** `session_id` (monotonic) for this match — rematch after
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
-2. If `match_caps.force_input_relay` is true, opens a UDP relay session and
-   sets `host_endpoint` / `guest_endpoint` (and `relay_endpoint`) to the
-   advertised relay address (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`).
-   Otherwise 3+ clients use host-as-relay (no server rewrite).
+2. Opens a UDP SFU session and sets `host_endpoint` / `guest_endpoint` (and
+   `relay_endpoint`) to the advertised relay address
+   (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`).
 3. Clears every slot’s `ready` (clients auto-ready again for rematch).
 4. Broadcasts to **all** members:
 
@@ -276,15 +276,17 @@ Errors: `not_host`, `bad_slot`, `empty_slot`, `cannot_kick`.
 The kicked player receives `{ "op": "kicked", "ok": true, "lobby_id": "…" }`.
 Remaining members get `lobby_update` (ready flags cleared, like guest leave).
 
-Host may swap (or move into an empty) seat. Clears ready flags and broadcasts
-`lobby_update` so every peer refreshes the member table and `local_slot`:
+Host may swap (or move into an empty) **guest** seat. Slot 0 is the session
+host / sim authority and stays pinned; rearranging is only among seats
+1..max_slots−1. Clears ready flags and broadcasts `lobby_update` so every
+peer refreshes the member table and `local_slot`:
 
 ```json
-{ "op": "move", "from_slot": 0, "to_slot": 1 }
+{ "op": "move", "from_slot": 1, "to_slot": 2 }
 ```
 
 `slot` is accepted as an alias for `from_slot`. Errors: `not_in_lobby`,
-`not_host`, `gone`, `bad_slot`, `empty_slot`.
+`not_host`, `gone`, `bad_slot`, `empty_slot`, `host_slot_fixed`.
 
 Host disconnect or `{ "op": "close" }` destroys the lobby and notifies members
 with `lobby_closed`.

@@ -264,12 +264,14 @@ async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -
     }
 }
 
-/// Whether lobby match_caps request the server UDP input relay.
-/// Opt-in only (`force_input_relay`); 3+ lobbies default to host-as-relay.
-pub fn wants_input_relay(match_caps: &Option<serde_json::Value>, _max_slots: usize) -> bool {
-    match_caps
-        .as_ref()
-        .and_then(|v| v.get("force_input_relay"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+/// Online WebSocket lobbies always use the lobby UDP SFU star.
+///
+/// `match_caps.force_input_relay` is retained for older clients / diagnostics
+/// but no longer gates relay open. Disable only via `INPUT_RELAY_ENABLED=0`.
+/// LAN/direct lobbies (no WS start) keep host-as-relay / P2P on the client.
+pub fn wants_input_relay(
+    _match_caps: &Option<serde_json::Value>,
+    _max_slots: usize,
+) -> bool {
+    true
 }

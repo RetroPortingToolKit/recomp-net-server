@@ -110,7 +110,7 @@ impl RoomRegistry {
         protocol_magic: u32,
         is_private: bool,
     ) -> Result<Room, RoomError> {
-        if !(2..=5).contains(&slot_count) {
+        if !(2..=8).contains(&slot_count) {
             return Err(RoomError::BadSlotCount);
         }
         let now = Utc::now();

@@ -11,15 +11,15 @@ repo) and does not ship inside that library crate/tree.
 | HTTP `/v1` rooms + ICE signal relay | Guest console simulation |
 | WebSocket JSON lobby for MotK / psxrecomp | Interpreting pad bits / sim state |
 | Slot / `session_id` / endpoint handoff | Rollback or prediction |
-| Optional UDP input relay (star fan-out) | Storing gameplay pad streams |
+| UDP input SFU (star fan-out, online default) | Storing gameplay pad streams |
 | Optional TURN credential minting | |
 
-After lobby handoff, peers normally talk **directly** (LAN UDP or ICE) via
-`recomp-net`. For 3+ seats, clients default to **host-as-relay** (the game host
-fans out datagrams). When the host opts in with `match_caps.force_input_relay`,
-`start` opens a UDP star relay on this server: clients dial one public endpoint
-and the server forwards opaque delay-sync datagrams (magic + `session_id`
-checked; pad bytes are never interpreted).
+After WebSocket `start`, online peers dial this server’s **UDP SFU star** —
+one advertise endpoint, opaque fan-out (magic + `session_id` checked; pad
+bytes are never interpreted). There is no guest↔guest mesh and no
+game-host fan-out on the online path. Sim authority remains pad **slot 0**
+(session host); guests may rearrange among seats 1..N−1. LAN/direct lobbies
+(no WS start) may still use client host-as-relay / P2P.
 
 ## Two surfaces, one process
 

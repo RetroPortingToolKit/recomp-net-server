@@ -57,8 +57,8 @@ impl Config {
 
         let default_input_delay = parse_u8_env("LOBBY_DEFAULT_INPUT_DELAY", 2)?;
         let default_slot_count = parse_u8_env("LOBBY_DEFAULT_SLOT_COUNT", 2)?;
-        if !(2..=5).contains(&default_slot_count) {
-            bail!("LOBBY_DEFAULT_SLOT_COUNT must be between 2 and 5");
+        if !(2..=8).contains(&default_slot_count) {
+            bail!("LOBBY_DEFAULT_SLOT_COUNT must be between 2 and 8");
         }
 
         let room_idle_secs = parse_u64_env("LOBBY_ROOM_IDLE_SECS", 600);
