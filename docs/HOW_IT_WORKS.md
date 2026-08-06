@@ -56,11 +56,16 @@ Both surfaces share `BIND_ADDR` (default `0.0.0.0:8765` for MotK local dev).
 4. Server rewrites bind addresses (`0.0.0.0` → peer TCP IP) into
    `host_endpoint` / `guest_endpoint`.
 5. Both sides receive slot map + endpoints (`created` / `joined` /
-   `lobby_update`). On `start`, if input relay is selected, both endpoints
-   (and `relay_endpoint`) are rewritten to the public relay address.
-6. Clients start `recomp-net` LAN sessions (peer = other endpoint, or the
-   relay). The WebSocket stays up for list / ICE `signal`; pad fan-out uses
-   the separate UDP relay when enabled.
+   `lobby_update`). On `start`, online lobbies open the UDP SFU and set
+   `relay_endpoint` (and both pad endpoints) to the advertise address
+   (`PUBLIC_HOST` / `INPUT_RELAY_ADVERTISE_*`, or STUN public IPv4; port
+   usually `8777` — never loopback by default). If every seated WS peer is a
+   direct private/loopback address (not the LAN gateway / hairpin source),
+   the server prefers `INPUT_RELAY_LAN_HOST` when set.
+6. Clients start `recomp-net` LAN sessions with peer = relay. MotK/psx
+   clients may rewrite the relay host to the connected WebSocket peer IP.
+   The WebSocket stays up for list / ICE `signal`; pad fan-out uses UDP
+   `8777`.
 
 ## HTTP `/v1` flow
 

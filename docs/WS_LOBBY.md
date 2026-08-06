@@ -232,7 +232,18 @@ On success the server:
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
 2. Opens a UDP SFU session and sets `host_endpoint` / `guest_endpoint` (and
    `relay_endpoint`) to the advertised relay address
-   (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`).
+   (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`). The host
+   defaults from `PUBLIC_HOST` / `LOBBY_PUBLIC_HOST`, otherwise startup
+   STUN-discovers this machine’s public IPv4 (never `127.0.0.1` unless
+   `INPUT_RELAY_ALLOW_LOOPBACK=1`). When **every** seated member’s WebSocket
+   TCP peer IP is a *direct* RFC1918/loopback address (not the LAN gateway /
+   hairpin source) and `INPUT_RELAY_LAN_HOST` is set, launch uses that LAN
+   host instead. Peers that dial the public DNS and NAT-hairpin often appear
+   as the router (`.1`); those keep the public advertise. Override the
+   gateway with `INPUT_RELAY_LAN_GATEWAY` if it is not `<LAN>/24` → `.1`.
+   MotK clients may also rewrite the relay host to a private WebSocket peer.
+   On Linux the SFU uses `IP_PKTINFO` so forwarded datagrams are sourced from
+   the local address each peer dialed (avoids dual-NIC wrong-source drops).
 3. Clears every slot’s `ready` (clients auto-ready again for rematch).
 4. Broadcasts to **all** members:
 

@@ -162,7 +162,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let config = Config::from_env().context("invalid configuration")?;
+    let mut config = Config::from_env().context("invalid configuration")?;
+    config
+        .resolve_input_relay_advertise()
+        .context("input relay advertise host")?;
     let db_url = config.effective_database_url();
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -223,6 +226,17 @@ async fn main() -> anyhow::Result<()> {
             "{}:{}",
             config.input_relay_advertise_host, config.input_relay_advertise_port
         ),
+        input_relay_lan = %if config.input_relay_lan_host.is_empty() {
+            "(unset)".to_string()
+        } else {
+            format!(
+                "{}:{}",
+                config.input_relay_lan_host, config.input_relay_advertise_port
+            )
+        },
+        input_relay_lan_gateway = %config
+            .effective_input_relay_lan_gateway()
+            .unwrap_or_else(|| "(unset)".to_string()),
         allowlist_len = config.game_allowlist.len(),
         debug = debug_cli,
         "starting recomp-net-server"

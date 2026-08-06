@@ -3,24 +3,28 @@
 //! Each peer dials one public UDP endpoint (via `rnet_session_start_lan` with
 //! the relay as `peer`). The relay:
 //!   1. Validates the recomp-net common header (magic + session_id)
-//!   2. Learns `(session_id, local_slot) → SocketAddr` from the first packet
-//!   3. Forwards the raw datagram to every *other* registered seat
+//!   2. Learns `(session_id, local_slot) → (peer, local_dst)` from packets
+//!   3. Forwards the raw datagram to every *other* registered seat, pinning
+//!      the UDP source IP to that seat's dialed local address (`IP_PKTINFO`)
 //!
 //! Pad bytes are never interpreted. This is enough for 2P NAT traversal and
 //! for 3–4P matches where a full mesh is not available.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::metrics;
+use crate::udp_pktinfo::{self, RecvSas};
 
 const MAX_SLOTS: usize = 8;
 const MIN_PACKET: usize = 14; // magic(4)+type(2)+session(4)+body(≥0)+checksum(4)
@@ -33,6 +37,8 @@ const SESSION_IDLE: Duration = Duration::from_secs(120);
 pub struct InputRelay {
     inner: Arc<Mutex<RelayInner>>,
     advertise_host: String,
+    /// Same-LAN / split-horizon alternate (may be empty).
+    lan_host: String,
     advertise_port: u16,
     enabled: bool,
 }
@@ -41,10 +47,17 @@ struct RelayInner {
     sessions: HashMap<u32, RelaySession>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SlotBinding {
+    peer: SocketAddr,
+    /// Local IPv4 this peer dialed (from IP_PKTINFO on recv).
+    local_dst: Option<Ipv4Addr>,
+}
+
 struct RelaySession {
     slot_count: u8,
-    /// Per-slot last-seen source address (None = not yet registered).
-    slots: [Option<SocketAddr>; MAX_SLOTS],
+    /// Per-slot last-seen binding (None = not yet registered).
+    slots: [Option<SlotBinding>; MAX_SLOTS],
     last_rx: Instant,
 }
 
@@ -55,7 +68,10 @@ impl InputRelay {
     pub async fn start(config: &Config) -> Result<Self> {
         let enabled = config.input_relay_enabled;
         let advertise_host = config.input_relay_advertise_host.clone();
+        let lan_host = config.input_relay_lan_host.trim().to_string();
         let advertise_port = config.input_relay_advertise_port;
+        let fallback_source = udp_pktinfo::parse_ipv4_host(&lan_host)
+            .or_else(|| udp_pktinfo::parse_ipv4_host(&advertise_host));
 
         let inner = Arc::new(Mutex::new(RelayInner {
             sessions: HashMap::new(),
@@ -66,26 +82,33 @@ impl InputRelay {
             return Ok(Self {
                 inner,
                 advertise_host,
+                lan_host,
                 advertise_port,
                 enabled: false,
             });
         }
 
         let bind = &config.input_relay_bind;
-        let sock = UdpSocket::bind(bind)
-            .await
+        let sock = udp_pktinfo::bind_udp_with_pktinfo(bind)
             .with_context(|| format!("input relay bind {bind}"))?;
         let local = sock.local_addr().context("input relay local_addr")?;
         info!(
             %local,
             advertise = %format!("{}:{}", advertise_host, advertise_port),
-            "input relay listening"
+            lan = %if lan_host.is_empty() {
+                "(unset)".to_string()
+            } else {
+                format!("{lan_host}:{advertise_port}")
+            },
+            ?fallback_source,
+            "input relay listening (IP_PKTINFO source pin)"
         );
 
         let loop_inner = inner.clone();
         let magic = config.protocol_magic;
+        let fallback = fallback_source;
         tokio::spawn(async move {
-            if let Err(e) = recv_loop(sock, loop_inner, magic).await {
+            if let Err(e) = recv_loop(sock, loop_inner, magic, fallback).await {
                 warn!(error = %e, "input relay recv loop exited");
             }
         });
@@ -110,6 +133,7 @@ impl InputRelay {
         Ok(Self {
             inner,
             advertise_host,
+            lan_host,
             advertise_port,
             enabled: true,
         })
@@ -119,14 +143,35 @@ impl InputRelay {
         self.enabled
     }
 
-    /// Advertise `host:port` string clients should dial as their recomp-net peer.
+    /// Public / DNS advertise `host:port` string clients should dial.
     pub fn advertise_endpoint(&self) -> String {
         format!("{}:{}", self.advertise_host, self.advertise_port)
     }
 
+    /// Same-LAN alternate when `INPUT_RELAY_LAN_HOST` is set.
+    pub fn lan_advertise_endpoint(&self) -> Option<String> {
+        let h = self.lan_host.trim();
+        if h.is_empty() {
+            None
+        } else {
+            Some(format!("{h}:{}", self.advertise_port))
+        }
+    }
+
+    /// Pick public vs LAN advertise. `prefer_lan` when every seated WS peer is
+    /// on a private/loopback address (split-horizon / no hairpin).
+    pub fn pick_advertise_endpoint(&self, prefer_lan: bool) -> String {
+        if prefer_lan {
+            if let Some(lan) = self.lan_advertise_endpoint() {
+                return lan;
+            }
+        }
+        self.advertise_endpoint()
+    }
+
     /// Register a match session. Idempotent if the same session_id is reopened
     /// (rematch allocates a fresh session_id from the lobby).
-    pub async fn open_session(&self, session_id: u32, slot_count: u8) -> Result<String> {
+    pub async fn open_session(&self, session_id: u32, slot_count: u8) -> Result<()> {
         if !self.enabled {
             bail!("input relay disabled");
         }
@@ -146,7 +191,7 @@ impl InputRelay {
         metrics::set_input_relay_sessions(g.sessions.len());
         metrics::input_relay_session_opened();
         debug!(session_id, slot_count = slots, "input relay session opened");
-        Ok(self.advertise_endpoint())
+        Ok(())
     }
 
     pub async fn close_session(&self, session_id: u32) {
@@ -183,10 +228,71 @@ fn packet_local_slot(pkt_type: u16, buf: &[u8]) -> Option<u8> {
     buf.get(HEADER_LEN).copied()
 }
 
-async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -> Result<()> {
+fn bind_slot(slot: &mut Option<SlotBinding>, peer: SocketAddr, local_dst: Option<Ipv4Addr>) {
+    match slot {
+        Some(b) => {
+            b.peer = peer;
+            if local_dst.is_some() {
+                b.local_dst = local_dst;
+            }
+        }
+        None => {
+            *slot = Some(SlotBinding { peer, local_dst });
+        }
+    }
+}
+
+async fn recv_one(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<RecvSas> {
+    loop {
+        sock.readable().await?;
+        match sock.try_io(Interest::READABLE, || udp_pktinfo::try_recv_sas(sock, buf)) {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn send_one(
+    sock: &UdpSocket,
+    buf: &[u8],
+    peer: SocketAddr,
+    source: Option<Ipv4Addr>,
+) -> io::Result<()> {
+    if let Some(src) = source {
+        loop {
+            sock.writable().await?;
+            match sock.try_io(Interest::WRITABLE, || {
+                udp_pktinfo::try_send_sas(sock, buf, peer, src)
+            }) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    // Fall back if pktinfo send fails (e.g. address not local).
+                    warn!(%peer, %src, error = %e, "IP_PKTINFO send failed; falling back to send_to");
+                    sock.send_to(buf, peer).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    sock.send_to(buf, peer).await?;
+    Ok(())
+}
+
+async fn recv_loop(
+    sock: UdpSocket,
+    inner: Arc<Mutex<RelayInner>>,
+    magic: u32,
+    fallback_source: Option<Ipv4Addr>,
+) -> Result<()> {
     let mut buf = vec![0u8; 2048];
     loop {
-        let (n, src) = sock.recv_from(&mut buf).await?;
+        let RecvSas {
+            n,
+            peer: src,
+            local_dst,
+        } = recv_one(&sock, &mut buf).await?;
         if n < MIN_PACKET {
             metrics::input_relay_drop("short");
             continue;
@@ -207,7 +313,7 @@ async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -
         };
 
         // Collect fan-out targets under the lock, then send without holding it.
-        let targets: Vec<SocketAddr> = {
+        let targets: Vec<SlotBinding> = {
             let mut g = inner.lock().await;
             let Some(sess) = g.sessions.get_mut(&session_id) else {
                 metrics::input_relay_drop("unknown_session");
@@ -221,24 +327,26 @@ async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -
                         metrics::input_relay_drop("bad_slot");
                         continue;
                     }
-                    // First-wins address binding; allow the same seat to roam
-                    // (NAT rebinding) by updating to the latest source.
-                    sess.slots[slot as usize] = Some(src);
+                    bind_slot(&mut sess.slots[slot as usize], src, local_dst);
                     Some(slot)
                 }
                 None => {
                     // START / DELAY_SYNC: map by source address if known.
-                    sess.slots
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, a)| if *a == Some(src) { Some(i as u8) } else { None })
+                    sess.slots.iter_mut().enumerate().find_map(|(i, a)| {
+                        if a.as_ref().map(|b| b.peer) == Some(src) {
+                            bind_slot(a, src, local_dst);
+                            Some(i as u8)
+                        } else {
+                            None
+                        }
+                    })
                 }
             };
 
             if sender_slot.is_none() && pkt_type == RNET_PKT_START {
                 // Slot 0 authority — bind this source as seat 0 if empty.
                 if sess.slots[0].is_none() {
-                    sess.slots[0] = Some(src);
+                    bind_slot(&mut sess.slots[0], src, local_dst);
                 }
             }
 
@@ -246,7 +354,7 @@ async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -
                 .iter()
                 .flatten()
                 .copied()
-                .filter(|addr| *addr != src)
+                .filter(|b| b.peer != src)
                 .collect()
         };
 
@@ -256,7 +364,8 @@ async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -
         }
         let mut sent = 0u64;
         for dst in targets {
-            if sock.send_to(pkt, dst).await.is_ok() {
+            let source = dst.local_dst.or(fallback_source);
+            if send_one(&sock, pkt, dst.peer, source).await.is_ok() {
                 sent += 1;
             }
         }
@@ -267,7 +376,7 @@ async fn recv_loop(sock: UdpSocket, inner: Arc<Mutex<RelayInner>>, magic: u32) -
 /// Online WebSocket lobbies always use the lobby UDP SFU star.
 ///
 /// `match_caps.force_input_relay` is retained for older clients / diagnostics
-/// but no longer gates relay open. Disable only via `INPUT_RELAY_ENABLED=0`.
+/// but does not gate relay open. Disable only via `INPUT_RELAY_ENABLED=0`.
 /// LAN/direct lobbies (no WS start) keep host-as-relay / P2P on the client.
 pub fn wants_input_relay(
     _match_caps: &Option<serde_json::Value>,

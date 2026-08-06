@@ -31,10 +31,22 @@ pub struct Config {
     pub input_relay_enabled: bool,
     /// Socket bind for the input relay (e.g. `0.0.0.0:8777`).
     pub input_relay_bind: String,
-    /// Host string written into launch endpoints (public DNS / IP clients dial).
+    /// Host string written into launch endpoints. Defaults from
+    /// `INPUT_RELAY_ADVERTISE_HOST` → `PUBLIC_HOST` → `LOBBY_PUBLIC_HOST`,
+    /// then STUN public IPv4 at startup. Never defaults to loopback.
     pub input_relay_advertise_host: String,
     /// Port written into launch endpoints (may differ from bind when NAT'd).
     pub input_relay_advertise_port: u16,
+    /// Optional RFC1918 host for same-LAN / split-horizon lobbies. When every
+    /// seated member's WebSocket peer IP is a direct LAN address (not the
+    /// hairpin gateway), launch uses this instead of the public advertise.
+    pub input_relay_lan_host: String,
+    /// LAN default gateway / hairpin source IP (e.g. `192.168.66.1`). Peers
+    /// that appear as this address are treated as NAT hairpin, not on-LAN.
+    /// Empty → guess `<LAN_HOST>/24` → `.1` when `INPUT_RELAY_LAN_HOST` is set.
+    pub input_relay_lan_gateway: String,
+    /// When true, allow advertising 127.0.0.1 (same-machine-only testing).
+    pub input_relay_allow_loopback: bool,
 }
 
 impl Config {
@@ -88,10 +100,27 @@ impl Config {
             .unwrap_or(8777);
         let input_relay_advertise_port =
             parse_u16_env("INPUT_RELAY_ADVERTISE_PORT", advertise_port_default)?;
+        /* Prefer an explicit relay / public host. Do NOT fall back to
+         * COTURN_HOST — Coturn is often a different machine than the lobby
+         * UDP SFU. Empty or loopback is replaced by STUN public IPv4 in
+         * `resolve_input_relay_advertise` before the relay binds. */
         let input_relay_advertise_host = env::var("INPUT_RELAY_ADVERTISE_HOST")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+            .or_else(|| env::var("PUBLIC_HOST").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| env::var("LOBBY_PUBLIC_HOST").ok().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_default();
+        let input_relay_lan_host = env::var("INPUT_RELAY_LAN_HOST")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_default();
+        let input_relay_lan_gateway = env::var("INPUT_RELAY_LAN_GATEWAY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_default();
+        let input_relay_allow_loopback = parse_bool_env(
+            &env::var("INPUT_RELAY_ALLOW_LOOPBACK").unwrap_or_default(),
+        );
 
         Ok(Config {
             bind_addr,
@@ -109,7 +138,61 @@ impl Config {
             input_relay_bind,
             input_relay_advertise_host,
             input_relay_advertise_port,
+            input_relay_lan_host,
+            input_relay_lan_gateway,
+            input_relay_allow_loopback,
         })
+    }
+
+    /// Hairpin / gateway IP used to reject false "all peers local" picks.
+    pub fn effective_input_relay_lan_gateway(&self) -> Option<String> {
+        let explicit = self.input_relay_lan_gateway.trim();
+        if !explicit.is_empty() {
+            return Some(explicit.to_string());
+        }
+        guess_lan_gateway_from_host(self.input_relay_lan_host.trim())
+    }
+
+    /// Replace empty/loopback relay advertise with STUN-discovered public IPv4.
+    /// Call once after `from_env` and before `InputRelay::start`.
+    pub fn resolve_input_relay_advertise(&mut self) -> Result<()> {
+        use crate::public_ip::{advertise_host_needs_public, discover_ipv4};
+        use std::time::Duration;
+
+        if !self.input_relay_enabled {
+            if self.input_relay_advertise_host.is_empty() {
+                self.input_relay_advertise_host = "127.0.0.1".to_string();
+            }
+            return Ok(());
+        }
+
+        let needs = advertise_host_needs_public(&self.input_relay_advertise_host);
+        if !needs {
+            return Ok(());
+        }
+
+        if self.input_relay_allow_loopback {
+            if self.input_relay_advertise_host.is_empty() {
+                self.input_relay_advertise_host = "127.0.0.1".to_string();
+            }
+            tracing::warn!(
+                advertise = %format!(
+                    "{}:{}",
+                    self.input_relay_advertise_host, self.input_relay_advertise_port
+                ),
+                "INPUT_RELAY_ALLOW_LOOPBACK=1 — remote peers cannot dial this relay"
+            );
+            return Ok(());
+        }
+
+        let ip = discover_ipv4(Duration::from_millis(750))?;
+        tracing::info!(
+            %ip,
+            port = self.input_relay_advertise_port,
+            "input relay advertise host = public IPv4 (STUN); set PUBLIC_HOST to pin a DNS name"
+        );
+        self.input_relay_advertise_host = ip;
+        Ok(())
     }
 
     pub fn effective_database_url(&self) -> String {
@@ -136,6 +219,20 @@ impl Config {
         }
         self.game_allowlist.iter().any(|g| g == game_id)
     }
+}
+
+/// Guess `<a.b.c>.1` from an IPv4 LAN host (common home-router convention).
+fn guess_lan_gateway_from_host(lan_host: &str) -> Option<String> {
+    let parts: Vec<&str> = lan_host.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    for p in &parts {
+        if p.parse::<u8>().is_err() {
+            return None;
+        }
+    }
+    Some(format!("{}.{}.{}.1", parts[0], parts[1], parts[2]))
 }
 
 fn parse_bool_env(raw: &str) -> bool {
@@ -186,5 +283,24 @@ fn parse_u32_env(name: &str, default: u32) -> Result<u32> {
             }
         }
         _ => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guess_gateway_from_lan_host() {
+        assert_eq!(
+            guess_lan_gateway_from_host("192.168.66.3").as_deref(),
+            Some("192.168.66.1")
+        );
+        assert_eq!(
+            guess_lan_gateway_from_host("10.0.0.50").as_deref(),
+            Some("10.0.0.1")
+        );
+        assert!(guess_lan_gateway_from_host("netplay.example.com").is_none());
+        assert!(guess_lan_gateway_from_host("").is_none());
     }
 }

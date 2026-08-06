@@ -63,7 +63,7 @@ struct ClientMeta {
     #[allow(dead_code)]
     player_id: String,
     display_name: String,
-    #[allow(dead_code)]
+    /// TCP source IP as seen by the lobby (LAN vs WAN / hairpin signal).
     peer_ip: String,
     lobby_id: Option<String>,
     tx: broadcast::Sender<String>,
@@ -318,6 +318,34 @@ fn is_rfc1918_host(host: &str) -> bool {
     a == 10
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
+}
+
+fn normalize_ws_peer_v4(ip: &str) -> &str {
+    let h = ip.trim();
+    h.strip_prefix("::ffff:").unwrap_or(h)
+}
+
+/// True when the WebSocket TCP peer is on-LAN (or loopback to this host).
+fn is_local_ws_peer_ip(ip: &str) -> bool {
+    let h = ip.trim();
+    if h.is_empty() {
+        return false;
+    }
+    if h == "::1" || h.eq_ignore_ascii_case("localhost") || h.starts_with("127.") {
+        return true;
+    }
+    is_rfc1918_host(normalize_ws_peer_v4(h))
+}
+
+/// Direct LAN / loopback peer — excludes the LAN gateway (NAT hairpin source).
+fn is_direct_lan_ws_peer(ip: &str, gateway: Option<&str>) -> bool {
+    if !is_local_ws_peer_ip(ip) {
+        return false;
+    }
+    let Some(gw) = gateway.map(str::trim).filter(|g| !g.is_empty()) else {
+        return true;
+    };
+    normalize_ws_peer_v4(ip) != gw
 }
 
 /// Cap and validate LAN advertise list (RFC1918 only, no loopback).
@@ -1502,15 +1530,33 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         if !state.input_relay.enabled() {
             break 'prep Err("relay_unavailable");
         }
+        /* Same-LAN / split-horizon: every seated peer's WS TCP source is a
+         * direct private/loopback address (not the hairpin gateway) → prefer
+         * INPUT_RELAY_LAN_HOST. Guests that dial the WAN name and NAT-hairpin
+         * often appear as the router (.1) — that must not force LAN advertise. */
+        let mut peer_ips = Vec::new();
+        for slot in lobby.slots.iter().flatten() {
+            if let Some(c) = g.clients.get(&slot.player_id) {
+                peer_ips.push(c.peer_ip.clone());
+            }
+        }
+        let lan_host = state.config.input_relay_lan_host.trim();
+        let gateway = state.config.effective_input_relay_lan_gateway();
+        let prefer_lan = !lan_host.is_empty()
+            && !peer_ips.is_empty()
+            && peer_ips.len() == n
+            && peer_ips
+                .iter()
+                .all(|ip| is_direct_lan_ws_peer(ip, gateway.as_deref()));
         let old_relay = lobby.relay_session_id;
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
-        Ok((lid, sid, n, use_relay, old_relay))
+        Ok((lid, sid, n, use_relay, old_relay, prefer_lan, peer_ips))
     };
 
-    let (lid, sid, n, use_relay, old_relay) = match prepared {
+    let (lid, sid, n, use_relay, old_relay, prefer_lan, peer_ips) = match prepared {
         Ok(v) => v,
         Err(code) => {
             send_to(
@@ -1529,7 +1575,32 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
     }
     let relay_endpoint = if use_relay {
         match state.input_relay.open_session(sid, n as u8).await {
-            Ok(ep) => Some(ep),
+            Ok(()) => {
+                let ep = state.input_relay.pick_advertise_endpoint(prefer_lan);
+                let gateway = state.config.effective_input_relay_lan_gateway();
+                if prefer_lan {
+                    info!(
+                        session_id = sid,
+                        advertise = %ep,
+                        ?peer_ips,
+                        ?gateway,
+                        "input relay advertise = LAN (all WS peers direct LAN)"
+                    );
+                } else if peer_ips.iter().any(|ip| {
+                    gateway
+                        .as_deref()
+                        .is_some_and(|gw| normalize_ws_peer_v4(ip) == gw)
+                }) {
+                    info!(
+                        session_id = sid,
+                        advertise = %ep,
+                        ?peer_ips,
+                        ?gateway,
+                        "input relay advertise = public (WS peer via LAN gateway / hairpin)"
+                    );
+                }
+                Some(ep)
+            }
             Err(e) => {
                 warn!(error = %e, session_id = sid, "input relay open_session failed");
                 send_to(

@@ -3,10 +3,12 @@ pub mod config;
 pub mod input_relay;
 pub mod metrics;
 pub mod players;
+pub mod public_ip;
 pub mod rooms;
 pub mod routes;
 pub mod signal;
 pub mod turn_credentials;
+pub mod udp_pktinfo;
 pub mod ws_lobby;
 
 use sqlx::SqlitePool;
