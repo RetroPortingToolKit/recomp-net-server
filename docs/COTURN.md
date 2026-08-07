@@ -70,7 +70,7 @@ use-auth-secret
 static-auth-secret=<same-value-as-COTURN_STATIC_AUTH_SECRET>
 # optional long-lived user for manual tests; lobby minting uses auth-secret
 user=netplay:<secret-pass-shared>
-realm=coturn.technicallycomputers.ca
+realm=coturn.retcomm.net
 cert=/etc/turnserver/certs/fullchain.pem
 pkey=/etc/turnserver/certs/privkey.pem
 allow-loopback-peers
@@ -135,11 +135,11 @@ after host/srflx stalls.
 # Must equal turnserver.conf static-auth-secret
 COTURN_STATIC_AUTH_SECRET=<same-secret>
 
-COTURN_REALM=coturn.technicallycomputers.ca
-COTURN_HOST=coturn.technicallycomputers.ca
+COTURN_REALM=coturn.retcomm.net
+COTURN_HOST=coturn.retcomm.net
 # Optional overrides (default to COTURN_HOST / standard ports):
-# COTURN_STUN_HOST=coturn.technicallycomputers.ca
-# COTURN_TURN_HOST=coturn.technicallycomputers.ca
+# COTURN_STUN_HOST=coturn.retcomm.net
+# COTURN_TURN_HOST=coturn.retcomm.net
 # COTURN_STUN_PORT=3478
 # COTURN_TURN_PORT=3478
 # COTURN_TURNS_PORT=5349

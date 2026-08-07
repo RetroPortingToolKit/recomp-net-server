@@ -106,6 +106,6 @@ cargo run
 # optional: cargo run -- --debug
 ```
 
-Clients default to `ws://netplay.technicallycomputers.ca:8765`. For a local
+Clients default to `ws://netplay.retcomm.net:8765`. For a local
 server: `PSX_NET_LOBBY_URL=ws://127.0.0.1:8765` (or `SNES_NET_LOBBY_URL`).
 (default matches local MotK).

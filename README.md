@@ -68,7 +68,7 @@ testing.
 Never commit `.env` — it is gitignored.
 
 Public reference lobby (when available):
-`ws://netplay.technicallycomputers.ca:8765`.
+`ws://netplay.retcomm.net:8765`.
 
 ## License
 
