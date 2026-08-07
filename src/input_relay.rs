@@ -373,14 +373,10 @@ async fn recv_loop(
     }
 }
 
-/// Online WebSocket lobbies always use the lobby UDP SFU star.
+/// Whether `start` should open the lobby UDP SFU.
 ///
-/// `match_caps.force_input_relay` is retained for older clients / diagnostics
-/// but does not gate relay open. Disable only via `INPUT_RELAY_ENABLED=0`.
-/// LAN/direct lobbies (no WS start) keep host-as-relay / P2P on the client.
-pub fn wants_input_relay(
-    _match_caps: &Option<serde_json::Value>,
-    _max_slots: usize,
-) -> bool {
-    true
+/// Decision is made in `ws_lobby` from seated count + waiting-room ICE path
+/// reports. This helper remains for call-site clarity / tests.
+pub fn wants_input_relay(use_sfu: bool) -> bool {
+    use_sfu
 }

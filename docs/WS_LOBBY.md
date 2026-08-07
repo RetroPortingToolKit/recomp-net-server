@@ -95,6 +95,7 @@ unfiltered; clients should filter locally to their own title + release.
   "name": "Friday Fights",
   "game_name": "Star Wars: Masters of Teras Kasi",
   "game_version": "0.1.0",
+  "disc_fp": "0123…64 hex chars…abcd",
   "password": "optional",
   "max_slots": 2,
   "host_bind": "0.0.0.0:7777",
@@ -116,6 +117,13 @@ unfiltered; clients should filter locally to their own title + release.
 `game_version` is the release / build pin for this title (semver or tag).
 Omitted or empty → stored as `"dev"` (local/dev builds). Peers must match
 exactly to join.
+
+`disc_fp` is an optional lowercase hex SHA-256 of the mounted disc TOC
+(geometry fingerprint from the client). Omitted / empty / invalid → stored
+empty (legacy). When either the lobby or the joiner has a non-empty
+fingerprint, both must match or join fails with `disc_mismatch`. This
+catches Track-01-only dumps vs full multi-track cues even when data-track
+hashes agree.
 
 `match_caps` is optional. When present it must be a JSON object (≤2048
 bytes serialized). The server stores it opaquely and echoes it on
@@ -150,7 +158,8 @@ Success:
   "guest_bind": "0.0.0.0:7778",
   "display_name": "Guest",
   "game_name": "Star Wars: Masters of Teras Kasi",
-  "game_version": "0.1.0"
+  "game_version": "0.1.0",
+  "disc_fp": "0123…64 hex chars…abcd"
 }
 ```
 
@@ -166,6 +175,7 @@ Outcomes:
 | `error` + `code:"bad_password"` | Wrong password |
 | `error` + `code:"version_mismatch"` | Guest `game_version` ≠ lobby |
 | `error` + `code:"game_mismatch"` | Guest `game_name` ≠ lobby |
+| `error` + `code:"disc_mismatch"` | Guest `disc_fp` ≠ lobby (or one side empty) |
 | `error` + `code:"full"` / `"gone"` | Cannot join |
 
 On successful join every member receives `lobby_update` with the new slot map,
@@ -210,13 +220,20 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
-Client → server (host only; requires `player_count >= 2`). Online start always
-opens the lobby UDP SFU star (`INPUT_RELAY_*`) and rewrites
-`host_endpoint` / `guest_endpoint` / `relay_endpoint` to the advertise address.
-Peers dial the SFU only — no host-as-relay and no guest↔guest mesh on the
-WebSocket path. `match_caps.force_input_relay` is retained for older clients
-but does not gate relay open. Ready flags are informational only — host Play
-is the launch authority:
+Client → server (host only; requires seated `player_count >= 2`). Transport is
+chosen from **seated** count and waiting-room ICE path reports (not
+`max_slots`):
+
+| Condition | Transport |
+|---|---|
+| seated ≥ 3 | lobby UDP SFU |
+| `match_caps.force_turn` or `force_input_relay` | SFU |
+| seated == 2 and **both** seats recently reported `path=direct` | `ice_p2p` |
+| otherwise (relay/fail/stale/missing path) | SFU (fail closed) |
+
+Path freshness is ~45s. Clients send `path_report` from the waiting-room ICE
+RTT probe (`host`/`srflx`/`prflx` → `direct`). Ready flags are informational
+only — host Play is the launch authority:
 
 ```json
 { "op": "start", "match_caps": { "v": 1, "…": "…" } }
@@ -224,14 +241,14 @@ is the launch authority:
 
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
-`need_players`, `relay_unavailable`.
+`need_players`, `relay_unavailable` (SFU required but relay not configured).
 
 On success the server:
 
 1. Allocates a **new** `session_id` (monotonic) for this match — rematch after
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
-2. Opens a UDP SFU session and sets `host_endpoint` / `guest_endpoint` (and
-   `relay_endpoint`) to the advertised relay address
+2. **SFU:** opens a UDP SFU session and sets `host_endpoint` /
+   `guest_endpoint` / `relay_endpoint` to the advertised relay address
    (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`). The host
    defaults from `PUBLIC_HOST` / `LOBBY_PUBLIC_HOST`, otherwise startup
    STUN-discovers this machine’s public IPv4 (never `127.0.0.1` unless
@@ -244,6 +261,8 @@ On success the server:
    MotK clients may also rewrite the relay host to a private WebSocket peer.
    On Linux the SFU uses `IP_PKTINFO` so forwarded datagrams are sourced from
    the local address each peer dialed (avoids dual-NIC wrong-source drops).
+   **ice_p2p:** no SFU; `relay_endpoint` omitted; peers run MotK ICE for the
+   match (waiting-room already punched a direct path).
 3. Clears every slot’s `ready` (clients auto-ready again for rematch).
 4. Broadcasts to **all** members:
 
@@ -256,6 +275,7 @@ On success the server:
   "host_endpoint": "…",
   "guest_endpoint": "…",
   "relay_endpoint": "public.example:8777",
+  "transport": "sfu",
   "player_count": 2,
   "max_slots": 2,
   "slots": [ … ],
@@ -263,12 +283,23 @@ On success the server:
 }
 ```
 
-`relay_endpoint` is present only when the server opened an input-relay
-session. Each client then starts delay-sync with the LAN endpoints from the
-message (local bind from create/join; peer = the other endpoint, or the
-relay when `relay_endpoint` / force-relay is set). Clients must refuse to
-boot netplay when the peer endpoint is empty. Guests apply `match_caps`
-(when present) before booting so both peers share sim-affecting settings.
+`transport` is `"sfu"` or `"ice_p2p"`. `relay_endpoint` is present only for
+SFU. Each client starts netplay from the launch endpoints (peer = relay when
+SFU; MotK ICE when `ice_p2p`). Guests apply `match_caps` (when present)
+before booting so both peers share sim-affecting settings.
+
+## Path report (waiting-room ICE)
+
+While seated (2 players), each client reports the selected ICE candidate type
+from the waiting-room RTT probe:
+
+```json
+{ "op": "path_report", "path": "direct" }
+```
+
+`path` is `direct` | `relay` | `fail` (aliases: `host`/`srflx`/`prflx` →
+`direct`, `failed`/`none` → `fail`). Success: `{ "op": "path_report_ok",
+"ok": true, "path": "direct" }`. Join/leave/kick clears stored paths.
 
 ## Leave / close / kick
 

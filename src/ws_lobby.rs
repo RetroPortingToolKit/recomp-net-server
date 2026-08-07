@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -32,7 +33,15 @@ struct Slot {
     player_id: String,
     display_name: String,
     ready: bool,
+    /// Peer-advertised BIOS capability (opaque JSON from set_ready).
+    bios_offer: Option<Value>,
+    /// Waiting-room ICE path report: "direct" | "relay" | "fail".
+    ice_path: Option<String>,
+    ice_path_at: Option<Instant>,
 }
+
+/// Path reports older than this are ignored (fail closed → SFU).
+const ICE_PATH_FRESH: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
 struct Lobby {
@@ -41,6 +50,8 @@ struct Lobby {
     game_name: String,
     /// Release / build pin (semver or tag). Peers must match to join.
     game_version: String,
+    /// TOC fingerprint (lowercase hex SHA-256). Empty = legacy host (no check).
+    disc_fp: String,
     host_player_id: String,
     #[allow(dead_code)]
     host_bind: String,
@@ -141,6 +152,9 @@ struct InMsg {
     /// Release version / build pin for this game (create / join / list filter).
     #[serde(default)]
     game_version: Option<String>,
+    /// Disc TOC fingerprint (create / join). Lowercase hex SHA-256, 64 chars.
+    #[serde(default)]
+    disc_fp: Option<String>,
     #[serde(default)]
     password: Option<String>,
     #[serde(default)]
@@ -167,6 +181,9 @@ struct InMsg {
     text: Option<String>,
     #[serde(default)]
     ready: Option<bool>,
+    /// Peer BIOS capability advertise (attached to set_ready).
+    #[serde(default)]
+    bios_offer: Option<Value>,
     /// Host sim settings blob (aspect, turbo_loads, bios_hle, input_delay, …).
     #[serde(default)]
     match_caps: Option<Value>,
@@ -178,6 +195,9 @@ struct InMsg {
     /// Host slot move: destination index (paired with `from_slot` or `slot`).
     #[serde(default)]
     to_slot: Option<usize>,
+    /// Waiting-room ICE path: `direct` | `relay` | `fail` (`path_report`).
+    #[serde(default)]
+    path: Option<String>,
 }
 
 fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
@@ -192,6 +212,33 @@ fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
         return None;
     }
     Some(v)
+}
+
+fn sanitize_bios_offer(offer: Option<Value>) -> Option<Value> {
+    let Some(v) = offer else {
+        return None;
+    };
+    if !v.is_object() {
+        return None;
+    }
+    let s = v.to_string();
+    if s.len() > 512 {
+        return None;
+    }
+    Some(v)
+}
+
+fn slot_json(i: usize, slot: &Slot) -> Value {
+    let mut row = json!({
+        "slot": i,
+        "player_id": slot.player_id,
+        "display_name": slot.display_name,
+        "ready": slot.ready,
+    });
+    if let Some(offer) = &slot.bios_offer {
+        row["bios_offer"] = offer.clone();
+    }
+    row
 }
 
 #[derive(Serialize)]
@@ -210,6 +257,30 @@ struct LobbyListRow<'a> {
 }
 
 /// Normalize empty / missing version to `"dev"` (local builds).
+/// Normalize disc TOC fingerprint: lowercase hex, exactly 64 chars, or empty.
+fn normalize_disc_fp(v: Option<String>) -> String {
+    let Some(raw) = v else {
+        return String::new();
+    };
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return String::new();
+    }
+    s
+}
+
+/// Peer mount match: when either side advertises a fingerprint, both must
+/// match. Two empty values (legacy clients) skip the check.
+fn disc_fp_mismatch(lobby_fp: &str, join_fp: &str) -> bool {
+    if lobby_fp.is_empty() && join_fp.is_empty() {
+        return false;
+    }
+    lobby_fp != join_fp
+}
+
 fn normalize_game_version(v: Option<String>) -> String {
     v.filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string())
@@ -373,6 +444,69 @@ fn sanitize_lan_endpoints(raw: Option<Vec<String>>) -> Vec<String> {
     out
 }
 
+fn clear_lobby_ice_paths(lobby: &mut Lobby) {
+    for s in lobby.slots.iter_mut().flatten() {
+        s.ice_path = None;
+        s.ice_path_at = None;
+    }
+}
+
+fn normalize_ice_path(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "direct" | "host" | "srflx" | "prflx" => Some("direct"),
+        "relay" => Some("relay"),
+        "fail" | "failed" | "none" => Some("fail"),
+        _ => None,
+    }
+}
+
+fn caps_bool(caps: &Option<Value>, key: &str) -> bool {
+    caps.as_ref()
+        .and_then(|c| c.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 2P ICE P2P when every seated peer recently reported a non-relay path.
+fn both_seated_ice_direct(lobby: &Lobby) -> bool {
+    let now = Instant::now();
+    let mut n = 0usize;
+    for s in lobby.slots.iter().flatten() {
+        n += 1;
+        let Some(path) = s.ice_path.as_deref() else {
+            return false;
+        };
+        if path != "direct" {
+            return false;
+        }
+        let Some(at) = s.ice_path_at else {
+            return false;
+        };
+        if now.duration_since(at) > ICE_PATH_FRESH {
+            return false;
+        }
+    }
+    n == 2
+}
+
+/// SFU vs ICE P2P for online `start` (seated count, not max_slots).
+fn start_use_sfu(lobby: &Lobby, caps: &Option<Value>) -> (bool, &'static str) {
+    let n = player_count(lobby);
+    if n >= 3 {
+        return (true, "seated_ge_3");
+    }
+    if caps_bool(caps, "force_turn") {
+        return (true, "force_turn");
+    }
+    if caps_bool(caps, "force_input_relay") {
+        return (true, "force_input_relay");
+    }
+    if n == 2 && both_seated_ice_direct(lobby) {
+        return (false, "ice_direct");
+    }
+    (true, "path_not_direct")
+}
+
 fn player_count(lobby: &Lobby) -> usize {
     lobby.slots.iter().filter(|s| s.is_some()).count()
 }
@@ -444,12 +578,7 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
         let mut slots = Vec::new();
         for (i, s) in l.slots.iter().enumerate() {
             if let Some(slot) = s {
-                slots.push(json!({
-                    "slot": i,
-                    "player_id": slot.player_id,
-                    "display_name": slot.display_name,
-                    "ready": slot.ready,
-                }));
+                slots.push(slot_json(i, slot));
             }
         }
         let all_ready = l.slots.iter().flatten().all(|s| s.ready)
@@ -536,6 +665,7 @@ async fn client_leave(state: &AppState, player_id: &str) {
                     }
                 }
                 lobby.guest_endpoint.clear();
+                clear_lobby_ice_paths(lobby);
             }
             Some((lid, false))
         }
@@ -670,6 +800,7 @@ async fn handle_text(
         "set_ready" => handle_set_ready(hub, player_id, msg).await?,
         "set_match_caps" => handle_set_match_caps(hub, player_id, msg).await?,
         "set_host_endpoint" => handle_set_host_endpoint(hub, player_id, msg).await?,
+        "path_report" => handle_path_report(hub, player_id, msg).await?,
         "start" => handle_start(state, player_id, msg).await?,
         "leave" => {
             client_leave(state, player_id).await;
@@ -830,6 +961,7 @@ async fn handle_create(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown".into());
     let game_version = normalize_game_version(msg.game_version);
+    let disc_fp = normalize_disc_fp(msg.disc_fp);
     let host_bind = msg
         .host_bind
         .filter(|s| !s.is_empty())
@@ -872,6 +1004,9 @@ async fn handle_create(
             player_id: player_id.to_string(),
             display_name: display_name.clone(),
             ready: false,
+            bios_offer: None,
+            ice_path: None,
+            ice_path_at: None,
         });
 
         let match_caps = sanitize_match_caps(msg.match_caps);
@@ -882,6 +1017,7 @@ async fn handle_create(
                 name,
                 game_name,
                 game_version,
+                disc_fp,
                 host_player_id: player_id.to_string(),
                 host_bind,
                 host_endpoint: host_endpoint.clone(),
@@ -968,17 +1104,24 @@ async fn handle_join(
     let password = msg.password.clone();
     let join_game_name = msg.game_name.clone().filter(|s| !s.is_empty());
     let join_game_version = normalize_game_version(msg.game_version);
+    let join_disc_fp = normalize_disc_fp(msg.disc_fp);
 
     let outcome = {
         let mut g = hub.inner.lock().await;
         if !g.lobbies.contains_key(&lobby_id) {
             SeatResult::Err("gone")
         } else {
-            let (game_name, game_version) = {
+            let (game_name, game_version, lobby_disc_fp) = {
                 let lobby = g.lobbies.get(&lobby_id).unwrap();
-                (lobby.game_name.clone(), lobby.game_version.clone())
+                (
+                    lobby.game_name.clone(),
+                    lobby.game_version.clone(),
+                    lobby.disc_fp.clone(),
+                )
             };
-            if let Some(ref want) = join_game_name {
+            if disc_fp_mismatch(&lobby_disc_fp, &join_disc_fp) {
+                SeatResult::Err("disc_mismatch")
+            } else if let Some(ref want) = join_game_name {
                 if &game_name != want {
                     SeatResult::Err("game_mismatch")
                 } else if game_version != join_game_version {
@@ -1099,10 +1242,15 @@ fn seat_joiner_locked(
             player_id: player_id.to_string(),
             display_name: display_name.clone(),
             ready: false,
+            bios_offer: None,
+            ice_path: None,
+            ice_path_at: None,
         });
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
         }
+        /* Membership change invalidates prior ICE path pairs. */
+        clear_lobby_ice_paths(lobby);
         lobby.guest_endpoint = rewrite_endpoint(guest_bind, peer_ip);
         (
             slot,
@@ -1193,6 +1341,7 @@ async fn handle_kick(
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
         }
+        clear_lobby_ice_paths(lobby);
         if let Some(c) = g.clients.get_mut(&victim) {
             c.lobby_id = None;
         }
@@ -1395,6 +1544,69 @@ async fn handle_set_host_endpoint(
     Ok(())
 }
 
+async fn handle_path_report(
+    hub: &WsLobbyHub,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let Some(raw) = msg.path.as_deref() else {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "bad_path_report", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(kind) = normalize_ice_path(raw) else {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "bad_path_report", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+    let err: Option<&'static str> = 'path: {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = g
+            .clients
+            .get(player_id)
+            .and_then(|c| c.lobby_id.clone())
+        else {
+            break 'path Some("not_in_lobby");
+        };
+        let Some(lobby) = g.lobbies.get_mut(&lid) else {
+            break 'path Some("gone");
+        };
+        for s in lobby.slots.iter_mut().flatten() {
+            if s.player_id == player_id {
+                s.ice_path = Some(kind.to_string());
+                s.ice_path_at = Some(Instant::now());
+                debug!(%player_id, path = kind, "lobby ICE path_report");
+                break 'path None;
+            }
+        }
+        Some("not_in_lobby")
+    };
+    if let Some(code) = err {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": code, "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    }
+    send_to(
+        hub,
+        player_id,
+        json!({ "op": "path_report_ok", "ok": true, "path": kind }).to_string(),
+    )
+    .await;
+    Ok(())
+}
+
 async fn handle_set_match_caps(
     hub: &WsLobbyHub,
     player_id: &str,
@@ -1459,6 +1671,7 @@ async fn handle_set_ready(
     msg: InMsg,
 ) -> Result<(), String> {
     let ready = msg.ready.unwrap_or(true);
+    let bios_offer = sanitize_bios_offer(msg.bios_offer);
     enum ReadyOut {
         Err(&'static str),
         Ok(String),
@@ -1473,6 +1686,9 @@ async fn handle_set_ready(
                     for s in lobby.slots.iter_mut().flatten() {
                         if s.player_id == player_id {
                             s.ready = ready;
+                            if bios_offer.is_some() {
+                                s.bios_offer = bios_offer.clone();
+                            }
                             break;
                         }
                     }
@@ -1524,10 +1740,16 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             break 'prep Err("need_players");
         }
         let caps_for_relay = fresh_caps.as_ref().or(lobby.match_caps.as_ref()).cloned();
-        /* Online start always opens the lobby UDP SFU (star). Peers never mesh. */
-        let use_relay =
-            crate::input_relay::wants_input_relay(&caps_for_relay, lobby.max_slots);
-        if !state.input_relay.enabled() {
+        /* 2 seated + fresh direct ICE reports → P2P; else lobby UDP SFU. */
+        let (use_relay, path_why) = start_use_sfu(lobby, &caps_for_relay);
+        info!(
+            lobby_id = %lid,
+            seated = n,
+            use_sfu = use_relay,
+            reason = path_why,
+            "lobby start transport decision"
+        );
+        if use_relay && !state.input_relay.enabled() {
             break 'prep Err("relay_unavailable");
         }
         /* Same-LAN / split-horizon: every seated peer's WS TCP source is a
@@ -1641,12 +1863,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         let mut slots = Vec::new();
         for (i, s) in lobby.slots.iter().enumerate() {
             if let Some(slot) = s {
-                slots.push(json!({
-                    "slot": i,
-                    "player_id": slot.player_id,
-                    "display_name": slot.display_name,
-                    "ready": slot.ready,
-                }));
+                slots.push(slot_json(i, slot));
             }
         }
         let members: Vec<String> = lobby
@@ -1664,6 +1881,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             "player_count": n,
             "max_slots": lobby.max_slots,
             "slots": slots,
+            "transport": if relay_endpoint.is_some() { "sfu" } else { "ice_p2p" },
         });
         if let Some(caps) = &lobby.match_caps {
             launch["match_caps"] = caps.clone();
