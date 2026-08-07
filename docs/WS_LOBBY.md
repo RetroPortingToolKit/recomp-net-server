@@ -220,20 +220,11 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
-Client → server (host only; requires seated `player_count >= 2`). Transport is
-chosen from **seated** count and waiting-room ICE path reports (not
-`max_slots`):
-
-| Condition | Transport |
-|---|---|
-| seated ≥ 3 | lobby UDP SFU |
-| `match_caps.force_turn` or `force_input_relay` | SFU |
-| seated == 2 and **both** seats recently reported `path=direct` | `ice_p2p` |
-| otherwise (relay/fail/stale/missing path) | SFU (fail closed) |
-
-Path freshness is ~45s. Clients send `path_report` from the waiting-room ICE
-RTT probe (`host`/`srflx`/`prflx` → `direct`). Ready flags are informational
-only — host Play is the launch authority:
+Client → server (host only; requires seated `player_count >= 2`). Online MotK/BPE
+lobbies **always** open the lobby UDP SFU (`transport=sfu`, §108). Waiting-room
+ICE `path_report` is telemetry only and does **not** select `ice_p2p`.
+`match_caps.force_turn` is a client delay-floor hint, not a transport switch.
+Ready flags are informational only — host Play is the launch authority:
 
 ```json
 { "op": "start", "match_caps": { "v": 1, "…": "…" } }
@@ -261,8 +252,6 @@ On success the server:
    MotK clients may also rewrite the relay host to a private WebSocket peer.
    On Linux the SFU uses `IP_PKTINFO` so forwarded datagrams are sourced from
    the local address each peer dialed (avoids dual-NIC wrong-source drops).
-   **ice_p2p:** no SFU; `relay_endpoint` omitted; peers run MotK ICE for the
-   match (waiting-room already punched a direct path).
 3. Clears every slot’s `ready` (clients auto-ready again for rematch).
 4. Broadcasts to **all** members:
 
@@ -283,15 +272,17 @@ On success the server:
 }
 ```
 
-`transport` is `"sfu"` or `"ice_p2p"`. `relay_endpoint` is present only for
-SFU. Each client starts netplay from the launch endpoints (peer = relay when
-SFU; MotK ICE when `ice_p2p`). Guests apply `match_caps` (when present)
-before booting so both peers share sim-affecting settings.
+`transport` is `"sfu"`. `relay_endpoint` is present on every successful online
+start. Each client starts netplay with LAN transport to the relay. Guests apply
+`match_caps` (when present) before booting so both peers share sim-affecting
+settings. Direct IP / LAN file lobbies (no MotK WS seat) stay on local UDP and
+do not use this path.
 
-## Path report (waiting-room ICE)
+## Path report (waiting-room ICE, telemetry)
 
-While seated (2 players), each client reports the selected ICE candidate type
-from the waiting-room RTT probe:
+While seated (2 players), ICE-capable clients may still report the selected
+candidate type from the waiting-room RTT probe (delay hints / diagnostics).
+This no longer affects match transport:
 
 ```json
 { "op": "path_report", "path": "direct" }

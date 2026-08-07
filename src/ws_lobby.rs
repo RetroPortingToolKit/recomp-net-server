@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -41,8 +41,6 @@ struct Slot {
 }
 
 /// Path reports older than this are ignored (fail closed → SFU).
-const ICE_PATH_FRESH: Duration = Duration::from_secs(45);
-
 #[derive(Clone)]
 struct Lobby {
     lobby_id: String,
@@ -460,51 +458,12 @@ fn normalize_ice_path(raw: &str) -> Option<&'static str> {
     }
 }
 
-fn caps_bool(caps: &Option<Value>, key: &str) -> bool {
-    caps.as_ref()
-        .and_then(|c| c.get(key))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-/// 2P ICE P2P when every seated peer recently reported a non-relay path.
-fn both_seated_ice_direct(lobby: &Lobby) -> bool {
-    let now = Instant::now();
-    let mut n = 0usize;
-    for s in lobby.slots.iter().flatten() {
-        n += 1;
-        let Some(path) = s.ice_path.as_deref() else {
-            return false;
-        };
-        if path != "direct" {
-            return false;
-        }
-        let Some(at) = s.ice_path_at else {
-            return false;
-        };
-        if now.duration_since(at) > ICE_PATH_FRESH {
-            return false;
-        }
-    }
-    n == 2
-}
-
-/// SFU vs ICE P2P for online `start` (seated count, not max_slots).
-fn start_use_sfu(lobby: &Lobby, caps: &Option<Value>) -> (bool, &'static str) {
-    let n = player_count(lobby);
-    if n >= 3 {
-        return (true, "seated_ge_3");
-    }
-    if caps_bool(caps, "force_turn") {
-        return (true, "force_turn");
-    }
-    if caps_bool(caps, "force_input_relay") {
-        return (true, "force_input_relay");
-    }
-    if n == 2 && both_seated_ice_direct(lobby) {
-        return (false, "ice_direct");
-    }
-    (true, "path_not_direct")
+/// Online MotK/BPE lobbies always use the lobby UDP SFU (§108).
+/// Waiting-room `path_report` / ICE P2P selection was removed — it disagreed
+/// with no-ICE builds and Force TURN semantics. Caps bits are ignored here;
+/// `force_turn` remains a client delay-floor hint only.
+fn start_use_sfu(_lobby: &Lobby, _caps: &Option<Value>) -> (bool, &'static str) {
+    (true, "always_sfu")
 }
 
 fn player_count(lobby: &Lobby) -> usize {
@@ -1740,7 +1699,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             break 'prep Err("need_players");
         }
         let caps_for_relay = fresh_caps.as_ref().or(lobby.match_caps.as_ref()).cloned();
-        /* 2 seated + fresh direct ICE reports → P2P; else lobby UDP SFU. */
+        /* §108: online lobbies always open lobby UDP SFU (no ice_p2p). */
         let (use_relay, path_why) = start_use_sfu(lobby, &caps_for_relay);
         info!(
             lobby_id = %lid,
