@@ -259,8 +259,8 @@ impl RoomRegistry {
         member.last_heartbeat = Utc::now();
         room.updated_at = Utc::now();
 
-        let all_ready = room.members.len() == room.slot_count as usize
-            && room.members.iter().all(|m| m.ready);
+        let all_ready =
+            room.members.len() == room.slot_count as usize && room.members.iter().all(|m| m.ready);
 
         if all_ready {
             if room.session_id.is_none() {
@@ -324,7 +324,10 @@ impl RoomRegistry {
                 .retain(|m| now.signed_duration_since(m.last_heartbeat) <= hb);
             if room.members.is_empty()
                 || now.signed_duration_since(room.updated_at) > idle
-                || !room.members.iter().any(|m| m.player_id == room.host_player_id)
+                || !room
+                    .members
+                    .iter()
+                    .any(|m| m.player_id == room.host_player_id)
             {
                 remove.push(*id);
             }
@@ -349,10 +352,31 @@ impl RoomRegistry {
         self.rooms.is_empty()
     }
 
+    /// HTTP rooms whose host has marked the match running.
+    pub fn running_count(&self) -> usize {
+        self.rooms
+            .values()
+            .filter(|r| r.status == RoomStatus::Running)
+            .count()
+    }
+
     /// Live room counts keyed by `game_id` (for `/stats` only).
     pub fn counts_by_game(&self) -> BTreeMap<String, usize> {
         let mut out = BTreeMap::new();
         for room in self.rooms.values() {
+            *out.entry(room.game_id.clone()).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// Live running-room counts keyed by `game_id` (for `/stats` only).
+    pub fn running_counts_by_game(&self) -> BTreeMap<String, usize> {
+        let mut out = BTreeMap::new();
+        for room in self
+            .rooms
+            .values()
+            .filter(|r| r.status == RoomStatus::Running)
+        {
             *out.entry(room.game_id.clone()).or_insert(0) += 1;
         }
         out

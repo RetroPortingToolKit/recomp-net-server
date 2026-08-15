@@ -40,24 +40,69 @@ fn parse_cli_debug_flag() -> bool {
     std::env::args().any(|a| a == "--debug")
 }
 
-async fn refresh_gauges(state: &AppState) -> (usize, usize, usize) {
+async fn refresh_gauges(state: &AppState) -> LiveCounts {
     let ws_clients = state.ws_lobby.client_count().await;
     let ws_lobbies = state.ws_lobby.lobby_count().await;
-    let http_rooms = state.rooms.lock().await.len();
-    metrics::set_gauges(ws_clients, ws_lobbies, http_rooms);
-    (ws_clients, ws_lobbies, http_rooms)
-}
-
-async fn stats_handler(axum::extract::State(state): axum::extract::State<AppState>) -> Json<StatsSnapshot> {
-    let (ws_clients, ws_lobbies, http_rooms) = refresh_gauges(&state).await;
-    let ws_lobbies_by_game = state.ws_lobby.counts_by_game().await;
-    let http_rooms_by_game = state.rooms.lock().await.counts_by_game();
-    Json(StatsSnapshot {
+    let ws_matches = state.ws_lobby.match_count().await;
+    let rooms = state.rooms.lock().await;
+    let http_rooms = rooms.len();
+    let http_rooms_running = rooms.running_count();
+    drop(rooms);
+    let (input_relay_sessions, input_relay_sessions_active) =
+        state.input_relay.session_counts().await;
+    metrics::set_gauges(
         ws_clients,
         ws_lobbies,
-        ws_lobbies_by_game,
+        ws_matches,
         http_rooms,
+        http_rooms_running,
+    );
+    metrics::set_input_relay_sessions(input_relay_sessions);
+    metrics::set_input_relay_sessions_active(input_relay_sessions_active);
+    LiveCounts {
+        ws_clients,
+        ws_lobbies,
+        ws_matches,
+        http_rooms,
+        http_rooms_running,
+        input_relay_sessions,
+        input_relay_sessions_active,
+    }
+}
+
+struct LiveCounts {
+    ws_clients: usize,
+    ws_lobbies: usize,
+    ws_matches: usize,
+    http_rooms: usize,
+    http_rooms_running: usize,
+    input_relay_sessions: usize,
+    input_relay_sessions_active: usize,
+}
+
+async fn stats_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<StatsSnapshot> {
+    let live = refresh_gauges(&state).await;
+    let ws_lobbies_by_game = state.ws_lobby.counts_by_game().await;
+    let ws_matches_by_game = state.ws_lobby.match_counts_by_game().await;
+    let rooms = state.rooms.lock().await;
+    let http_rooms_by_game = rooms.counts_by_game();
+    let http_rooms_running_by_game = rooms.running_counts_by_game();
+    drop(rooms);
+    Json(StatsSnapshot {
+        ws_clients: live.ws_clients,
+        ws_lobbies: live.ws_lobbies,
+        ws_lobbies_waiting: live.ws_lobbies.saturating_sub(live.ws_matches),
+        ws_matches: live.ws_matches,
+        ws_lobbies_by_game,
+        ws_matches_by_game,
+        http_rooms: live.http_rooms,
+        http_rooms_running: live.http_rooms_running,
         http_rooms_by_game,
+        http_rooms_running_by_game,
+        input_relay_sessions: live.input_relay_sessions,
+        input_relay_sessions_active: live.input_relay_sessions_active,
         totals: metrics::totals(),
     })
 }
@@ -117,9 +162,15 @@ const STATS_UI_HTML: &str = r#"<!DOCTYPE html>
         const s = await r.json();
         liveEl.innerHTML =
           card('WS clients', s.ws_clients) +
-          card('WS lobbies', s.ws_lobbies) +
-          card('HTTP rooms', s.http_rooms);
-        const g = rows('ws', s.ws_lobbies_by_game) + rows('http', s.http_rooms_by_game);
+          card('WS waiting', s.ws_lobbies_waiting ?? Math.max(0, (s.ws_lobbies||0) - (s.ws_matches||0))) +
+          card('WS matches', s.ws_matches ?? 0) +
+          card('HTTP rooms', s.http_rooms) +
+          card('HTTP running', s.http_rooms_running ?? 0) +
+          card('SFU live', s.input_relay_sessions_active ?? 0);
+        const g = rows('ws', s.ws_lobbies_by_game) +
+          rows('ws-match', s.ws_matches_by_game) +
+          rows('http', s.http_rooms_by_game) +
+          rows('http-running', s.http_rooms_running_by_game);
         gamesEl.innerHTML = g || '<tr><td colspan="3">none</td></tr>';
         const t = s.totals || {};
         totalsEl.innerHTML = [
@@ -208,8 +259,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let turn_configured = recomp_net_server::turn_credentials::TurnCredentialConfig::from_env()
-        .is_some();
+    let turn_configured =
+        recomp_net_server::turn_credentials::TurnCredentialConfig::from_env().is_some();
 
     metrics::describe();
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();

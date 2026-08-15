@@ -66,6 +66,8 @@ struct Lobby {
     match_caps: Option<Value>,
     /// Active UDP input-relay session (closed on destroy / rematch).
     relay_session_id: Option<u32>,
+    /// True after a successful `start` until the lobby is destroyed.
+    started: bool,
 }
 
 struct ClientMeta {
@@ -112,11 +114,32 @@ impl WsLobbyHub {
         self.inner.lock().await.lobbies.len()
     }
 
+    /// Lobbies that have completed at least one `start` (in-match / rematch).
+    pub async fn match_count(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .lobbies
+            .values()
+            .filter(|l| l.started)
+            .count()
+    }
+
     /// Live lobby counts keyed by `game_name` (for `/stats` only).
     pub async fn counts_by_game(&self) -> BTreeMap<String, usize> {
         let g = self.inner.lock().await;
         let mut out = BTreeMap::new();
         for lobby in g.lobbies.values() {
+            *out.entry(lobby.game_name.clone()).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// Live in-match lobby counts keyed by `game_name` (for `/stats` only).
+    pub async fn match_counts_by_game(&self) -> BTreeMap<String, usize> {
+        let g = self.inner.lock().await;
+        let mut out = BTreeMap::new();
+        for lobby in g.lobbies.values().filter(|l| l.started) {
             *out.entry(lobby.game_name.clone()).or_insert(0) += 1;
         }
         out
@@ -384,9 +407,7 @@ fn is_rfc1918_host(host: &str) -> bool {
     if parts[2].parse::<u8>().is_err() || parts[3].parse::<u8>().is_err() {
         return false;
     }
-    a == 10
-        || (a == 172 && (16..=31).contains(&b))
-        || (a == 192 && b == 168)
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
 }
 
 fn normalize_ws_peer_v4(ip: &str) -> &str {
@@ -540,9 +561,8 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
                 slots.push(slot_json(i, slot));
             }
         }
-        let all_ready = l.slots.iter().flatten().all(|s| s.ready)
-            && player_count(l) >= 2;
-            let mut msg = json!({
+        let all_ready = l.slots.iter().flatten().all(|s| s.ready) && player_count(l) >= 2;
+        let mut msg = json!({
             "op": "lobby_update",
             "lobby_id": l.lobby_id,
             "session_id": l.session_id,
@@ -736,7 +756,12 @@ async fn handle_text(
                     c.display_name = name;
                 }
             }
-            send_to(hub, player_id, json!({ "op": "hello_ok", "ok": true }).to_string()).await;
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "hello_ok", "ok": true }).to_string(),
+            )
+            .await;
         }
         "list" => {
             let filter_game = msg.game_name.as_deref().filter(|s| !s.is_empty());
@@ -763,7 +788,12 @@ async fn handle_text(
         "start" => handle_start(state, player_id, msg).await?,
         "leave" => {
             client_leave(state, player_id).await;
-            send_to(hub, player_id, json!({ "op": "left", "ok": true }).to_string()).await;
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "left", "ok": true }).to_string(),
+            )
+            .await;
         }
         "kick" => handle_kick(hub, player_id, msg).await?,
         "move" => handle_move(hub, player_id, msg).await?,
@@ -799,10 +829,7 @@ async fn handle_text(
     Ok(())
 }
 
-async fn handle_get_turn_credentials(
-    hub: &WsLobbyHub,
-    player_id: &str,
-) -> Result<(), String> {
+async fn handle_get_turn_credentials(hub: &WsLobbyHub, player_id: &str) -> Result<(), String> {
     use crate::turn_credentials;
 
     let Ok(uuid) = Uuid::parse_str(player_id) else {
@@ -925,10 +952,7 @@ async fn handle_create(
         .host_bind
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "0.0.0.0:7777".into());
-    let max_slots = msg
-        .max_slots
-        .unwrap_or(2)
-        .clamp(2, MAX_SLOTS as u32) as usize;
+    let max_slots = msg.max_slots.unwrap_or(2).clamp(2, MAX_SLOTS as u32) as usize;
 
     if let Some(dn) = msg.display_name.filter(|s| !s.is_empty()) {
         let mut g = hub.inner.lock().await;
@@ -989,12 +1013,19 @@ async fn handle_create(
                 slots,
                 match_caps: match_caps.clone(),
                 relay_session_id: None,
+                started: false,
             },
         );
         if let Some(c) = g.clients.get_mut(player_id) {
             c.lobby_id = Some(lobby_id.clone());
         }
-        (lobby_id, session_id, host_endpoint, display_name, match_caps)
+        (
+            lobby_id,
+            session_id,
+            host_endpoint,
+            display_name,
+            match_caps,
+        )
     };
 
     let mut created = json!({
@@ -1030,7 +1061,10 @@ async fn handle_join(
     peer_ip: &str,
     msg: InMsg,
 ) -> Result<(), String> {
-    let lobby_id = msg.lobby_id.filter(|s| !s.is_empty()).ok_or("missing lobby_id")?;
+    let lobby_id = msg
+        .lobby_id
+        .filter(|s| !s.is_empty())
+        .ok_or("missing lobby_id")?;
     {
         let g = hub.inner.lock().await;
         if g.clients
@@ -1179,8 +1213,7 @@ fn seat_joiner_locked(
             Some(l) => l,
             None => return SeatResult::Err("gone"),
         };
-        let pw_err = if let (Some(hash), Some(salt)) = (lobby.password_hash, lobby.password_salt)
-        {
+        let pw_err = if let (Some(hash), Some(salt)) = (lobby.password_hash, lobby.password_salt) {
             match password.filter(|s| !s.is_empty()) {
                 None => Some("need_password"),
                 Some(pw) if hash_password(pw, &salt) != hash => Some("bad_password"),
@@ -1233,11 +1266,7 @@ fn seat_joiner_locked(
     }
 }
 
-async fn handle_kick(
-    hub: &WsLobbyHub,
-    player_id: &str,
-    msg: InMsg,
-) -> Result<(), String> {
+async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let slot = msg.slot.ok_or("missing slot")?;
     struct KickOk {
         lid: String,
@@ -1245,11 +1274,7 @@ async fn handle_kick(
     }
     let outcome: Option<KickOk> = {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g
-            .clients
-            .get(player_id)
-            .and_then(|c| c.lobby_id.clone())
-        else {
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             return Ok(());
         };
         let Some(lobby) = g.lobbies.get_mut(&lid) else {
@@ -1320,11 +1345,7 @@ async fn handle_kick(
 }
 
 /// Host-only: swap (or move into an empty) seat. Broadcasts `lobby_update`.
-async fn handle_move(
-    hub: &WsLobbyHub,
-    player_id: &str,
-    msg: InMsg,
-) -> Result<(), String> {
+async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let from = msg.from_slot.or(msg.slot);
     let to = msg.to_slot;
     let (Some(from), Some(to)) = (from, to) else {
@@ -1341,11 +1362,7 @@ async fn handle_move(
     }
     let lid = {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g
-            .clients
-            .get(player_id)
-            .and_then(|c| c.lobby_id.clone())
-        else {
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             drop(g);
             send_to(
                 hub,
@@ -1443,11 +1460,7 @@ async fn handle_set_host_endpoint(
     };
     let lid = {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g
-            .clients
-            .get(player_id)
-            .and_then(|c| c.lobby_id.clone())
-        else {
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             drop(g);
             send_to(
                 hub,
@@ -1503,11 +1516,7 @@ async fn handle_set_host_endpoint(
     Ok(())
 }
 
-async fn handle_path_report(
-    hub: &WsLobbyHub,
-    player_id: &str,
-    msg: InMsg,
-) -> Result<(), String> {
+async fn handle_path_report(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let Some(raw) = msg.path.as_deref() else {
         send_to(
             hub,
@@ -1528,11 +1537,7 @@ async fn handle_path_report(
     };
     let err: Option<&'static str> = 'path: {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g
-            .clients
-            .get(player_id)
-            .and_then(|c| c.lobby_id.clone())
-        else {
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             break 'path Some("not_in_lobby");
         };
         let Some(lobby) = g.lobbies.get_mut(&lid) else {
@@ -1583,11 +1588,7 @@ async fn handle_set_match_caps(
     }
     let lid = {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g
-            .clients
-            .get(player_id)
-            .and_then(|c| c.lobby_id.clone())
-        else {
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             drop(g);
             send_to(
                 hub,
@@ -1624,11 +1625,7 @@ async fn handle_set_match_caps(
     Ok(())
 }
 
-async fn handle_set_ready(
-    hub: &WsLobbyHub,
-    player_id: &str,
-    msg: InMsg,
-) -> Result<(), String> {
+async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let ready = msg.ready.unwrap_or(true);
     let bios_offer = sanitize_bios_offer(msg.bios_offer);
     enum ReadyOut {
@@ -1681,11 +1678,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
     // Phase 1: validate + allocate session_id (hold lobby lock briefly).
     let prepared = 'prep: {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g
-            .clients
-            .get(player_id)
-            .and_then(|c| c.lobby_id.clone())
-        else {
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             break 'prep Err("not_in_lobby");
         };
         let Some(lobby) = g.lobbies.get(&lid) else {
@@ -1807,6 +1800,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             lobby.match_caps = Some(caps);
         }
         lobby.session_id = sid;
+        lobby.started = true;
         if let Some(ref ep) = relay_endpoint {
             lobby.host_endpoint = ep.clone();
             lobby.guest_endpoint = ep.clone();

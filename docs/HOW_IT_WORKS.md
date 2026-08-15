@@ -84,7 +84,7 @@ must stay in lockstep is `COTURN_STATIC_AUTH_SECRET` ↔ `static-auth-secret`.
 
 | Endpoint | Use |
 |----------|-----|
-| `GET /stats` | JSON: live WS/HTTP lobby counts, by-game breakdown, process totals |
+| `GET /stats` | JSON: live WS/HTTP lobby counts, in-match vs waiting, SFU-active sessions, by-game breakdown, process totals |
 | `GET /stats/ui` | Small HTML dashboard that polls `/stats` |
 | `GET /metrics` | Prometheus (`recomp_*` counters/gauges + HTTP request metrics) |
 

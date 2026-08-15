@@ -18,11 +18,7 @@ const DEFAULT_STUN: &str = "stun.l.google.com:19302";
 
 fn is_loopback_host(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
-    h.is_empty()
-        || h == "127.0.0.1"
-        || h == "::1"
-        || h == "localhost"
-        || h.starts_with("127.")
+    h.is_empty() || h == "127.0.0.1" || h == "::1" || h == "localhost" || h.starts_with("127.")
 }
 
 /// True when `host` is empty, loopback, or otherwise unsafe to advertise WAN peers.
@@ -66,8 +62,9 @@ pub fn discover_ipv4(timeout: Duration) -> Result<String> {
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no STUN endpoints")))
-        .context("failed to discover public IPv4 via STUN (set PUBLIC_HOST or INPUT_RELAY_ADVERTISE_HOST)")
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no STUN endpoints"))).context(
+        "failed to discover public IPv4 via STUN (set PUBLIC_HOST or INPUT_RELAY_ADVERTISE_HOST)",
+    )
 }
 
 fn discover_ipv4_via(endpoint: &str, timeout: Duration) -> Result<String> {

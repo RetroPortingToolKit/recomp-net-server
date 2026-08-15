@@ -35,7 +35,10 @@ impl SignalStore {
     }
 
     pub fn drain(&mut self, player_id: Uuid) -> Vec<SignalEnvelope> {
-        self.queues.remove(&player_id).map(|q| q.into()).unwrap_or_default()
+        self.queues
+            .remove(&player_id)
+            .map(|q| q.into())
+            .unwrap_or_default()
     }
 
     pub fn clear_player(&mut self, player_id: Uuid) {

@@ -57,8 +57,12 @@ impl Config {
         let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8765".to_string());
         let database_url = env::var("DATABASE_URL").ok().filter(|s| !s.is_empty());
         let require_auth = parse_bool_env(&env::var("REQUIRE_AUTH").unwrap_or_default());
-        let jwt_secret_current = env::var("JWT_SECRET_CURRENT").ok().filter(|s| !s.is_empty());
-        let jwt_secret_previous = env::var("JWT_SECRET_PREVIOUS").ok().filter(|s| !s.is_empty());
+        let jwt_secret_current = env::var("JWT_SECRET_CURRENT")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let jwt_secret_previous = env::var("JWT_SECRET_PREVIOUS")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         if require_auth && jwt_secret_current.is_none() {
             bail!(
@@ -107,8 +111,16 @@ impl Config {
         let input_relay_advertise_host = env::var("INPUT_RELAY_ADVERTISE_HOST")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| env::var("PUBLIC_HOST").ok().filter(|s| !s.trim().is_empty()))
-            .or_else(|| env::var("LOBBY_PUBLIC_HOST").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| {
+                env::var("PUBLIC_HOST")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                env::var("LOBBY_PUBLIC_HOST")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or_default();
         let input_relay_lan_host = env::var("INPUT_RELAY_LAN_HOST")
             .ok()
@@ -118,9 +130,8 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_default();
-        let input_relay_allow_loopback = parse_bool_env(
-            &env::var("INPUT_RELAY_ALLOW_LOOPBACK").unwrap_or_default(),
-        );
+        let input_relay_allow_loopback =
+            parse_bool_env(&env::var("INPUT_RELAY_ALLOW_LOOPBACK").unwrap_or_default());
 
         Ok(Config {
             bind_addr,
@@ -271,10 +282,7 @@ fn parse_u32_env(name: &str, default: u32) -> Result<u32> {
     match env::var(name) {
         Ok(s) if !s.is_empty() => {
             let t = s.trim();
-            if let Some(hex) = t
-                .strip_prefix("0x")
-                .or_else(|| t.strip_prefix("0X"))
-            {
+            if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
                 u32::from_str_radix(hex, 16)
                     .map_err(|_| anyhow::anyhow!("{name} must be a u32 (hex or decimal)"))
             } else {

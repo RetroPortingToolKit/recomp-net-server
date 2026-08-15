@@ -32,6 +32,8 @@ const HEADER_LEN: usize = 10;
 const RNET_PKT_START: u16 = 3;
 const RNET_PKT_DELAY_SYNC: u16 = 5;
 const SESSION_IDLE: Duration = Duration::from_secs(120);
+/// Recent UDP + at least two bound seats ⇒ pads are actually flowing.
+const SESSION_ACTIVE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct InputRelay {
@@ -45,6 +47,23 @@ pub struct InputRelay {
 
 struct RelayInner {
     sessions: HashMap<u32, RelaySession>,
+}
+
+impl RelayInner {
+    fn publish_gauges(&self) {
+        metrics::set_input_relay_sessions(self.sessions.len());
+        metrics::set_input_relay_sessions_active(self.active_count());
+    }
+
+    fn active_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.last_rx.elapsed() < SESSION_ACTIVE
+                    && s.slots.iter().filter(|b| b.is_some()).count() >= 2
+            })
+            .count()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -120,13 +139,12 @@ impl InputRelay {
                 tick.tick().await;
                 let mut g = janitor_inner.lock().await;
                 let before = g.sessions.len();
-                g.sessions
-                    .retain(|_, s| s.last_rx.elapsed() < SESSION_IDLE);
+                g.sessions.retain(|_, s| s.last_rx.elapsed() < SESSION_IDLE);
                 let dropped = before.saturating_sub(g.sessions.len());
                 if dropped > 0 {
                     debug!(dropped, "purged idle input-relay sessions");
                 }
-                metrics::set_input_relay_sessions(g.sessions.len());
+                g.publish_gauges();
             }
         });
 
@@ -188,8 +206,8 @@ impl InputRelay {
                 last_rx: Instant::now(),
             },
         );
-        metrics::set_input_relay_sessions(g.sessions.len());
         metrics::input_relay_session_opened();
+        g.publish_gauges();
         debug!(session_id, slot_count = slots, "input relay session opened");
         Ok(())
     }
@@ -201,9 +219,15 @@ impl InputRelay {
         let mut g = self.inner.lock().await;
         if g.sessions.remove(&session_id).is_some() {
             metrics::input_relay_session_closed();
-            metrics::set_input_relay_sessions(g.sessions.len());
+            g.publish_gauges();
             debug!(session_id, "input relay session closed");
         }
+    }
+
+    /// `(allocated sessions, sessions with recent two-seat traffic)`.
+    pub async fn session_counts(&self) -> (usize, usize) {
+        let g = self.inner.lock().await;
+        (g.sessions.len(), g.active_count())
     }
 }
 

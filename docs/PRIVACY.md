@@ -50,7 +50,10 @@ What metrics include:
 
 - Counts of connects, lobby/room creates, joins, join failures (by result code),
   match starts, TURN credential mints, and ICE signal relays
-- Gauges for currently connected WS clients, open WS lobbies, open HTTP rooms
+- Gauges for currently connected WS clients, open WS lobbies, **WS matches**
+  (lobbies that have `start`ed), open HTTP rooms, **HTTP rooms running**,
+  allocated input-relay sessions, and **SFU-active** sessions (recent UDP from
+  at least two seats)
 
 What metrics intentionally omit:
 

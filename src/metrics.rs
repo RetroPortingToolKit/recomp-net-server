@@ -2,6 +2,8 @@
 //!
 //! Labels stay low-cardinality (result codes only). Live game breakdowns are
 //! exposed via `/stats` from in-memory lobby/room state — not as metric labels.
+//! Waiting vs in-match is split: `recomp_ws_matches` / `recomp_http_rooms_running`
+//! plus `recomp_input_relay_sessions_active` (SFU pads actually flowing).
 
 use metrics::{counter, describe_counter, describe_gauge, gauge};
 use serde::Serialize;
@@ -81,7 +83,12 @@ pub fn describe() {
         "Currently connected WebSocket lobby clients"
     );
     describe_gauge!("recomp_ws_lobbies", "Currently open WebSocket lobbies");
+    describe_gauge!(
+        "recomp_ws_matches",
+        "WebSocket lobbies that have started a match"
+    );
     describe_gauge!("recomp_http_rooms", "Currently open HTTP /v1 rooms");
+    describe_gauge!("recomp_http_rooms_running", "HTTP /v1 rooms marked running");
     describe_counter!(
         "recomp_input_relay_sessions_opened_total",
         "Input-relay sessions allocated at match start"
@@ -100,7 +107,11 @@ pub fn describe() {
     );
     describe_gauge!(
         "recomp_input_relay_sessions",
-        "Live input-relay sessions"
+        "Live input-relay sessions (allocated at launch)"
+    );
+    describe_gauge!(
+        "recomp_input_relay_sessions_active",
+        "Input-relay sessions with recent UDP from at least two seats"
     );
 }
 
@@ -205,10 +216,22 @@ pub fn set_input_relay_sessions(n: usize) {
     gauge!("recomp_input_relay_sessions").set(n as f64);
 }
 
-pub fn set_gauges(ws_clients: usize, ws_lobbies: usize, http_rooms: usize) {
+pub fn set_input_relay_sessions_active(n: usize) {
+    gauge!("recomp_input_relay_sessions_active").set(n as f64);
+}
+
+pub fn set_gauges(
+    ws_clients: usize,
+    ws_lobbies: usize,
+    ws_matches: usize,
+    http_rooms: usize,
+    http_rooms_running: usize,
+) {
     gauge!("recomp_ws_clients").set(ws_clients as f64);
     gauge!("recomp_ws_lobbies").set(ws_lobbies as f64);
+    gauge!("recomp_ws_matches").set(ws_matches as f64);
     gauge!("recomp_http_rooms").set(http_rooms as f64);
+    gauge!("recomp_http_rooms_running").set(http_rooms_running as f64);
 }
 
 #[derive(Serialize)]
@@ -260,9 +283,16 @@ pub fn totals() -> Totals {
 pub struct StatsSnapshot {
     pub ws_clients: usize,
     pub ws_lobbies: usize,
+    pub ws_lobbies_waiting: usize,
+    pub ws_matches: usize,
     pub ws_lobbies_by_game: BTreeMap<String, usize>,
+    pub ws_matches_by_game: BTreeMap<String, usize>,
     pub http_rooms: usize,
+    pub http_rooms_running: usize,
     pub http_rooms_by_game: BTreeMap<String, usize>,
+    pub http_rooms_running_by_game: BTreeMap<String, usize>,
+    pub input_relay_sessions: usize,
+    pub input_relay_sessions_active: usize,
     pub totals: Totals,
 }
 

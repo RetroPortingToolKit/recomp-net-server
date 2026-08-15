@@ -114,9 +114,8 @@ fn storage_to_socket_addr(ss: &SockaddrStorage) -> Option<SocketAddr> {
     ss.as_sockaddr_in()
         .map(|v4| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(v4.ip()), v4.port())))
         .or_else(|| {
-            ss.as_sockaddr_in6().map(|v6| {
-                SocketAddr::V6(std::net::SocketAddrV6::new(v6.ip(), v6.port(), 0, 0))
-            })
+            ss.as_sockaddr_in6()
+                .map(|v6| SocketAddr::V6(std::net::SocketAddrV6::new(v6.ip(), v6.port(), 0, 0)))
         })
 }
 

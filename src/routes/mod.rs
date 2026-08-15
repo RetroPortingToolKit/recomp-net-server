@@ -2,7 +2,7 @@
 
 use crate::metrics;
 use crate::players;
-use crate::rooms::{Room, RoomError, RoomRegistry, RnetBootstrap};
+use crate::rooms::{RnetBootstrap, Room, RoomError, RoomRegistry};
 use crate::signal::SignalEnvelope;
 use crate::turn_credentials;
 use crate::AppState;
@@ -101,7 +101,10 @@ async fn create_room(
 ) -> Result<(StatusCode, Json<RoomView>), ApiError> {
     let player_id = require_auth(&state, &headers).await?;
     if !state.config.game_allowed(&body.game_id) {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "game_id not allowed"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "game_id not allowed",
+        ));
     }
     if body.game_id.is_empty() || body.client_version.is_empty() {
         return Err(ApiError::new(
@@ -133,7 +136,10 @@ async fn create_room(
         .map_err(ApiError::from)?;
     metrics::http_room_created();
 
-    Ok((StatusCode::CREATED, Json(RoomView::from_room(&room, player_id))))
+    Ok((
+        StatusCode::CREATED,
+        Json(RoomView::from_room(&room, player_id)),
+    ))
 }
 
 async fn get_room(
@@ -143,7 +149,9 @@ async fn get_room(
 ) -> Result<Json<RoomView>, ApiError> {
     let player_id = require_auth(&state, &headers).await?;
     let rooms = state.rooms.lock().await;
-    let room = rooms.get(&room_id).ok_or(ApiError::from(RoomError::NotFound))?;
+    let room = rooms
+        .get(&room_id)
+        .ok_or(ApiError::from(RoomError::NotFound))?;
     if !room.members.iter().any(|m| m.player_id == player_id) {
         return Err(ApiError::from(RoomError::NotMember));
     }
@@ -224,7 +232,9 @@ async fn heartbeat(
 ) -> Result<StatusCode, ApiError> {
     let player_id = require_auth(&state, &headers).await?;
     let mut rooms = state.rooms.lock().await;
-    rooms.heartbeat(&room_id, player_id).map_err(ApiError::from)?;
+    rooms
+        .heartbeat(&room_id, player_id)
+        .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -268,7 +278,9 @@ async fn post_signal(
 
     let targets = {
         let rooms = state.rooms.lock().await;
-        let room = rooms.get(&room_id).ok_or(ApiError::from(RoomError::NotFound))?;
+        let room = rooms
+            .get(&room_id)
+            .ok_or(ApiError::from(RoomError::NotFound))?;
         if !room.members.iter().any(|m| m.player_id == player_id) {
             return Err(ApiError::from(RoomError::NotMember));
         }
@@ -312,7 +324,9 @@ async fn get_signals(
     let player_id = require_auth(&state, &headers).await?;
     {
         let rooms = state.rooms.lock().await;
-        let room = rooms.get(&room_id).ok_or(ApiError::from(RoomError::NotFound))?;
+        let room = rooms
+            .get(&room_id)
+            .ok_or(ApiError::from(RoomError::NotFound))?;
         if !room.members.iter().any(|m| m.player_id == player_id) {
             return Err(ApiError::from(RoomError::NotMember));
         }
@@ -345,9 +359,8 @@ async fn turn_creds(
     headers: HeaderMap,
 ) -> Result<Json<TurnCredsResponse>, ApiError> {
     let player_id = require_auth(&state, &headers).await?;
-    let cfg = turn_credentials::require_config().map_err(|e| {
-        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
-    })?;
+    let cfg = turn_credentials::require_config()
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     let (username, password) = turn_credentials::issue_credentials(&cfg, &player_id)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     metrics::http_turn_credentials_issued();

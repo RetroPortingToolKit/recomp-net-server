@@ -28,7 +28,7 @@ Secrets: [docs/SECURITY.md](docs/SECURITY.md)
 
 | Endpoint | Use |
 |----------|-----|
-| `GET /stats` | JSON live counts + process totals |
+| `GET /stats` | JSON live counts (waiting vs in-match) + process totals |
 | `GET /stats/ui` | Browser glance page (auto-refresh) |
 | `GET /metrics` | Prometheus scrape |
 
