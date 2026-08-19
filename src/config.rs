@@ -27,6 +27,9 @@ pub struct Config {
     pub protocol_magic: u32,
     /// Empty = allow any non-empty game_id (dev). Otherwise exact match allowlist.
     pub game_allowlist: Vec<String>,
+    /// Ceiling on distinct `game` label values in Prometheus when no allowlist
+    /// is set. Games past the cap fold into `other`.
+    pub metrics_game_label_limit: usize,
     /// UDP delay-sync input relay (star fan-out). Off disables open_session.
     pub input_relay_enabled: bool,
     /// Socket bind for the input relay (e.g. `0.0.0.0:8777`).
@@ -92,6 +95,12 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let metrics_game_label_limit = parse_u64_env(
+            "METRICS_GAME_LABEL_LIMIT",
+            crate::metrics::DEFAULT_GAME_LABEL_LIMIT as u64,
+        )
+        .clamp(1, 1024) as usize;
+
         let input_relay_enabled = match env::var("INPUT_RELAY_ENABLED") {
             Ok(s) if !s.trim().is_empty() => parse_bool_env(&s),
             _ => true,
@@ -145,6 +154,7 @@ impl Config {
             heartbeat_timeout_secs,
             protocol_magic,
             game_allowlist,
+            metrics_game_label_limit,
             input_relay_enabled,
             input_relay_bind,
             input_relay_advertise_host,

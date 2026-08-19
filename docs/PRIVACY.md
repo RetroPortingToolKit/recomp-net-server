@@ -42,7 +42,7 @@ Operators can review aggregate usage without scraping application logs:
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /stats` | JSON snapshot: live client/lobby/room counts, live counts by `game_name` / `game_id`, process-lifetime totals |
+| `GET /stats` | JSON snapshot: live client/lobby/room counts, live counts by `game_name` / `game_id`, per-game match starts, process-lifetime totals |
 | `GET /stats/ui` | Small browser page that polls `/stats` |
 | `GET /metrics` | Prometheus text exposition (HTTP request metrics + recomp_* counters/gauges) |
 
@@ -50,6 +50,9 @@ What metrics include:
 
 - Counts of connects, lobby/room creates, joins, join failures (by result code),
   match starts, TURN credential mints, and ICE signal relays
+- Match starts, seated-player sums, and live in-match counts labelled by
+  **surface** (`ws` / `http`) and **game** — the title being played, nothing
+  about who is playing it
 - Gauges for currently connected WS clients, open WS lobbies, **WS matches**
   (lobbies that have `start`ed), open HTTP rooms, **HTTP rooms running**,
   allocated input-relay sessions, and **SFU-active** sessions (recent UDP from
@@ -58,8 +61,13 @@ What metrics include:
 What metrics intentionally omit:
 
 - Display names, player ids, peer IPs, lobby passwords, and ICE SDP payloads
-- Per-game labels on Prometheus series (game breakdowns are only in `/stats`
-  from current in-memory lobbies/rooms, bounded by active lobby limits)
+- Lobby names, game versions, and disc fingerprints — no metric label carries them
+- Unbounded label values: the `game` label is normalized (lowercased, reduced to
+  `[a-z0-9._-]`, truncated to 48 chars) and capped. With `LOBBY_GAME_ALLOWLIST`
+  set, only allowlisted titles get their own label; otherwise the first
+  `METRICS_GAME_LABEL_LIMIT` (default 64) distinct games do and everything past
+  the cap folds into `other`. Empty / unnamed games become `unknown`. Other
+  breakdowns (open lobbies, waiting rooms) stay `/stats`-only.
 
 Process-lifetime totals reset on restart unless scraped into an external
 time-series store (e.g. Prometheus + Grafana).

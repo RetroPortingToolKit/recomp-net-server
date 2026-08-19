@@ -19,6 +19,7 @@ use recomp_net_server::signal::SignalStore;
 use recomp_net_server::AppState;
 use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,9 +45,13 @@ async fn refresh_gauges(state: &AppState) -> LiveCounts {
     let ws_clients = state.ws_lobby.client_count().await;
     let ws_lobbies = state.ws_lobby.lobby_count().await;
     let ws_matches = state.ws_lobby.match_count().await;
+    let ws_lobbies_by_game = state.ws_lobby.counts_by_game().await;
+    let ws_matches_by_game = state.ws_lobby.match_counts_by_game().await;
     let rooms = state.rooms.lock().await;
     let http_rooms = rooms.len();
     let http_rooms_running = rooms.running_count();
+    let http_rooms_by_game = rooms.counts_by_game();
+    let http_rooms_running_by_game = rooms.running_counts_by_game();
     drop(rooms);
     let (input_relay_sessions, input_relay_sessions_active) =
         state.input_relay.session_counts().await;
@@ -57,14 +62,22 @@ async fn refresh_gauges(state: &AppState) -> LiveCounts {
         http_rooms,
         http_rooms_running,
     );
+    /* Live "what is being played right now", on the same bounded game label
+     * set as recomp_match_starts_total. */
+    metrics::set_matches_by_game(metrics::SURFACE_WS, &ws_matches_by_game);
+    metrics::set_matches_by_game(metrics::SURFACE_HTTP, &http_rooms_running_by_game);
     metrics::set_input_relay_sessions(input_relay_sessions);
     metrics::set_input_relay_sessions_active(input_relay_sessions_active);
     LiveCounts {
         ws_clients,
         ws_lobbies,
         ws_matches,
+        ws_lobbies_by_game,
+        ws_matches_by_game,
         http_rooms,
         http_rooms_running,
+        http_rooms_by_game,
+        http_rooms_running_by_game,
         input_relay_sessions,
         input_relay_sessions_active,
     }
@@ -74,8 +87,12 @@ struct LiveCounts {
     ws_clients: usize,
     ws_lobbies: usize,
     ws_matches: usize,
+    ws_lobbies_by_game: BTreeMap<String, usize>,
+    ws_matches_by_game: BTreeMap<String, usize>,
     http_rooms: usize,
     http_rooms_running: usize,
+    http_rooms_by_game: BTreeMap<String, usize>,
+    http_rooms_running_by_game: BTreeMap<String, usize>,
     input_relay_sessions: usize,
     input_relay_sessions_active: usize,
 }
@@ -84,23 +101,19 @@ async fn stats_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Json<StatsSnapshot> {
     let live = refresh_gauges(&state).await;
-    let ws_lobbies_by_game = state.ws_lobby.counts_by_game().await;
-    let ws_matches_by_game = state.ws_lobby.match_counts_by_game().await;
-    let rooms = state.rooms.lock().await;
-    let http_rooms_by_game = rooms.counts_by_game();
-    let http_rooms_running_by_game = rooms.running_counts_by_game();
-    drop(rooms);
     Json(StatsSnapshot {
         ws_clients: live.ws_clients,
         ws_lobbies: live.ws_lobbies,
         ws_lobbies_waiting: live.ws_lobbies.saturating_sub(live.ws_matches),
         ws_matches: live.ws_matches,
-        ws_lobbies_by_game,
-        ws_matches_by_game,
+        ws_lobbies_by_game: live.ws_lobbies_by_game,
+        ws_matches_by_game: live.ws_matches_by_game,
         http_rooms: live.http_rooms,
         http_rooms_running: live.http_rooms_running,
-        http_rooms_by_game,
-        http_rooms_running_by_game,
+        http_rooms_by_game: live.http_rooms_by_game,
+        http_rooms_running_by_game: live.http_rooms_running_by_game,
+        ws_match_starts_by_game: metrics::match_starts_by_game(metrics::SURFACE_WS),
+        http_match_starts_by_game: metrics::match_starts_by_game(metrics::SURFACE_HTTP),
         input_relay_sessions: live.input_relay_sessions,
         input_relay_sessions_active: live.input_relay_sessions_active,
         totals: metrics::totals(),
@@ -140,12 +153,15 @@ const STATS_UI_HTML: &str = r#"<!DOCTYPE html>
   <div id="live" class="grid"></div>
   <h2>By game (live)</h2>
   <table><thead><tr><th>Surface</th><th>Game</th><th>Count</th></tr></thead><tbody id="games"></tbody></table>
+  <h2>Match starts by game (since restart)</h2>
+  <table><thead><tr><th>Surface</th><th>Game</th><th>Starts</th><th>Players</th><th>Avg seats</th></tr></thead><tbody id="starts"></tbody></table>
   <h2>Process totals</h2>
   <div id="totals" class="grid"></div>
   <p class="sub" id="updated"></p>
   <script>
     const liveEl = document.getElementById('live');
     const gamesEl = document.getElementById('games');
+    const startsEl = document.getElementById('starts');
     const totalsEl = document.getElementById('totals');
     const updatedEl = document.getElementById('updated');
     function card(label, n) {
@@ -154,6 +170,15 @@ const STATS_UI_HTML: &str = r#"<!DOCTYPE html>
     function rows(surface, map) {
       return Object.entries(map || {}).map(([g, n]) =>
         `<tr><td>${surface}</td><td>${g}</td><td>${n}</td></tr>`).join('');
+    }
+    function startRows(surface, map) {
+      return Object.entries(map || {})
+        .sort((a, b) => (b[1].starts || 0) - (a[1].starts || 0))
+        .map(([g, t]) => {
+          const starts = t.starts || 0, players = t.players || 0;
+          const avg = starts ? (players / starts).toFixed(1) : '0.0';
+          return `<tr><td>${surface}</td><td>${g}</td><td>${starts}</td><td>${players}</td><td>${avg}</td></tr>`;
+        }).join('');
     }
     async function tick() {
       try {
@@ -172,6 +197,9 @@ const STATS_UI_HTML: &str = r#"<!DOCTYPE html>
           rows('http', s.http_rooms_by_game) +
           rows('http-running', s.http_rooms_running_by_game);
         gamesEl.innerHTML = g || '<tr><td colspan="3">none</td></tr>';
+        const st = startRows('ws', s.ws_match_starts_by_game) +
+          startRows('http', s.http_match_starts_by_game);
+        startsEl.innerHTML = st || '<tr><td colspan="5">none</td></tr>';
         const t = s.totals || {};
         totalsEl.innerHTML = [
           ['WS connects', t.ws_connects],
@@ -263,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         recomp_net_server::turn_credentials::TurnCredentialConfig::from_env().is_some();
 
     metrics::describe();
+    metrics::init_game_labels(&config.game_allowlist, config.metrics_game_label_limit);
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
     info!(

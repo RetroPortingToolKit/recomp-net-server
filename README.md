@@ -15,9 +15,11 @@ This server owns:
 - WebSocket JSON lobby for MotK / psxrecomp / SNES hosts ([docs/WS_LOBBY.md](docs/WS_LOBBY.md))
 - HTTP `/v1` game-filtered rooms ([docs/LOBBY.md](docs/LOBBY.md))
 - Slot and `session_id` / endpoint handoff
-- ICE signal relay and optional short-lived TURN credentials
+- ICE signal relay (waiting-room RTT and pre-join mod transfer) and optional
+  short-lived TURN credentials
 
-It does **not** run the guest sim and never sees gameplay inputs.
+It does **not** run the guest sim, never sees gameplay inputs, and does **not**
+carry mod-package bytes (those go host↔peer over ICE).
 
 Architecture: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)  
 Coturn / ICE TURN: [docs/COTURN.md](docs/COTURN.md)  
@@ -31,6 +33,16 @@ Secrets: [docs/SECURITY.md](docs/SECURITY.md)
 | `GET /stats` | JSON live counts (waiting vs in-match) + process totals |
 | `GET /stats/ui` | Browser glance page (auto-refresh) |
 | `GET /metrics` | Prometheus scrape |
+
+Match starts carry the game that was launched:
+`recomp_match_starts_total{surface="ws|http",game="..."}`,
+`recomp_match_players_total{...}` (seats summed over starts), and
+`recomp_matches_active{...}` for what is being played right now. Game names come
+from clients, so labels are normalized and **bounded** — with
+`LOBBY_GAME_ALLOWLIST` set only those games get their own label, otherwise the
+first `METRICS_GAME_LABEL_LIMIT` (default 64) do and the rest fold into `other`.
+`/stats` carries the same breakdown as JSON (`ws_match_starts_by_game`,
+`http_match_starts_by_game`).
 
 See [docs/PRIVACY.md](docs/PRIVACY.md) for what is (and is not) recorded.
 

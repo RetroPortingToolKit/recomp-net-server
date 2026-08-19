@@ -125,11 +125,13 @@ fingerprint, both must match or join fails with `disc_mismatch`. This
 catches Track-01-only dumps vs full multi-track cues even when data-track
 hashes agree.
 
-`match_caps` is optional. When present it must be a JSON object (≤2048
+`match_caps` is optional. When present it must be a JSON object (≤4096
 bytes serialized). The server stores it opaquely and echoes it on
 `created` / `joined` / `lobby_update` / `launch` so guests can apply the
 host’s sim-affecting settings at boot. Present-only settings (renderer,
-fullscreen, filters) stay local.
+fullscreen, filters) stay local. Optional `mods` is the host’s required
+package list (`[{id,ver,n,f,b,size},…]`); the match runs those packages
+and enabled features, not vanilla.
 
 Success:
 
@@ -159,18 +161,22 @@ Success:
   "display_name": "Guest",
   "game_name": "Star Wars: Masters of Teras Kasi",
   "game_version": "0.1.0",
-  "disc_fp": "0123…64 hex chars…abcd"
+  "disc_fp": "0123…64 hex chars…abcd",
+  "mod_offer": { "v": 1, "pkgs": [ { "id": "psx.foo", "ver": "1.0.0" } ] }
 }
 ```
 
 `game_version` is normalized like create (`""` → `"dev"`). When present,
-`game_name` must also match the lobby.
+`game_name` must also match the lobby. `mod_offer` is the guest’s installed
+package catalog (≤2048 bytes). After password / game / disc checks, the
+server compares it to `match_caps.mods` **before seating**.
 
 Outcomes:
 
 | `op` / fields | Meaning |
 |---------------|---------|
 | `joined` + `ok:true` | In room; includes `local_slot`, `session_id`, endpoints |
+| `need_mods` + `ok:false` | Password ok, not seated; install missing packages then rejoin |
 | `error` + `code:"need_password"` | Lobby is locked; retry with password |
 | `error` + `code:"bad_password"` | Wrong password |
 | `error` + `code:"version_mismatch"` | Guest `game_version` ≠ lobby |
@@ -181,6 +187,68 @@ Outcomes:
 On successful join every member receives `lobby_update` with the new slot map,
 peer endpoints, and ready flags. Membership changes clear everyone’s ready so
 players must re-confirm.
+
+## Missing mods (pre-join transfer)
+
+When `match_caps.mods` lists packages the guest’s `mod_offer` does not contain,
+the server does **not** seat the player. It stores a password-ok grant
+(`pending_mod_lobby`) and replies:
+
+```json
+{
+  "op": "need_mods",
+  "ok": false,
+  "code": "need_mods",
+  "lobby_id": "...",
+  "host_player_id": "...",
+  "mods": [ { "id": "psx.foo", "ver": "1.0.0", "n": "Foo", "f": "wide", "b": true, "size": 0 } ],
+  "can_transfer": true
+}
+```
+
+The client prompts before fully joining. Accept starts a **host↔guest ICE
+data path** (same libjuice stack as waiting-room RTT). Package bytes never
+cross the lobby WebSocket — the VPS only relays tiny SDP/candidate JSON.
+LAN/direct matches have no transfer path (join vanilla). There is no
+lobby-imposed archive size cap; STORE zip32 still cannot exceed 4 GiB per
+file/archive.
+
+```json
+{ "op": "mod_xfer_start", "lobby_id": "..." }
+```
+
+Server → lobby host:
+
+```json
+{ "op": "mod_xfer_pull", "from_player_id": "…guest…", "lobby_id": "…", "mods": [ … ] }
+```
+
+ICE signaling (pending guest ↔ host only; **not** seated `signal`). Host is
+ICE-controlling. Relayed only if the sender is the lobby host or a client
+with `pending_mod_lobby` for that room:
+
+```json
+{
+  "op": "mod_signal",
+  "lobby_id": "…",
+  "to_player_id": "…peer…",
+  "type": 1,
+  "flag": 0,
+  "text": "…"
+}
+```
+
+Abort / export failure (still WS; no file bytes):
+
+```json
+{ "op": "mod_xfer_fail", "to_player_id": "…guest…", "error": "export failed" }
+{ "op": "mod_xfer_cancel" }
+```
+
+Guest installs received `.psxmod` zips, then sends `join` again with an updated
+`mod_offer`. Cancel clears `pending_mod_lobby` (not seated). If ICE cannot
+hole-punch, juice may fall back to TURN (same Coturn as waiting-room ICE) —
+that is last-resort connectivity, not lobby-VPS file relay.
 
 ## Lobby room (`lobby_update`)
 

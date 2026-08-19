@@ -35,6 +35,8 @@ struct Slot {
     ready: bool,
     /// Peer-advertised BIOS capability (opaque JSON from set_ready).
     bios_offer: Option<Value>,
+    /// Peer installed-package catalog (opaque JSON from set_ready).
+    mod_offer: Option<Value>,
     /// Waiting-room ICE path report: "direct" | "relay" | "fail".
     ice_path: Option<String>,
     ice_path_at: Option<Instant>,
@@ -77,6 +79,8 @@ struct ClientMeta {
     /// TCP source IP as seen by the lobby (LAN vs WAN / hairpin signal).
     peer_ip: String,
     lobby_id: Option<String>,
+    /// Password-ok join waiting on missing mods (not seated).
+    pending_mod_lobby: Option<String>,
     tx: broadcast::Sender<String>,
 }
 
@@ -205,6 +209,9 @@ struct InMsg {
     /// Peer BIOS capability advertise (attached to set_ready).
     #[serde(default)]
     bios_offer: Option<Value>,
+    /// Peer installed-package catalog (attached to set_ready).
+    #[serde(default)]
+    mod_offer: Option<Value>,
     /// Host sim settings blob (aspect, turbo_loads, bios_hle, input_delay, …).
     #[serde(default)]
     match_caps: Option<Value>,
@@ -219,6 +226,8 @@ struct InMsg {
     /// Waiting-room ICE path: `direct` | `relay` | `fail` (`path_report`).
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
@@ -229,7 +238,7 @@ fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
         return None;
     }
     let s = v.to_string();
-    if s.len() > 2048 {
+    if s.len() > 4096 {
         return None;
     }
     Some(v)
@@ -249,6 +258,20 @@ fn sanitize_bios_offer(offer: Option<Value>) -> Option<Value> {
     Some(v)
 }
 
+fn sanitize_mod_offer(offer: Option<Value>) -> Option<Value> {
+    let Some(v) = offer else {
+        return None;
+    };
+    if !v.is_object() {
+        return None;
+    }
+    let s = v.to_string();
+    if s.len() > 2048 {
+        return None;
+    }
+    Some(v)
+}
+
 fn slot_json(i: usize, slot: &Slot) -> Value {
     let mut row = json!({
         "slot": i,
@@ -258,6 +281,9 @@ fn slot_json(i: usize, slot: &Slot) -> Value {
     });
     if let Some(offer) = &slot.bios_offer {
         row["bios_offer"] = offer.clone();
+    }
+    if let Some(offer) = &slot.mod_offer {
+        row["mod_offer"] = offer.clone();
     }
     row
 }
@@ -672,6 +698,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 display_name: format!("Player-{}", &player_id[..8.min(player_id.len())]),
                 peer_ip: peer_ip.clone(),
                 lobby_id: None,
+                pending_mod_lobby: None,
                 tx: tx.clone(),
             },
         );
@@ -815,6 +842,10 @@ async fn handle_text(
             }
         }
         "signal" => handle_signal(hub, player_id, msg).await?,
+        "mod_signal" => handle_mod_signal(hub, player_id, msg).await?,
+        "mod_xfer_start" => handle_mod_xfer_start(hub, player_id, msg).await?,
+        "mod_xfer_cancel" => handle_mod_xfer_cancel(hub, player_id).await?,
+        "mod_xfer_fail" => handle_mod_xfer_fail(hub, player_id, msg).await?,
         "get_turn_credentials" => handle_get_turn_credentials(hub, player_id).await?,
         other => {
             send_to(
@@ -825,6 +856,161 @@ async fn handle_text(
             )
             .await;
         }
+    }
+    Ok(())
+}
+
+async fn handle_mod_xfer_start(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let lobby_id = msg.lobby_id.unwrap_or_default();
+    if lobby_id.is_empty() {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "gone", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    }
+    let (host_id, mods) = {
+        let g = hub.inner.lock().await;
+        let pending = g
+            .clients
+            .get(player_id)
+            .and_then(|c| c.pending_mod_lobby.clone());
+        if pending.as_deref() != Some(lobby_id.as_str()) {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "need_mods", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        let Some(lobby) = g.lobbies.get(&lobby_id) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "gone", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        (
+            lobby.host_player_id.clone(),
+            required_mod_rows(&lobby.match_caps),
+        )
+    };
+    send_to(
+        hub,
+        &host_id,
+        json!({
+            "op": "mod_xfer_pull",
+            "from_player_id": player_id,
+            "lobby_id": lobby_id,
+            "mods": mods,
+        })
+        .to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+async fn handle_mod_xfer_cancel(hub: &WsLobbyHub, player_id: &str) -> Result<(), String> {
+    let mut g = hub.inner.lock().await;
+    if let Some(c) = g.clients.get_mut(player_id) {
+        c.pending_mod_lobby = None;
+    }
+    Ok(())
+}
+
+fn xfer_relay_ok(
+    g: &HubInner,
+    from_id: &str,
+    to_id: &str,
+) -> Result<String, &'static str> {
+    let to = g.clients.get(to_id).ok_or("gone")?;
+    let lid = to.pending_mod_lobby.as_ref().ok_or("need_mods")?;
+    let lobby = g.lobbies.get(lid).ok_or("gone")?;
+    if lobby.host_player_id != from_id {
+        return Err("not_host");
+    }
+    Ok(to_id.to_string())
+}
+
+async fn handle_mod_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let to = msg.to_player_id.unwrap_or_default();
+    let (fwd, target) = {
+        let g = hub.inner.lock().await;
+        let sender = g.clients.get(player_id).ok_or_else(|| "gone".to_string())?;
+        let lid = msg
+            .lobby_id
+            .clone()
+            .or_else(|| sender.pending_mod_lobby.clone())
+            .or_else(|| sender.lobby_id.clone())
+            .ok_or_else(|| "no lobby".to_string())?;
+        let Some(lobby) = g.lobbies.get(&lid) else {
+            return Ok(());
+        };
+        let pending = sender.pending_mod_lobby.as_deref() == Some(lid.as_str());
+        let is_host = lobby.host_player_id == player_id;
+        if !pending && !is_host {
+            return Ok(());
+        }
+        let dest = if pending {
+            lobby.host_player_id.clone()
+        } else {
+            if to.is_empty() {
+                return Ok(());
+            }
+            let Some(peer) = g.clients.get(&to) else {
+                return Ok(());
+            };
+            if peer.pending_mod_lobby.as_deref() != Some(lid.as_str()) {
+                return Ok(());
+            }
+            to.clone()
+        };
+        let fwd = json!({
+            "op": "mod_signal",
+            "lobby_id": lid,
+            "from_player_id": player_id,
+            "type": msg.r#type.unwrap_or(0),
+            "flag": msg.flag.unwrap_or(0),
+            "text": msg.text.unwrap_or_default(),
+        })
+        .to_string();
+        (fwd, dest)
+    };
+    send_to(hub, &target, fwd).await;
+    Ok(())
+}
+
+async fn handle_mod_xfer_fail(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let to = msg.to_player_id.unwrap_or_default();
+    let err = msg.error.unwrap_or_else(|| "export failed".into());
+    let dest = {
+        let g = hub.inner.lock().await;
+        if let Ok(d) = xfer_relay_ok(&g, player_id, &to) {
+            Some(d)
+        } else if let Some(c) = g.clients.get(player_id) {
+            if let Some(lid) = c.pending_mod_lobby.as_ref() {
+                g.lobbies.get(lid).map(|l| l.host_player_id.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(dest) = dest {
+        send_to(
+            hub,
+            &dest,
+            json!({ "op": "mod_xfer_fail", "error": err }).to_string(),
+        )
+        .await;
     }
     Ok(())
 }
@@ -988,6 +1174,7 @@ async fn handle_create(
             display_name: display_name.clone(),
             ready: false,
             bios_offer: None,
+            mod_offer: None,
             ice_path: None,
             ice_path_at: None,
         });
@@ -1098,6 +1285,7 @@ async fn handle_join(
     let join_game_name = msg.game_name.clone().filter(|s| !s.is_empty());
     let join_game_version = normalize_game_version(msg.game_version);
     let join_disc_fp = normalize_disc_fp(msg.disc_fp);
+    let join_mod_offer = msg.mod_offer.clone();
 
     let outcome = {
         let mut g = hub.inner.lock().await;
@@ -1127,6 +1315,7 @@ async fn handle_join(
                         peer_ip,
                         &guest_bind,
                         password.as_deref(),
+                        join_mod_offer.clone(),
                     )
                 }
             } else if game_version != join_game_version {
@@ -1139,6 +1328,7 @@ async fn handle_join(
                     peer_ip,
                     &guest_bind,
                     password.as_deref(),
+                    join_mod_offer.clone(),
                 )
             }
         }
@@ -1155,6 +1345,37 @@ async fn handle_join(
             .await;
             Ok(())
         }
+        SeatResult::NeedMods {
+            mods,
+            can_transfer,
+        } => {
+            let host_id = {
+                let mut g = hub.inner.lock().await;
+                if let Some(c) = g.clients.get_mut(player_id) {
+                    c.pending_mod_lobby = Some(lobby_id.clone());
+                }
+                g.lobbies
+                    .get(&lobby_id)
+                    .map(|l| l.host_player_id.clone())
+                    .unwrap_or_default()
+            };
+            send_to(
+                hub,
+                player_id,
+                json!({
+                    "op": "need_mods",
+                    "ok": false,
+                    "code": "need_mods",
+                    "lobby_id": lobby_id,
+                    "host_player_id": host_id,
+                    "mods": mods,
+                    "can_transfer": can_transfer,
+                })
+                .to_string(),
+            )
+            .await;
+            Ok(())
+        }
         SeatResult::Ok {
             slot,
             session_id,
@@ -1162,6 +1383,12 @@ async fn handle_join(
             guest_endpoint,
             match_caps,
         } => {
+            {
+                let mut g = hub.inner.lock().await;
+                if let Some(c) = g.clients.get_mut(player_id) {
+                    c.pending_mod_lobby = None;
+                }
+            }
             let mut joined = json!({
                 "op": "joined",
                 "ok": true,
@@ -1185,6 +1412,10 @@ async fn handle_join(
 
 enum SeatResult {
     Err(&'static str),
+    NeedMods {
+        mods: Vec<Value>,
+        can_transfer: bool,
+    },
     Ok {
         slot: usize,
         session_id: u32,
@@ -1194,6 +1425,42 @@ enum SeatResult {
     },
 }
 
+fn required_mod_rows(caps: &Option<Value>) -> Vec<Value> {
+    let Some(c) = caps else {
+        return Vec::new();
+    };
+    let Some(arr) = c.get("mods").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|v| {
+            v.get("id")
+                .or_else(|| v.get("i"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .is_some()
+        })
+        .cloned()
+        .collect()
+}
+
+fn guest_has_pkg(offer: &Option<Value>, id: &str, ver: &str) -> bool {
+    let Some(o) = offer else {
+        return false;
+    };
+    let arr = o
+        .get("pkgs")
+        .or_else(|| o.get("mods"))
+        .and_then(|v| v.as_array());
+    let Some(arr) = arr else {
+        return false;
+    };
+    arr.iter().any(|p| {
+        p.get("id").or_else(|| p.get("i")).and_then(|v| v.as_str()) == Some(id)
+            && p.get("ver").or_else(|| p.get("v")).and_then(|v| v.as_str()) == Some(ver)
+    })
+}
+
 fn seat_joiner_locked(
     g: &mut HubInner,
     lobby_id: &str,
@@ -1201,6 +1468,7 @@ fn seat_joiner_locked(
     peer_ip: &str,
     guest_bind: &str,
     password: Option<&str>,
+    mod_offer: Option<Value>,
 ) -> SeatResult {
     let requested_name = g
         .clients
@@ -1225,6 +1493,28 @@ fn seat_joiner_locked(
         if let Some(code) = pw_err {
             return SeatResult::Err(code);
         }
+        let missing: Vec<Value> = required_mod_rows(&lobby.match_caps)
+            .into_iter()
+            .filter(|m| {
+                let id = m
+                    .get("id")
+                    .or_else(|| m.get("i"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let ver = m
+                    .get("ver")
+                    .or_else(|| m.get("v"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                !id.is_empty() && !guest_has_pkg(&mod_offer, id, ver)
+            })
+            .collect();
+        if !missing.is_empty() {
+            return SeatResult::NeedMods {
+                mods: missing,
+                can_transfer: true,
+            };
+        }
         if player_count(lobby) >= lobby.max_slots || lobby.slots.iter().all(|s| s.is_some()) {
             return SeatResult::Err("full");
         }
@@ -1235,6 +1525,7 @@ fn seat_joiner_locked(
             display_name: display_name.clone(),
             ready: false,
             bios_offer: None,
+            mod_offer: None,
             ice_path: None,
             ice_path_at: None,
         });
@@ -1628,6 +1919,7 @@ async fn handle_set_match_caps(
 async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let ready = msg.ready.unwrap_or(true);
     let bios_offer = sanitize_bios_offer(msg.bios_offer);
+    let mod_offer = sanitize_mod_offer(msg.mod_offer);
     enum ReadyOut {
         Err(&'static str),
         Ok(String),
@@ -1644,6 +1936,9 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
                             s.ready = ready;
                             if bios_offer.is_some() {
                                 s.bios_offer = bios_offer.clone();
+                            }
+                            if mod_offer.is_some() {
+                                s.mod_offer = mod_offer.clone();
                             }
                             break;
                         }
@@ -1670,7 +1965,11 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
 async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
     enum StartOut {
         Err(&'static str),
-        Ok { msg: String, members: Vec<String> },
+        Ok {
+            msg: String,
+            members: Vec<String>,
+            game_name: String,
+        },
     }
     let hub = &state.ws_lobby;
     let fresh_caps = sanitize_match_caps(msg.match_caps);
@@ -1845,6 +2144,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         StartOut::Ok {
             msg: launch.to_string(),
             members,
+            game_name: lobby.game_name.clone(),
         }
     };
     match outcome {
@@ -1859,11 +2159,16 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             )
             .await;
         }
-        StartOut::Ok { msg, members } => {
+        StartOut::Ok {
+            msg,
+            members,
+            game_name,
+        } => {
+            let players = members.len();
             for m in members {
                 send_to(hub, &m, msg.clone()).await;
             }
-            metrics::ws_lobby_started();
+            metrics::ws_lobby_started(&game_name, players);
         }
     }
     Ok(())

@@ -248,7 +248,7 @@ async fn mark_running(
     let room = rooms
         .mark_running(&room_id, player_id)
         .map_err(ApiError::from)?;
-    metrics::http_room_started();
+    metrics::http_room_started(&room.game_id, room.members.len());
     Ok(Json(RoomView::from_room(&room, player_id)))
 }
 
