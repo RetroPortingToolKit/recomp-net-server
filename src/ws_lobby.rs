@@ -297,6 +297,9 @@ struct LobbyListRow<'a> {
     player_count: usize,
     max_slots: usize,
     has_password: bool,
+    /// match_caps.lobby_kind echoed for browser badges (0 standard,
+    /// 1 PSX-Link). Opaque otherwise; absent caps read as 0.
+    lobby_kind: i64,
     /// Host UDP game endpoint (rewritten for peers). Clients probe RTT here.
     host_endpoint: &'a str,
     /// Same-LAN probe candidates (RFC1918 host:port).
@@ -363,6 +366,12 @@ fn lobby_list_json_filtered(
             player_count: player_count(l),
             max_slots: l.max_slots,
             has_password: l.password_hash.is_some(),
+            lobby_kind: l
+                .match_caps
+                .as_ref()
+                .and_then(|c| c.get("lobby_kind"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
             host_endpoint: &l.host_endpoint,
             lan_endpoints: &l.lan_endpoints,
         })
