@@ -220,6 +220,15 @@ struct InMsg {
     /// Host slot move: source index (paired with `to_slot`).
     #[serde(default)]
     from_slot: Option<usize>,
+    /// Seat self-service: target seat of a `seat_move` / `seat_swap_request`.
+    #[serde(default)]
+    target_slot: Option<usize>,
+    /// Seat swap verdict (`seat_swap_answer`).
+    #[serde(default)]
+    accept: Option<bool>,
+    /// Seat swap: the player who asked (echoed back on the answer).
+    #[serde(default)]
+    asker_player_id: Option<String>,
     /// Host slot move: destination index (paired with `from_slot` or `slot`).
     #[serde(default)]
     to_slot: Option<usize>,
@@ -833,6 +842,9 @@ async fn handle_text(
         }
         "kick" => handle_kick(hub, player_id, msg).await?,
         "move" => handle_move(hub, player_id, msg).await?,
+        "seat_move" => handle_seat_move(hub, player_id, msg).await?,
+        "seat_swap_request" => handle_seat_swap_request(hub, player_id, msg).await?,
+        "seat_swap_answer" => handle_seat_swap_answer(hub, player_id, msg).await?,
         "close" => {
             let lid = {
                 let g = hub.inner.lock().await;
@@ -1731,6 +1743,212 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
         lid
     };
     emit_lobby_update(hub, &lid).await;
+    Ok(())
+}
+
+/* ===== seat self-service =================================================
+ * `move` above is the HOST rearranging anybody. These three let a player
+ * manage its OWN seat: taking a free seat is immediate, taking an occupied
+ * one needs that player's consent, so it is a request the occupant answers.
+ * The server arbitrates, which also makes two simultaneous requests resolve
+ * in arrival order rather than racing. Slot 0 stays pinned to the host / sim
+ * authority, exactly as in `handle_move`. */
+
+/// Find the seat a player currently occupies.
+fn slot_of_player(lobby: &Lobby, player_id: &str) -> Option<usize> {
+    lobby
+        .slots
+        .iter()
+        .position(|s| s.as_ref().is_some_and(|s| s.player_id == player_id))
+}
+
+/// A player moves ITSELF into a free seat.
+async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let Some(to) = msg.to_slot.or(msg.target_slot) else {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "bad_slot", "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    };
+    let lid = {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_in_lobby", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get_mut(&lid) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "gone", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        let Some(from) = slot_of_player(lobby, player_id) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_seated", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        if to >= lobby.slots.len() || from == to || from == 0 || to == 0 {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "host_slot_fixed", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        /* Occupied seats are not takeable without consent — that is what
+         * seat_swap_request is for. */
+        if lobby.slots[to].is_some() {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "slot_taken", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        lobby.slots.swap(from, to);
+        for s in lobby.slots.iter_mut().flatten() {
+            s.ready = false;
+        }
+        lid
+    };
+    emit_lobby_update(hub, &lid).await;
+    Ok(())
+}
+
+/// Ask the player sitting in `target_slot` to trade seats. Nothing moves yet.
+async fn handle_seat_swap_request(
+    hub: &WsLobbyHub,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let Some(target) = msg.target_slot.or(msg.to_slot) else {
+        return Ok(());
+    };
+    let (dest, ask) = {
+        let g = hub.inner.lock().await;
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get(&lid) else {
+            return Ok(());
+        };
+        let Some(from) = slot_of_player(lobby, player_id) else {
+            return Ok(());
+        };
+        if target >= lobby.slots.len() || target == from || target == 0 || from == 0 {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "host_slot_fixed", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        let Some(occupant) = lobby.slots[target].as_ref() else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "empty_slot", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        let asker_name = lobby.slots[from]
+            .as_ref()
+            .map(|s| s.display_name.clone())
+            .unwrap_or_default();
+        (
+            occupant.player_id.clone(),
+            json!({
+                "op": "seat_swap_ask",
+                "asker_player_id": player_id,
+                "asker_name": asker_name,
+                "from_slot": from,
+                "target_slot": target,
+            })
+            .to_string(),
+        )
+    };
+    send_to(hub, &dest, ask).await;
+    Ok(())
+}
+
+/// The occupant answers. On accept the server performs the swap.
+async fn handle_seat_swap_answer(
+    hub: &WsLobbyHub,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let accept = msg.accept.unwrap_or(false);
+    let asker = msg.asker_player_id.unwrap_or_default();
+    if asker.is_empty() {
+        return Ok(());
+    }
+    let (lid, swapped) = {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get_mut(&lid) else {
+            return Ok(());
+        };
+        let (Some(mine), Some(theirs)) = (
+            slot_of_player(lobby, player_id),
+            slot_of_player(lobby, &asker),
+        ) else {
+            /* The asker left, or seats moved under us — decline quietly. */
+            drop(g);
+            send_to(
+                hub,
+                &asker,
+                json!({ "op": "seat_swap_result", "accept": false, "ok": true }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        if !accept || mine == 0 || theirs == 0 {
+            (lid.clone(), false)
+        } else {
+            lobby.slots.swap(mine, theirs);
+            for s in lobby.slots.iter_mut().flatten() {
+                s.ready = false;
+            }
+            (lid.clone(), true)
+        }
+    };
+    send_to(
+        hub,
+        &asker,
+        json!({ "op": "seat_swap_result", "accept": swapped, "ok": true }).to_string(),
+    )
+    .await;
+    if swapped {
+        emit_lobby_update(hub, &lid).await;
+    }
     Ok(())
 }
 
