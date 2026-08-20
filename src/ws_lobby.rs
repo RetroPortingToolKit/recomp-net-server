@@ -1724,18 +1724,9 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
-        /* Slot 0 is the session host / sim authority. Guests may rearrange
-         * among seats 1..max-1; the lobby host stays pinned at slot 0. */
-        if from == 0 || to == 0 {
-            drop(g);
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "host_slot_fixed", "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
+        /* The host is identified by host_player_id, not by slot index, so
+         * the host's own seat may move like any other — including trading
+         * places with a guest. */
         lobby.slots.swap(from, to);
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
@@ -1805,12 +1796,12 @@ async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
             .await;
             return Ok(());
         };
-        if to >= lobby.slots.len() || from == to || from == 0 || to == 0 {
+        if to >= lobby.slots.len() || from == to {
             drop(g);
             send_to(
                 hub,
                 player_id,
-                json!({ "op": "error", "code": "host_slot_fixed", "ok": false }).to_string(),
+                json!({ "op": "error", "code": "bad_slot", "ok": false }).to_string(),
             )
             .await;
             return Ok(());
@@ -1857,12 +1848,12 @@ async fn handle_seat_swap_request(
         let Some(from) = slot_of_player(lobby, player_id) else {
             return Ok(());
         };
-        if target >= lobby.slots.len() || target == from || target == 0 || from == 0 {
+        if target >= lobby.slots.len() || target == from {
             drop(g);
             send_to(
                 hub,
                 player_id,
-                json!({ "op": "error", "code": "host_slot_fixed", "ok": false }).to_string(),
+                json!({ "op": "error", "code": "bad_slot", "ok": false }).to_string(),
             )
             .await;
             return Ok(());
@@ -1930,7 +1921,7 @@ async fn handle_seat_swap_answer(
             .await;
             return Ok(());
         };
-        if !accept || mine == 0 || theirs == 0 {
+        if !accept {
             (lid.clone(), false)
         } else {
             lobby.slots.swap(mine, theirs);
