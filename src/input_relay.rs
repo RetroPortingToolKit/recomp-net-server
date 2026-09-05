@@ -26,7 +26,15 @@ use crate::config::Config;
 use crate::metrics;
 use crate::udp_pktinfo::{self, RecvSas};
 
-const MAX_SLOTS: usize = 8;
+/// Eight player seats plus a four-seat gallery.
+///
+/// Spectators bind slots ABOVE the session's player count: binding is what
+/// puts a peer on the fan-out list, so a spectator has to hold a slot to
+/// receive anything. What it must not do is send, and that is enforced in
+/// `recv_loop` rather than by withholding a binding.
+const MAX_PLAYER_SLOTS: usize = 8;
+const MAX_SPECTATOR_SLOTS: usize = 4;
+const MAX_SLOTS: usize = MAX_PLAYER_SLOTS + MAX_SPECTATOR_SLOTS;
 const MIN_PACKET: usize = 14; // magic(4)+type(2)+session(4)+body(≥0)+checksum(4)
 const HEADER_LEN: usize = 10;
 const RNET_PKT_START: u16 = 3;
@@ -74,7 +82,13 @@ struct SlotBinding {
 }
 
 struct RelaySession {
+    /// Bindable seats: players plus spectators. Packets naming a slot at or
+    /// beyond this are rejected as before.
     slot_count: u8,
+    /// Seats whose packets are forwarded. Slots in `player_slots..slot_count`
+    /// are the gallery: they bind, they receive, and nothing they send is
+    /// ever passed on.
+    player_slots: u8,
     /// Per-slot last-seen binding (None = not yet registered).
     slots: [Option<SlotBinding>; MAX_SLOTS],
     last_rx: Instant,
@@ -189,26 +203,39 @@ impl InputRelay {
 
     /// Register a match session. Idempotent if the same session_id is reopened
     /// (rematch allocates a fresh session_id from the lobby).
-    pub async fn open_session(&self, session_id: u32, slot_count: u8) -> Result<()> {
+    pub async fn open_session(
+        &self,
+        session_id: u32,
+        player_slots: u8,
+        spectator_slots: u8,
+    ) -> Result<()> {
         if !self.enabled {
             bail!("input relay disabled");
         }
         if session_id == 0 {
             bail!("invalid session_id");
         }
-        let slots = slot_count.clamp(2, MAX_SLOTS as u8);
+        let players = player_slots.clamp(2, MAX_PLAYER_SLOTS as u8);
+        let spectators = spectator_slots.min(MAX_SPECTATOR_SLOTS as u8);
+        let slots = players.saturating_add(spectators).min(MAX_SLOTS as u8);
         let mut g = self.inner.lock().await;
         g.sessions.insert(
             session_id,
             RelaySession {
                 slot_count: slots,
+                player_slots: players,
                 slots: [None; MAX_SLOTS],
                 last_rx: Instant::now(),
             },
         );
         metrics::input_relay_session_opened();
         g.publish_gauges();
-        debug!(session_id, slot_count = slots, "input relay session opened");
+        debug!(
+            session_id,
+            slot_count = slots,
+            player_slots = players,
+            "input relay session opened"
+        );
         Ok(())
     }
 
@@ -374,6 +401,21 @@ async fn recv_loop(
                 }
             }
 
+            /* The gallery is read-only, and this is where that is true.
+             *
+             * The binding above already happened, which is deliberate: a
+             * spectator has to be on the fan-out list to receive the match,
+             * and the list is built from bindings. What it does not get is
+             * this: its packet stops here and reaches nobody. Enforcing it at
+             * the relay rather than in the client is the whole point --
+             * "spectators cannot affect the game" then holds against a
+             * spectator running a patched build, which a client-side check
+             * cannot promise. */
+            if sender_is_spectator(sender_slot, sess.player_slots) {
+                metrics::input_relay_drop("spectator");
+                continue;
+            }
+
             sess.slots
                 .iter()
                 .flatten()
@@ -397,10 +439,67 @@ async fn recv_loop(
     }
 }
 
+/// Is this packet from the gallery?
+///
+/// Seats at or beyond `player_slots` are spectators. An unbound sender
+/// (`None`) is NOT treated as one: it has not been placed in the session yet,
+/// and the existing START/first-packet binding paths above decide what it is.
+/// Answering "spectator" for an unknown sender would silently mute a player
+/// whose first packet arrived out of order.
+fn sender_is_spectator(sender_slot: Option<u8>, player_slots: u8) -> bool {
+    sender_slot.is_some_and(|slot| slot >= player_slots)
+}
+
 /// Whether `start` should open the lobby UDP SFU.
 ///
 /// Decision is made in `ws_lobby` from seated count + waiting-room ICE path
 /// reports. This helper remains for call-site clarity / tests.
 pub fn wants_input_relay(use_sfu: bool) -> bool {
     use_sfu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gallery_fits_beside_a_full_room() {
+        /* The point of raising the ceiling: eight players AND four watchers,
+         * not four plus four. */
+        assert_eq!(MAX_SLOTS, MAX_PLAYER_SLOTS + MAX_SPECTATOR_SLOTS);
+        assert!(MAX_PLAYER_SLOTS >= 8);
+        assert_eq!(MAX_SPECTATOR_SLOTS, 4);
+    }
+
+    #[test]
+    fn player_seats_are_forwarded() {
+        for slot in 0..4u8 {
+            assert!(!sender_is_spectator(Some(slot), 4), "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn spectator_seats_are_muted() {
+        /* Seat 4 in a four-player session is the first gallery seat. */
+        for slot in 4..8u8 {
+            assert!(sender_is_spectator(Some(slot), 4), "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn unbound_sender_is_not_muted() {
+        /* A packet we could not attribute to a seat is not evidence of a
+         * spectator. Muting it would drop a player's first packet whenever it
+         * arrived before the binding that names it. */
+        assert!(!sender_is_spectator(None, 2));
+    }
+
+    #[test]
+    fn a_session_with_no_gallery_mutes_nobody_in_range() {
+        /* player_slots == slot_count: every bindable seat is a player, and
+         * out-of-range seats are already rejected before this check. */
+        for slot in 0..8u8 {
+            assert!(!sender_is_spectator(Some(slot), 8), "slot {slot}");
+        }
+    }
 }

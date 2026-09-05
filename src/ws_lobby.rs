@@ -28,6 +28,30 @@ use crate::AppState;
 const MAX_SLOTS: usize = 8;
 const MAX_LOBBIES: usize = 64;
 
+/// Spectator seats a host may open, on top of the player seats.
+///
+/// Spectators are a SEPARATE pool, not a slice of `max_slots`: an eight-player
+/// room can still be watched. The relay's own ceiling was raised to
+/// MAX_SLOTS + MAX_SPECTATORS so a full room plus a full gallery still fits.
+const MAX_SPECTATORS: usize = 4;
+
+/// Seat indices are one namespace on the wire so `slot` / `from_slot` /
+/// `to_slot` keep their existing shape: below the base is a player seat,
+/// at or above it is `index - base` in the spectator pool.
+///
+/// A number, rather than a second pair of fields, because every seat-carrying
+/// message already has an int and older servers reject an out-of-range one --
+/// which is exactly the right answer from a server that has no spectators.
+const SPECTATOR_SLOT_BASE: usize = 64;
+
+fn is_spectator_seat(seat: usize) -> bool {
+    seat >= SPECTATOR_SLOT_BASE
+}
+
+fn spectator_seat(index: usize) -> usize {
+    SPECTATOR_SLOT_BASE + index
+}
+
 #[derive(Clone)]
 struct Slot {
     player_id: String,
@@ -64,6 +88,13 @@ struct Lobby {
     max_slots: usize,
     session_id: u32,
     slots: Vec<Option<Slot>>,
+    /// Host opt-in. False leaves `spectators` empty, so a joiner can never
+    /// land in the gallery of a host who did not ask for one.
+    allow_spectators: bool,
+    /// The gallery. Seated like players and told everything players are told,
+    /// but outside `player_count`, outside `all_ready`, and -- at the relay --
+    /// unable to have a packet forwarded to anyone.
+    spectators: Vec<Option<Slot>>,
     /* Host-authoritative sim-affecting settings (opaque JSON object). */
     match_caps: Option<Value>,
     /// Active UDP input-relay session (closed on destroy / rematch).
@@ -184,6 +215,8 @@ struct InMsg {
     password: Option<String>,
     #[serde(default)]
     max_slots: Option<u32>,
+    /// create: open a spectator gallery (default off).
+    allow_spectators: Option<bool>,
     #[serde(default)]
     host_bind: Option<String>,
     /// Host STUN advertise update (`set_host_endpoint`).
@@ -279,6 +312,67 @@ fn sanitize_mod_offer(offer: Option<Value>) -> Option<Value> {
         return None;
     }
     Some(v)
+}
+
+impl Lobby {
+    /// The seat array a seat index addresses, and the index within it.
+    fn seat_parts(&self, seat: usize) -> Option<(&Vec<Option<Slot>>, usize)> {
+        if is_spectator_seat(seat) {
+            let i = seat - SPECTATOR_SLOT_BASE;
+            (i < self.spectators.len()).then_some((&self.spectators, i))
+        } else {
+            (seat < self.slots.len()).then_some((&self.slots, seat))
+        }
+    }
+
+    fn seat(&self, seat: usize) -> Option<&Option<Slot>> {
+        self.seat_parts(seat).map(|(v, i)| &v[i])
+    }
+
+    fn seat_mut(&mut self, seat: usize) -> Option<&mut Option<Slot>> {
+        if is_spectator_seat(seat) {
+            self.spectators.get_mut(seat - SPECTATOR_SLOT_BASE)
+        } else {
+            self.slots.get_mut(seat)
+        }
+    }
+
+    /// Every seated participant, players first. Use this wherever the question
+    /// is "who is in this room" -- membership, name collisions, broadcasts --
+    /// and `slots` only where the question is "who is playing".
+    fn everyone(&self) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().flatten().chain(self.spectators.iter().flatten())
+    }
+
+    fn everyone_mut(&mut self) -> impl Iterator<Item = &mut Slot> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .chain(self.spectators.iter_mut().flatten())
+    }
+
+    fn member_ids(&self) -> Vec<String> {
+        self.everyone().map(|s| s.player_id.clone()).collect()
+    }
+
+    /// Which seat a player occupies, in the shared index namespace.
+    fn seat_of(&self, player_id: &str) -> Option<usize> {
+        if let Some(i) = self
+            .slots
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|s| s.player_id == player_id))
+        {
+            return Some(i);
+        }
+        self.spectators
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|s| s.player_id == player_id))
+            .map(spectator_seat)
+    }
+
+    fn spectator_count(&self) -> usize {
+        self.spectators.iter().filter(|s| s.is_some()).count()
+    }
 }
 
 fn slot_json(i: usize, slot: &Slot) -> Value {
@@ -508,7 +602,7 @@ fn sanitize_lan_endpoints(raw: Option<Vec<String>>) -> Vec<String> {
 }
 
 fn clear_lobby_ice_paths(lobby: &mut Lobby) {
-    for s in lobby.slots.iter_mut().flatten() {
+    for s in lobby.everyone_mut() {
         s.ice_path = None;
         s.ice_path_at = None;
     }
@@ -546,7 +640,10 @@ fn unique_display_name(lobby: &Lobby, requested: &str, skip_player_id: Option<&s
         }
     };
     let taken = |name: &str| {
-        lobby.slots.iter().flatten().any(|s| {
+        /* Spectators included: two "Alex" rows are just as confusing across
+         * two tables as within one, and a promotion moves a name between
+         * them without renaming it. */
+        lobby.everyone().any(|s| {
             if let Some(skip) = skip_player_id {
                 if s.player_id == skip {
                     return false;
@@ -605,6 +702,14 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
                 slots.push(slot_json(i, slot));
             }
         }
+        let mut spectators = Vec::new();
+        for (i, s) in l.spectators.iter().enumerate() {
+            if let Some(slot) = s {
+                spectators.push(slot_json(spectator_seat(i), slot));
+            }
+        }
+        /* Players only. A gallery that never presses Ready must not hold the
+         * match, and a gallery that does must not be able to start one. */
         let all_ready = l.slots.iter().flatten().all(|s| s.ready) && player_count(l) >= 2;
         let mut msg = json!({
             "op": "lobby_update",
@@ -618,16 +723,19 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
             "host_player_id": l.host_player_id,
             "all_ready": all_ready,
             "slots": slots,
+            /* Additive: a client that does not read these sees exactly the
+             * lobby it saw before spectators existed. */
+            "allow_spectators": l.allow_spectators,
+            "max_spectators": l.spectators.len(),
+            "spectator_count": l.spectator_count(),
+            "spectator_slot_base": SPECTATOR_SLOT_BASE,
+            "spectators": spectators,
         });
         if let Some(caps) = &l.match_caps {
             msg["match_caps"] = caps.clone();
         }
         let msg = msg.to_string();
-        let members: Vec<String> = l
-            .slots
-            .iter()
-            .filter_map(|s| s.as_ref().map(|x| x.player_id.clone()))
-            .collect();
+        let members = l.member_ids();
         (msg, members)
     };
     for m in members {
@@ -643,11 +751,7 @@ async fn destroy_lobby(state: &AppState, lobby_id: &str) {
             return;
         };
         metrics::ws_lobby_destroyed();
-        let members: Vec<String> = l
-            .slots
-            .iter()
-            .filter_map(|s| s.as_ref().map(|x| x.player_id.clone()))
-            .collect();
+        let members = l.member_ids();
         for m in &members {
             if let Some(c) = g.clients.get_mut(m) {
                 c.lobby_id = None;
@@ -682,7 +786,7 @@ async fn client_leave(state: &AppState, player_id: &str) {
             Some((lid, true))
         } else {
             if let Some(lobby) = g.lobbies.get_mut(&lid) {
-                for s in lobby.slots.iter_mut() {
+                for s in lobby.slots.iter_mut().chain(lobby.spectators.iter_mut()) {
                     if s.as_ref().map(|x| x.player_id.as_str()) == Some(player_id) {
                         *s = None;
                     }
@@ -1160,6 +1264,7 @@ async fn handle_create(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "0.0.0.0:7777".into());
     let max_slots = msg.max_slots.unwrap_or(2).clamp(2, MAX_SLOTS as u32) as usize;
+    let allow_spectators = msg.allow_spectators.unwrap_or(false);
 
     if let Some(dn) = msg.display_name.filter(|s| !s.is_empty()) {
         let mut g = hub.inner.lock().await;
@@ -1219,6 +1324,8 @@ async fn handle_create(
                 max_slots,
                 session_id,
                 slots,
+                allow_spectators,
+                spectators: vec![None; if allow_spectators { MAX_SPECTATORS } else { 0 }],
                 match_caps: match_caps.clone(),
                 relay_session_id: None,
                 started: false,
@@ -1247,6 +1354,11 @@ async fn handle_create(
         "host_player_id": player_id,
         "player_count": 1,
         "max_slots": max_slots,
+        "allow_spectators": allow_spectators,
+        "max_spectators": if allow_spectators { MAX_SPECTATORS } else { 0 },
+        "spectator_count": 0,
+        "spectator_slot_base": SPECTATOR_SLOT_BASE,
+        "spectators": [],
         "slots": [{
             "slot": 0,
             "player_id": player_id,
@@ -1416,6 +1528,13 @@ async fn handle_join(
                 "lobby_id": lobby_id,
                 "session_id": session_id,
                 "local_slot": slot,
+                /* Said outright as well as implied by local_slot: a joiner
+                 * that overflowed into the gallery has to know it before it
+                 * shows the player anything, and reading a role out of an
+                 * index is exactly the kind of inference a client gets wrong
+                 * once and then ships. */
+                "spectator": is_spectator_seat(slot),
+                "spectator_slot_base": SPECTATOR_SLOT_BASE,
                 "host_endpoint": host_endpoint,
                 "guest_endpoint": guest_endpoint,
             });
@@ -1536,12 +1655,22 @@ fn seat_joiner_locked(
                 can_transfer: true,
             };
         }
-        if player_count(lobby) >= lobby.max_slots || lobby.slots.iter().all(|s| s.is_some()) {
-            return SeatResult::Err("full");
-        }
+        /* A full room is only full when there is no gallery to fall into.
+         * The joiner is seated as a spectator rather than refused, and the
+         * host can promote it later -- which is the whole point of the two
+         * tables. */
+        let players_full =
+            player_count(lobby) >= lobby.max_slots || lobby.slots.iter().all(|s| s.is_some());
+        let seat = if !players_full {
+            lobby.slots.iter().position(|s| s.is_none()).unwrap()
+        } else {
+            match lobby.spectators.iter().position(|s| s.is_none()) {
+                Some(i) => spectator_seat(i),
+                None => return SeatResult::Err("full"),
+            }
+        };
         let display_name = unique_display_name(lobby, &requested_name, Some(player_id));
-        let slot = lobby.slots.iter().position(|s| s.is_none()).unwrap();
-        lobby.slots[slot] = Some(Slot {
+        let new_slot = Slot {
             player_id: player_id.to_string(),
             display_name: display_name.clone(),
             ready: false,
@@ -1549,7 +1678,12 @@ fn seat_joiner_locked(
             mod_offer: None,
             ice_path: None,
             ice_path_at: None,
-        });
+        };
+        match lobby.seat_mut(seat) {
+            Some(cell) => *cell = Some(new_slot),
+            None => return SeatResult::Err("full"),
+        }
+        /* Only players carry Ready, so only players are un-readied. */
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
         }
@@ -1557,7 +1691,7 @@ fn seat_joiner_locked(
         clear_lobby_ice_paths(lobby);
         lobby.guest_endpoint = rewrite_endpoint(guest_bind, peer_ip);
         (
-            slot,
+            seat,
             lobby.session_id,
             lobby.host_endpoint.clone(),
             lobby.guest_endpoint.clone(),
@@ -1602,7 +1736,7 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
-        if slot >= lobby.slots.len() {
+        if lobby.seat(slot).is_none() {
             drop(g);
             send_to(
                 hub,
@@ -1612,7 +1746,11 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
-        let Some(victim) = lobby.slots[slot].as_ref().map(|s| s.player_id.clone()) else {
+        let Some(victim) = lobby
+            .seat(slot)
+            .and_then(|c| c.as_ref())
+            .map(|s| s.player_id.clone())
+        else {
             drop(g);
             send_to(
                 hub,
@@ -1632,7 +1770,9 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
-        lobby.slots[slot] = None;
+        if let Some(cell) = lobby.seat_mut(slot) {
+            *cell = None;
+        }
         lobby.guest_endpoint.clear();
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
@@ -1704,7 +1844,7 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
-        if from >= lobby.slots.len() || to >= lobby.slots.len() {
+        if lobby.seat(from).is_none() || lobby.seat(to).is_none() {
             drop(g);
             send_to(
                 hub,
@@ -1714,7 +1854,7 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
-        if lobby.slots[from].is_none() {
+        if lobby.seat(from).is_some_and(|c| c.is_none()) {
             drop(g);
             send_to(
                 hub,
@@ -1727,10 +1867,26 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
         /* The host is identified by host_player_id, not by slot index, so
          * the host's own seat may move like any other — including trading
          * places with a guest. */
-        lobby.slots.swap(from, to);
+        {
+            /* Take/put rather than Vec::swap, because a promotion or demotion
+             * moves a seat between two different arrays and a swap within one
+             * array cannot express that. Reorders inside a table take the same
+             * path, so a cross-table move cannot behave differently from one. */
+            let a = lobby.seat_mut(from).and_then(Option::take);
+            let b = lobby.seat_mut(to).and_then(Option::take);
+            if let Some(cell) = lobby.seat_mut(to) {
+                *cell = a;
+            }
+            if let Some(cell) = lobby.seat_mut(from) {
+                *cell = b;
+            }
+        }
+        /* Ready is a player-table property and the roster just changed on at
+         * least one side of the move. */
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
         }
+        clear_lobby_ice_paths(lobby);
         lid
     };
     emit_lobby_update(hub, &lid).await;
@@ -1745,12 +1901,9 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
  * in arrival order rather than racing. Slot 0 stays pinned to the host / sim
  * authority, exactly as in `handle_move`. */
 
-/// Find the seat a player currently occupies.
+/// Find the seat a player currently occupies, in either table.
 fn slot_of_player(lobby: &Lobby, player_id: &str) -> Option<usize> {
-    lobby
-        .slots
-        .iter()
-        .position(|s| s.as_ref().is_some_and(|s| s.player_id == player_id))
+    lobby.seat_of(player_id)
 }
 
 /// A player moves ITSELF into a free seat.
@@ -1796,6 +1949,20 @@ async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
             .await;
             return Ok(());
         };
+        /* Self-service stays inside the player table. A spectator asking to
+         * move itself would index `slots` with a spectator seat, and -- worse
+         * than the panic that used to be -- promoting yourself into the match
+         * is the host's call, not the gallery's. */
+        if is_spectator_seat(from) {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "spectator", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
         if to >= lobby.slots.len() || from == to {
             drop(g);
             send_to(
@@ -1848,6 +2015,20 @@ async fn handle_seat_swap_request(
         let Some(from) = slot_of_player(lobby, player_id) else {
             return Ok(());
         };
+        /* Self-service stays inside the player table. A spectator asking to
+         * move itself would index `slots` with a spectator seat, and -- worse
+         * than the panic that used to be -- promoting yourself into the match
+         * is the host's call, not the gallery's. */
+        if is_spectator_seat(from) {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "spectator", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
         if target >= lobby.slots.len() || target == from {
             drop(g);
             send_to(
@@ -1921,6 +2102,19 @@ async fn handle_seat_swap_answer(
             .await;
             return Ok(());
         };
+        /* Either side having been moved to the gallery since the ask is the
+         * same situation as the asker having left: the trade no longer means
+         * what it meant, and `slots.swap` below would index out of range. */
+        if is_spectator_seat(mine) || is_spectator_seat(theirs) {
+            drop(g);
+            send_to(
+                hub,
+                &asker,
+                json!({ "op": "seat_swap_result", "accept": false, "ok": true }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
         if !accept {
             (lid.clone(), false)
         } else {
@@ -2149,9 +2343,21 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
             Some(lid) => match g.lobbies.get_mut(&lid) {
                 None => ReadyOut::Err("gone"),
                 Some(lobby) => {
-                    for s in lobby.slots.iter_mut().flatten() {
+                    /* Offers from everyone, Ready from players only.
+                     *
+                     * A spectator runs the same simulation, so its BIOS and
+                     * mod catalogue matter just as much as a player's and the
+                     * host needs to see them. What it must not have is a vote
+                     * on whether the match may start -- so `ready` stays where
+                     * `all_ready` can see it, which is the player table. */
+                    let is_player = !lobby
+                        .seat_of(player_id)
+                        .is_some_and(is_spectator_seat);
+                    for s in lobby.everyone_mut() {
                         if s.player_id == player_id {
-                            s.ready = ready;
+                            if is_player {
+                                s.ready = ready;
+                            }
                             if bios_offer.is_some() {
                                 s.bios_offer = bios_offer.clone();
                             }
@@ -2226,7 +2432,10 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
          * INPUT_RELAY_LAN_HOST. Guests that dial the WAN name and NAT-hairpin
          * often appear as the router (.1) — that must not force LAN advertise. */
         let mut peer_ips = Vec::new();
-        for slot in lobby.slots.iter().flatten() {
+        /* Everyone seated, gallery included: the relay endpoint advertised
+         * here is the one SPECTATORS dial too, so a remote spectator has to
+         * be able to veto the LAN address exactly as a remote player does. */
+        for slot in lobby.everyone() {
             if let Some(c) = g.clients.get(&slot.player_id) {
                 peer_ips.push(c.peer_ip.clone());
             }
@@ -2235,19 +2444,31 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         let gateway = state.config.effective_input_relay_lan_gateway();
         let prefer_lan = !lan_host.is_empty()
             && !peer_ips.is_empty()
-            && peer_ips.len() == n
+            && peer_ips.len() == n + lobby.spectator_count()
             && peer_ips
                 .iter()
                 .all(|ip| is_direct_lan_ws_peer(ip, gateway.as_deref()));
         let old_relay = lobby.relay_session_id;
+        /* Read off `lobby` before the borrow ends: `g.next_session` below
+         * needs `g` mutably. */
+        let spectators_n = lobby.spectator_count();
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
-        Ok((lid, sid, n, use_relay, old_relay, prefer_lan, peer_ips))
+        Ok((
+            lid,
+            sid,
+            n,
+            spectators_n,
+            use_relay,
+            old_relay,
+            prefer_lan,
+            peer_ips,
+        ))
     };
 
-    let (lid, sid, n, use_relay, old_relay, prefer_lan, peer_ips) = match prepared {
+    let (lid, sid, n, spectators_n, use_relay, old_relay, prefer_lan, peer_ips) = match prepared {
         Ok(v) => v,
         Err(code) => {
             send_to(
@@ -2265,7 +2486,11 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         state.input_relay.close_session(prev).await;
     }
     let relay_endpoint = if use_relay {
-        match state.input_relay.open_session(sid, n as u8).await {
+        match state
+            .input_relay
+            .open_session(sid, n as u8, spectators_n as u8)
+            .await
+        {
             Ok(()) => {
                 let ep = state.input_relay.pick_advertise_endpoint(prefer_lan);
                 let gateway = state.config.effective_input_relay_lan_gateway();
@@ -2336,11 +2561,19 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
                 slots.push(slot_json(i, slot));
             }
         }
-        let members: Vec<String> = lobby
-            .slots
-            .iter()
-            .filter_map(|s| s.as_ref().map(|x| x.player_id.clone()))
-            .collect();
+        let mut spectators = Vec::new();
+        for (i, s) in lobby.spectators.iter().enumerate() {
+            if let Some(slot) = s {
+                spectators.push(slot_json(spectator_seat(i), slot));
+            }
+        }
+        /* The gallery launches with the match. It runs the same simulation
+         * from the same start, so it has to be told to start at the same
+         * moment and with the same caps -- it simply never contributes a row.
+         * player_count stays the PLAYER count: it is what sizes the peers'
+         * rollback slot_count, and a spectator counted there would be a seat
+         * every player waits on forever. */
+        let members = lobby.member_ids();
         let mut launch = json!({
             "op": "launch",
             "ok": true,
@@ -2351,6 +2584,9 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             "player_count": n,
             "max_slots": lobby.max_slots,
             "slots": slots,
+            "spectators": spectators,
+            "spectator_count": spectators.len(),
+            "spectator_slot_base": SPECTATOR_SLOT_BASE,
             "transport": if relay_endpoint.is_some() { "sfu" } else { "ice_p2p" },
         });
         if let Some(caps) = &lobby.match_caps {
@@ -2382,11 +2618,13 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             members,
             game_name,
         } => {
-            let players = members.len();
+            /* `members` is everyone who gets the launch; the metric wants
+             * players. They stopped being the same number when the gallery
+             * started launching with the match. */
             for m in members {
                 send_to(hub, &m, msg.clone()).await;
             }
-            metrics::ws_lobby_started(&game_name, players);
+            metrics::ws_lobby_started(&game_name, n);
         }
     }
     Ok(())
@@ -2414,9 +2652,7 @@ async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<
         .to_string();
         let to = msg.to_player_id.unwrap_or_default();
         let targets: Vec<String> = lobby
-            .slots
-            .iter()
-            .filter_map(|s| s.as_ref())
+            .everyone()
             .filter(|s| s.player_id != player_id)
             .filter(|s| to.is_empty() || s.player_id == to)
             .map(|s| s.player_id.clone())
@@ -2436,4 +2672,128 @@ async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<
 #[allow(dead_code)]
 fn err_json(code: &str) -> Value {
     json!({ "op": "error", "code": code, "ok": false })
+}
+
+#[cfg(test)]
+mod spectator_tests {
+    use super::*;
+
+    fn slot(name: &str) -> Slot {
+        Slot {
+            player_id: name.to_string(),
+            display_name: name.to_string(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            ice_path: None,
+            ice_path_at: None,
+        }
+    }
+
+    fn lobby(players: usize, spectators: usize) -> Lobby {
+        Lobby {
+            lobby_id: "L".into(),
+            name: "L".into(),
+            game_name: "G".into(),
+            game_version: String::new(),
+            disc_fp: String::new(),
+            host_player_id: "host".into(),
+            host_bind: String::new(),
+            host_endpoint: String::new(),
+            lan_endpoints: Vec::new(),
+            guest_endpoint: String::new(),
+            password_hash: None,
+            password_salt: None,
+            max_slots: players,
+            session_id: 1,
+            slots: vec![None; players],
+            allow_spectators: spectators > 0,
+            spectators: vec![None; spectators],
+            match_caps: None,
+            relay_session_id: None,
+            started: false,
+        }
+    }
+
+    #[test]
+    fn seat_indices_do_not_collide() {
+        /* The two tables share one integer namespace. Player seats must stay
+         * where they always were, or every existing client's `slot` changes
+         * meaning. */
+        assert!(!is_spectator_seat(0));
+        assert!(!is_spectator_seat(MAX_SLOTS - 1));
+        assert!(is_spectator_seat(spectator_seat(0)));
+        assert!(spectator_seat(0) > MAX_SLOTS);
+    }
+
+    #[test]
+    fn seat_addresses_both_tables() {
+        let mut l = lobby(2, 4);
+        *l.seat_mut(1).unwrap() = Some(slot("p1"));
+        *l.seat_mut(spectator_seat(2)).unwrap() = Some(slot("s2"));
+
+        assert_eq!(
+            l.seat(1).unwrap().as_ref().map(|s| s.player_id.as_str()),
+            Some("p1")
+        );
+        assert_eq!(
+            l.seat(spectator_seat(2))
+                .unwrap()
+                .as_ref()
+                .map(|s| s.player_id.as_str()),
+            Some("s2")
+        );
+        /* Out of range in either table is None, not a panic and not a
+         * wrap-around into the other one. */
+        assert!(l.seat(2).is_none());
+        assert!(l.seat(spectator_seat(4)).is_none());
+    }
+
+    #[test]
+    fn counts_keep_the_tables_apart() {
+        let mut l = lobby(2, 4);
+        *l.seat_mut(0).unwrap() = Some(slot("host"));
+        *l.seat_mut(spectator_seat(0)).unwrap() = Some(slot("watcher"));
+
+        /* player_count is what sizes the peers' rollback slot_count. A
+         * spectator counted here is a seat every player waits on forever. */
+        assert_eq!(player_count(&l), 1);
+        assert_eq!(l.spectator_count(), 1);
+        assert_eq!(l.everyone().count(), 2);
+        assert_eq!(l.member_ids(), vec!["host".to_string(), "watcher".to_string()]);
+    }
+
+    #[test]
+    fn seat_of_finds_either_table() {
+        let mut l = lobby(2, 4);
+        *l.seat_mut(1).unwrap() = Some(slot("p"));
+        *l.seat_mut(spectator_seat(3)).unwrap() = Some(slot("s"));
+        assert_eq!(l.seat_of("p"), Some(1));
+        assert_eq!(l.seat_of("s"), Some(spectator_seat(3)));
+        assert_eq!(l.seat_of("nobody"), None);
+    }
+
+    #[test]
+    fn a_lobby_without_spectators_has_no_gallery_seats() {
+        /* The toggle is off: there is nowhere for a joiner to overflow to, so
+         * a full room is still full. */
+        let l = lobby(2, 0);
+        assert!(!l.allow_spectators);
+        assert!(l.seat(spectator_seat(0)).is_none());
+        assert_eq!(l.spectator_count(), 0);
+    }
+
+    #[test]
+    fn ready_is_a_player_property() {
+        let mut l = lobby(2, 4);
+        *l.seat_mut(0).unwrap() = Some(slot("host"));
+        *l.seat_mut(1).unwrap() = Some(slot("p2"));
+        *l.seat_mut(spectator_seat(0)).unwrap() = Some(slot("watcher"));
+        for s in l.slots.iter_mut().flatten() {
+            s.ready = true;
+        }
+        /* The gallery never pressed Ready, and the match is still startable. */
+        let all_ready = l.slots.iter().flatten().all(|s| s.ready) && player_count(&l) >= 2;
+        assert!(all_ready);
+    }
 }
