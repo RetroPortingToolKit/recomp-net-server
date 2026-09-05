@@ -61,6 +61,9 @@ struct Slot {
     bios_offer: Option<Value>,
     /// Peer installed-package catalog (opaque JSON from set_ready).
     mod_offer: Option<Value>,
+    /// Peer memory-card offer (opaque JSON from set_ready): whether the peer
+    /// has a card and opted in to bring it. Read on seat 1 by the host.
+    memcard_offer: Option<Value>,
     /// Waiting-room ICE path report: "direct" | "relay" | "fail".
     ice_path: Option<String>,
     ice_path_at: Option<Instant>,
@@ -245,6 +248,9 @@ struct InMsg {
     /// Peer installed-package catalog (attached to set_ready).
     #[serde(default)]
     mod_offer: Option<Value>,
+    /// Peer memory-card offer (attached to set_ready).
+    #[serde(default)]
+    memcard_offer: Option<Value>,
     /// Host sim settings blob (aspect, turbo_loads, bios_hle, input_delay, …).
     #[serde(default)]
     match_caps: Option<Value>,
@@ -295,6 +301,20 @@ fn sanitize_bios_offer(offer: Option<Value>) -> Option<Value> {
     }
     let s = v.to_string();
     if s.len() > 512 {
+        return None;
+    }
+    Some(v)
+}
+
+fn sanitize_memcard_offer(offer: Option<Value>) -> Option<Value> {
+    let Some(v) = offer else {
+        return None;
+    };
+    if !v.is_object() {
+        return None;
+    }
+    let s = v.to_string();
+    if s.len() > 256 {
         return None;
     }
     Some(v)
@@ -387,6 +407,9 @@ fn slot_json(i: usize, slot: &Slot) -> Value {
     }
     if let Some(offer) = &slot.mod_offer {
         row["mod_offer"] = offer.clone();
+    }
+    if let Some(offer) = &slot.memcard_offer {
+        row["memcard_offer"] = offer.clone();
     }
     row
 }
@@ -1301,6 +1324,7 @@ async fn handle_create(
             ready: false,
             bios_offer: None,
             mod_offer: None,
+            memcard_offer: None,
             ice_path: None,
             ice_path_at: None,
         });
@@ -1676,6 +1700,7 @@ fn seat_joiner_locked(
             ready: false,
             bios_offer: None,
             mod_offer: None,
+            memcard_offer: None,
             ice_path: None,
             ice_path_at: None,
         };
@@ -2332,6 +2357,7 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
     let ready = msg.ready.unwrap_or(true);
     let bios_offer = sanitize_bios_offer(msg.bios_offer);
     let mod_offer = sanitize_mod_offer(msg.mod_offer);
+    let memcard_offer = sanitize_memcard_offer(msg.memcard_offer);
     enum ReadyOut {
         Err(&'static str),
         Ok(String),
@@ -2363,6 +2389,9 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
                             }
                             if mod_offer.is_some() {
                                 s.mod_offer = mod_offer.clone();
+                            }
+                            if memcard_offer.is_some() {
+                                s.memcard_offer = memcard_offer.clone();
                             }
                             break;
                         }
@@ -2452,6 +2481,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         /* Read off `lobby` before the borrow ends: `g.next_session` below
          * needs `g` mutably. */
         let spectators_n = lobby.spectator_count();
+        let max_slots_for_relay = lobby.max_slots;
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
@@ -2461,6 +2491,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             sid,
             n,
             spectators_n,
+            max_slots_for_relay,
             use_relay,
             old_relay,
             prefer_lan,
@@ -2468,7 +2499,8 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         ))
     };
 
-    let (lid, sid, n, spectators_n, use_relay, old_relay, prefer_lan, peer_ips) = match prepared {
+    let (lid, sid, n, spectators_n, max_slots_for_relay, use_relay, old_relay, prefer_lan, peer_ips) =
+        match prepared {
         Ok(v) => v,
         Err(code) => {
             send_to(
@@ -2486,9 +2518,23 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         state.input_relay.close_session(prev).await;
     }
     let relay_endpoint = if use_relay {
+        /* The relay is sized by the seat CEILING, not by how many seats are
+         * filled.
+         *
+         * A player's packet carries its lobby seat index, and the relay rejects
+         * any index at or beyond the session's player_slots. In a sparse room
+         * -- seats 0 and 3 occupied after a move, so n == 2 -- passing `n`
+         * rejects the player in seat 3 outright. Passing max_slots leaves every
+         * player seat addressable and puts the gallery immediately above it, so
+         * a spectator's relay slot is max_slots + its gallery index and can
+         * never be confused with a player's.
+         *
+         * n stays the PLAYER count in the launch message, where it belongs:
+         * that is what sizes the peers' rollback, and the peers already carry
+         * occupied_mask for the holes. */
         match state
             .input_relay
-            .open_session(sid, n as u8, spectators_n as u8)
+            .open_session(sid, max_slots_for_relay as u8, spectators_n as u8)
             .await
         {
             Ok(()) => {
@@ -2587,6 +2633,11 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             "spectators": spectators,
             "spectator_count": spectators.len(),
             "spectator_slot_base": SPECTATOR_SLOT_BASE,
+            /* Where the gallery starts in the RELAY's slot space, which is a
+             * different namespace from the lobby seat index above. A spectator
+             * sends as spectator_relay_base + its gallery index; every player
+             * seat is below it. */
+            "spectator_relay_base": lobby.max_slots,
             "transport": if relay_endpoint.is_some() { "sfu" } else { "ice_p2p" },
         });
         if let Some(caps) = &lobby.match_caps {
@@ -2685,6 +2736,7 @@ mod spectator_tests {
             ready: false,
             bios_offer: None,
             mod_offer: None,
+            memcard_offer: None,
             ice_path: None,
             ice_path_at: None,
         }
