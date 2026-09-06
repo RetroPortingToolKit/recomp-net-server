@@ -79,19 +79,23 @@ for the client to filter.
 ### Server chat (per game)
 
 ```json
-{ "op": "server_chat", "text": "anyone up for a set?" }
+{ "op": "server_chat", "game_name": "…", "text": "anyone up for a set?" }
 ```
 
-Relayed, after the profanity filter, to every client whose last `list`
-named the same `game_name` as the sender -- seated in a room or not:
+Relayed, after the profanity filter, to every client of the same **title**
+-- seated in a room or not, and regardless of `game_version`, so two builds
+of one game share the room. The server learns a client's title from
+`hello` (`game_name`), from `list`, from creating or joining a lobby, and
+from a `server_chat` line that carries one; `game_name` on the line is what
+lets a client chat before it has browsed:
 
 ```json
 { "op": "server_chat", "game_name": "…", "from_player_id": "…",
   "from": "Marisa", "country": "JP", "text": "anyone up for a set?" }
 ```
 
-No history is kept. A client that has not listed for a title yet gets
-`error` / `no_game`.
+No history is kept. `error` / `no_game` comes back only when the server has
+no title for that client from any of those sources.
 
 `allow_spectators` / `max_spectators` / `spectator_count` describe the
 lobby's gallery (a browser shows "No" or "1/4"). `players` is everyone

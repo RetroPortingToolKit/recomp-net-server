@@ -1124,10 +1124,19 @@ async fn handle_text(
     let msg: InMsg = serde_json::from_str(text).map_err(|e| e.to_string())?;
     match msg.op.as_str() {
         "hello" => {
-            if let Some(name) = msg.display_name.filter(|s| !s.is_empty()) {
+            let hello_game = msg.game_name.clone().filter(|s| !s.is_empty());
+            if msg.display_name.is_some() || hello_game.is_some() {
                 let mut g = hub.inner.lock().await;
                 if let Some(c) = g.clients.get_mut(player_id) {
-                    c.display_name = name;
+                    if let Some(name) = msg.display_name.filter(|s| !s.is_empty()) {
+                        c.display_name = name;
+                    }
+                    /* The title comes in on the FIRST message a client sends,
+                     * not only on `list`: server chat and the players-online
+                     * scope must not depend on having browsed first. */
+                    if let Some(g_name) = hello_game {
+                        c.game_name = g_name;
+                    }
                 }
             }
             send_to(
@@ -1492,6 +1501,8 @@ async fn handle_create(
         .game_name
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown".into());
+    /* Kept for the client's own per-game scope after the lobby takes it. */
+    let host_game_name = game_name.clone();
     let game_version = normalize_game_version(msg.game_version);
     let disc_fp = normalize_disc_fp(msg.disc_fp);
     let host_bind = msg
@@ -1577,6 +1588,9 @@ async fn handle_create(
         );
         if let Some(c) = g.clients.get_mut(player_id) {
             c.lobby_id = Some(lobby_id.clone());
+            /* Hosting a room for a title says which title this client plays
+             * as plainly as listing for it does. */
+            c.game_name = host_game_name;
         }
         (
             lobby_id,
@@ -1965,9 +1979,18 @@ fn seat_joiner_locked(
             display_name,
         )
     };
+    let lobby_game = g
+        .lobbies
+        .get(lobby_id)
+        .map(|l| l.game_name.clone())
+        .unwrap_or_default();
     if let Some(c) = g.clients.get_mut(player_id) {
         c.lobby_id = Some(lobby_id.to_string());
         c.display_name = seated.5.clone();
+        /* Sitting in a room for a title says which title this client plays. */
+        if !lobby_game.is_empty() {
+            c.game_name = lobby_game;
+        }
     }
     SeatResult::Ok {
         slot: seated.0,
@@ -3018,6 +3041,26 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
     Ok(())
 }
 
+/// The title a client counts as playing, for the players-online list and
+/// for server chat. It is the TITLE ONLY and never the version: two builds
+/// of one game are one audience, even when the lobby list hides one from
+/// the other. Learned from `hello`, from `list`, from creating or joining a
+/// room, and from a `server_chat` line that carries it; the room the client
+/// sits in is the last word when none of those arrived.
+fn game_scope_for(g: &HubInner, player_id: &str) -> String {
+    let Some(c) = g.clients.get(player_id) else {
+        return String::new();
+    };
+    if !c.game_name.is_empty() {
+        return c.game_name.clone();
+    }
+    c.lobby_id
+        .as_ref()
+        .and_then(|id| g.lobbies.get(id))
+        .map(|l| l.game_name.clone())
+        .unwrap_or_default()
+}
+
 /// Per-game chat outside any room: every client browsing for the same
 /// title hears it, seated or not. Same shape and same filter as lobby
 /// chat; no history, so a newcomer sees only what is said after arriving.
@@ -3034,11 +3077,18 @@ async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
     }
     let text = crate::chat_filter::apply(text);
     let (fwd, targets) = {
-        let g = hub.inner.lock().await;
-        let Some(sender) = g.clients.get(player_id) else {
-            return Ok(());
-        };
-        if sender.game_name.is_empty() {
+        let mut g = hub.inner.lock().await;
+        /* A line may carry its own title. Taking it here is what stops a
+         * client that has not browsed yet from being turned away with
+         * `no_game` -- the first thing it does may well be to say hello in
+         * the chat. */
+        if let Some(gn) = msg.game_name.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(c) = g.clients.get_mut(player_id) {
+                c.game_name = gn.to_string();
+            }
+        }
+        let scope = game_scope_for(&g, player_id);
+        if scope.is_empty() {
             drop(g);
             send_to(
                 hub,
@@ -3048,19 +3098,30 @@ async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
             .await;
             return Ok(());
         }
+        /* Remember what we resolved (it may have come from the room), so the
+         * players-online filter and the next line agree with this one. */
+        if let Some(c) = g.clients.get_mut(player_id) {
+            if c.game_name.is_empty() {
+                c.game_name = scope.clone();
+            }
+        }
+        let Some(sender) = g.clients.get(player_id) else {
+            return Ok(());
+        };
         let fwd = json!({
             "op": "server_chat",
-            "game_name": sender.game_name,
+            "game_name": scope,
             "from_player_id": player_id,
             "from": sender.display_name,
             "country": sender.country,
             "text": text,
         })
         .to_string();
+        /* Audience: same title, any version. */
         let targets: Vec<String> = g
             .clients
             .values()
-            .filter(|c| c.game_name == sender.game_name)
+            .filter(|c| game_scope_for(&g, &c.player_id) == scope)
             .map(|c| c.player_id.clone())
             .collect();
         (fwd, targets)
@@ -3191,6 +3252,114 @@ mod geoip_tests {
         let hub = WsLobbyHub::with_geoip(Some("/nonexistent/GeoLite2-Country.mmdb"));
         assert_eq!(hub.country_for("8.8.8.8"), "US");
         assert_eq!(hub.country_for("127.0.0.1"), "");
+    }
+}
+
+#[cfg(test)]
+mod game_scope_tests {
+    use super::*;
+
+    fn hub_inner() -> HubInner {
+        HubInner {
+            clients: HashMap::new(),
+            lobbies: HashMap::new(),
+            next_session: 1,
+        }
+    }
+
+    fn client(g: &mut HubInner, id: &str, game: &str, lobby: Option<&str>) {
+        let (tx, _rx) = broadcast::channel(4);
+        g.clients.insert(
+            id.to_string(),
+            ClientMeta {
+                player_id: id.to_string(),
+                display_name: id.to_string(),
+                peer_ip: "127.0.0.1".into(),
+                country: String::new(),
+                game_name: game.to_string(),
+                lobby_id: lobby.map(str::to_string),
+                pending_mod_lobby: None,
+                tx,
+            },
+        );
+    }
+
+    fn lobby(g: &mut HubInner, id: &str, game: &str) {
+        g.lobbies.insert(
+            id.to_string(),
+            Lobby {
+                lobby_id: id.into(),
+                name: id.into(),
+                game_name: game.into(),
+                game_version: "9.9.9".into(),
+                disc_fp: String::new(),
+                host_player_id: String::new(),
+                host_bind: String::new(),
+                host_endpoint: String::new(),
+                lan_endpoints: Vec::new(),
+                guest_endpoint: String::new(),
+                password_hash: None,
+                password_salt: None,
+                max_slots: 2,
+                session_id: 1,
+                slots: vec![None; 2],
+                allow_spectators: false,
+                spectators: Vec::new(),
+                match_caps: None,
+                relay_session_id: None,
+                started: false,
+            },
+        );
+    }
+
+    #[test]
+    fn the_recorded_title_is_the_scope() {
+        let mut g = hub_inner();
+        client(&mut g, "a", "Crash Bash", None);
+        assert_eq!(game_scope_for(&g, "a"), "Crash Bash");
+    }
+
+    #[test]
+    fn a_client_that_never_said_its_title_falls_back_to_its_room() {
+        /* This is the case that answered `no_game`: a client seated in a
+         * room, chatting before it ever sent a `list`. */
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Gundam Wing");
+        client(&mut g, "a", "", Some("L"));
+        assert_eq!(game_scope_for(&g, "a"), "Gundam Wing");
+    }
+
+    #[test]
+    fn nothing_anywhere_is_still_no_scope() {
+        let mut g = hub_inner();
+        client(&mut g, "a", "", None);
+        assert_eq!(game_scope_for(&g, "a"), "");
+        assert_eq!(game_scope_for(&g, "nobody"), "");
+    }
+
+    #[test]
+    fn the_scope_is_the_title_and_never_the_version() {
+        /* Two builds of one game are one audience. The lobby list may hide
+         * one from the other (strict version filtering), but the chat and
+         * the players-online list must not split along that line. */
+        let mut g = hub_inner();
+        lobby(&mut g, "old", "Crash Bash");
+        lobby(&mut g, "new", "Crash Bash");
+        g.lobbies.get_mut("old").unwrap().game_version = "0.1.0".into();
+        g.lobbies.get_mut("new").unwrap().game_version = "0.2.0".into();
+        client(&mut g, "a", "", Some("old"));
+        client(&mut g, "b", "", Some("new"));
+        client(&mut g, "c", "Crash Bash", None);
+        assert_eq!(game_scope_for(&g, "a"), game_scope_for(&g, "b"));
+        assert_eq!(game_scope_for(&g, "a"), game_scope_for(&g, "c"));
+    }
+
+    #[test]
+    fn different_titles_do_not_share_a_room() {
+        let mut g = hub_inner();
+        client(&mut g, "a", "Crash Bash", None);
+        client(&mut g, "b", "Gundam Wing", None);
+        assert_ne!(game_scope_for(&g, "a"), game_scope_for(&g, "b"));
     }
 }
 
