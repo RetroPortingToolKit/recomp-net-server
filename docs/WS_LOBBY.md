@@ -298,6 +298,19 @@ member row of `lobby_update` / `launch`, and `"host_country"` on each
 configured, the address is private or loopback, or the lookup has no answer.
 Clients draw it as a flag before the name. Nothing else depends on it.
 
+**No flags? The startup log says which of the three it is.** `GEOIP_DB_PATH
+not set; country flags off`, `GeoIP database not loaded` (with the error), or
+`GeoIP country database loaded; flags on`. With the database loaded, run at
+`RUST_LOG=debug` and each connect logs why a lookup came back empty.
+
+**Behind a reverse proxy, set `TRUST_PROXY_HEADER=1`.** The country is
+resolved from the TCP source address, which behind a proxy is the proxy --
+usually loopback, which is private, so *every* player is flagless even with a
+working database. With this set, the left-most `X-Forwarded-For` entry is used
+instead. It is off by default and must stay off unless a proxy really is in
+front: the header is trivially spoofable by anyone reaching the server
+directly, and trusting it would let a client choose its own flag.
+
 ### Lobby chat
 
 Any seated member (player or spectator) may send a line; the server echoes it

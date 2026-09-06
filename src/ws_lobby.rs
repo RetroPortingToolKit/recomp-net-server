@@ -4,6 +4,7 @@
 //! (JSON text frames, `"op"` field).
 
 use axum::extract::connect_info::ConnectInfo;
+use axum::http::HeaderMap;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -155,14 +156,20 @@ impl WsLobbyHub {
     /// nothing else about the lobby depends on it.
     pub fn with_geoip(path: Option<&str>) -> Self {
         let mut hub = Self::default();
-        if let Some(p) = path {
-            match maxminddb::Reader::open_readfile(p) {
+        match path {
+            Some(p) => match maxminddb::Reader::open_readfile(p) {
                 Ok(r) => {
-                    info!(path = p, "GeoIP country database loaded");
+                    info!(path = p, "GeoIP country database loaded; flags on");
                     hub.geoip = Arc::new(Some(r));
                 }
                 Err(e) => warn!(path = p, error = %e, "GeoIP database not loaded; no flags"),
-            }
+            },
+            /* Said out loud. An unset GEOIP_DB_PATH used to log nothing at
+             * all, so a deployment that had simply forgotten the variable was
+             * indistinguishable from one whose database was fine and whose
+             * players all happened to be on private addresses. Both show no
+             * flags; only one is a mistake. */
+            None => info!("GEOIP_DB_PATH not set; country flags off"),
         }
         hub
     }
@@ -172,9 +179,12 @@ impl WsLobbyHub {
     /// one, or an IP the database does not cover.
     pub fn country_for(&self, ip: &str) -> String {
         let Some(reader) = self.geoip.as_ref() else {
+            /* No startup log to repeat here -- with_geoip already said which
+             * state we are in, and this runs once per connect. */
             return String::new();
         };
         let Ok(addr) = ip.trim().parse::<std::net::IpAddr>() else {
+            debug!(ip, "geoip: unparsable peer address; no flag");
             return String::new();
         };
         let private = match addr {
@@ -189,18 +199,33 @@ impl WsLobbyHub {
             }
         };
         if private {
+            /* The usual reason flags are missing in testing, and the usual
+             * reason they are missing in production behind a reverse proxy --
+             * where every peer arrives as the proxy's loopback address. Worth
+             * one line per connect to tell those apart from a bad database. */
+            debug!(ip, "geoip: private/loopback peer address; no flag");
             return String::new();
         }
         let Ok(found) = reader.lookup(addr) else {
+            debug!(ip, "geoip: lookup failed; no flag");
             return String::new();
         };
         match found.decode::<maxminddb::geoip2::Country>() {
-            Ok(Some(c)) => c
-                .country
-                .iso_code
-                .map(|s| s.to_ascii_uppercase())
-                .unwrap_or_default(),
-            _ => String::new(),
+            Ok(Some(c)) => {
+                let code = c
+                    .country
+                    .iso_code
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_default();
+                if code.is_empty() {
+                    debug!(ip, "geoip: database has no country for this address");
+                }
+                code
+            }
+            _ => {
+                debug!(ip, "geoip: database has no record for this address");
+                String::new()
+            }
         }
     }
 
@@ -250,12 +275,34 @@ pub fn ws_router() -> Router<AppState> {
         .route("/ws", get(ws_upgrade))
 }
 
+/// The client address to attribute this connection to.
+///
+/// The TCP peer, unless the server is explicitly configured to sit behind a
+/// reverse proxy -- in which case the first entry of `X-Forwarded-For` is the
+/// original client and the TCP peer is the proxy. Gated on config and never
+/// on the header's presence: the header is trivially spoofable by anyone
+/// reaching the server directly, so honouring it unasked would let a client
+/// pick its own flag.
+fn client_ip_for(headers: &HeaderMap, addr: &SocketAddr, trust_proxy: bool) -> String {
+    if trust_proxy {
+        if let Some(fwd) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            /* Left-most entry is the original client; proxies append. */
+            let first = fwd.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    addr.ip().to_string()
+}
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let peer_ip = addr.ip().to_string();
+    let peer_ip = client_ip_for(&headers, &addr, state.config.trust_proxy_header);
     ws.on_upgrade(move |socket| handle_socket(socket, peer_ip, state))
 }
 
@@ -2923,6 +2970,71 @@ async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<
 #[allow(dead_code)]
 fn err_json(code: &str) -> Value {
     json!({ "op": "error", "code": code, "ok": false })
+}
+
+#[cfg(test)]
+mod geoip_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn hdr(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", v.parse().unwrap());
+        h
+    }
+
+    fn peer() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000)
+    }
+
+    #[test]
+    fn the_header_is_ignored_unless_trusted() {
+        /* The whole point of the flag. Anyone reaching the server directly can
+         * set this header, so believing it by default would let a client pick
+         * its own country. */
+        assert_eq!(client_ip_for(&hdr("8.8.8.8"), &peer(), false), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_trusted_proxy_reveals_the_client() {
+        /* And the reason to turn it on: behind a proxy every peer otherwise
+         * arrives as loopback, which is private, so nobody gets a flag. */
+        assert_eq!(client_ip_for(&hdr("8.8.8.8"), &peer(), true), "8.8.8.8");
+    }
+
+    #[test]
+    fn the_leftmost_entry_is_the_client() {
+        /* Proxies append, so the original client is first and the rest are
+         * hops. Taking the last would attribute every player to the proxy. */
+        assert_eq!(
+            client_ip_for(&hdr("8.8.8.8, 10.0.0.1, 10.0.0.2"), &peer(), true),
+            "8.8.8.8"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_empty_header_falls_back_to_the_peer() {
+        assert_eq!(client_ip_for(&HeaderMap::new(), &peer(), true), "127.0.0.1");
+        assert_eq!(client_ip_for(&hdr("   "), &peer(), true), "127.0.0.1");
+        assert_eq!(client_ip_for(&hdr(" , 10.0.0.1"), &peer(), true), "127.0.0.1");
+    }
+
+    #[test]
+    fn no_database_means_no_flag_and_no_panic() {
+        /* country_for must be safe to call in every deployment, including one
+         * that never configured a database -- which is the default. */
+        let hub = WsLobbyHub::with_geoip(None);
+        assert_eq!(hub.country_for("8.8.8.8"), "");
+        assert_eq!(hub.country_for("127.0.0.1"), "");
+        assert_eq!(hub.country_for("not-an-ip"), "");
+        assert_eq!(hub.country_for(""), "");
+    }
+
+    #[test]
+    fn a_bad_database_path_leaves_flags_off_rather_than_failing_to_start() {
+        let hub = WsLobbyHub::with_geoip(Some("/nonexistent/GeoLite2-Country.mmdb"));
+        assert_eq!(hub.country_for("8.8.8.8"), "");
+    }
 }
 
 #[cfg(test)]

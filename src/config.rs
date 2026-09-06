@@ -54,6 +54,15 @@ pub struct Config {
     /// client's country is resolved from its TCP source IP and shown as a
     /// flag in lobbies. Unset = no flags; private / loopback peers never get one.
     pub geoip_db_path: Option<String>,
+    /// Trust `X-Forwarded-For` for the client's address (GeoIP only).
+    ///
+    /// OFF by default, and it must stay that way: the header is trivially
+    /// spoofable by anyone talking to the server directly, so trusting it
+    /// unconditionally would let a client choose its own flag. Turn it on only
+    /// when the server sits behind a reverse proxy that sets the header
+    /// itself -- which is also the case where every peer otherwise arrives as
+    /// the proxy's loopback address and nobody gets a flag at all.
+    pub trust_proxy_header: bool,
 }
 
 impl Config {
@@ -147,9 +156,12 @@ impl Config {
             parse_bool_env(&env::var("INPUT_RELAY_ALLOW_LOOPBACK").unwrap_or_default());
 
         let geoip_db_path = env::var("GEOIP_DB_PATH").ok().filter(|s| !s.is_empty());
+        let trust_proxy_header =
+            parse_bool_env(&env::var("TRUST_PROXY_HEADER").unwrap_or_default());
 
         Ok(Config {
             geoip_db_path,
+            trust_proxy_header,
             bind_addr,
             database_url,
             require_auth,
