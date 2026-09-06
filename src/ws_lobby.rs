@@ -110,7 +110,6 @@ struct Lobby {
 }
 
 struct ClientMeta {
-    #[allow(dead_code)]
     player_id: String,
     display_name: String,
     /// TCP source IP as seen by the lobby (LAN vs WAN / hairpin signal).
@@ -551,6 +550,23 @@ struct LobbyListRow<'a> {
     lan_endpoints: &'a [String],
     /// Host's country (alpha-2) from GeoIP; "" when unknown.
     host_country: String,
+    /// Gallery: whether the host opened one, its size, and how many watch.
+    /// A browser shows "No" or "1/4" from these.
+    allow_spectators: bool,
+    max_spectators: usize,
+    spectator_count: usize,
+}
+
+/// One connected client, for the browser's "players online" panel.
+#[derive(Serialize)]
+struct OnlinePlayerRow {
+    display_name: String,
+    /// Country (alpha-2) from GeoIP; "" when unknown.
+    country: String,
+    /// The room this player is in ("" when browsing), and its name.
+    lobby_id: String,
+    lobby_name: String,
+    hosting: bool,
 }
 
 /// The built-in RIR table's answer, or "" when it has none. Private addresses
@@ -638,9 +654,32 @@ fn lobby_list_json_filtered(
                 .find(|s| s.player_id == l.host_player_id)
                 .map(|s| s.country.clone())
                 .unwrap_or_default(),
+            allow_spectators: l.allow_spectators,
+            max_spectators: l.spectators.len(),
+            spectator_count: l.spectator_count(),
         })
         .collect();
-    json!({ "op": "lobby_list", "lobbies": rows }).to_string()
+    /* Everyone connected, browsing or seated, so a browser can show who is
+     * around to play -- an empty lobby list with three people online reads
+     * very differently from an empty list with nobody. Same title filter as
+     * the rows: a client of another game is not "here" for this one.
+     * Additive: an older client ignores the key. */
+    let mut players: Vec<OnlinePlayerRow> = hub
+        .clients
+        .values()
+        .map(|c| {
+            let lobby = c.lobby_id.as_ref().and_then(|id| hub.lobbies.get(id));
+            OnlinePlayerRow {
+                display_name: c.display_name.clone(),
+                country: c.country.clone(),
+                lobby_id: lobby.map(|l| l.lobby_id.clone()).unwrap_or_default(),
+                lobby_name: lobby.map(|l| l.name.clone()).unwrap_or_default(),
+                hosting: lobby.is_some_and(|l| l.host_player_id == c.player_id),
+            }
+        })
+        .collect();
+    players.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    json!({ "op": "lobby_list", "lobbies": rows, "players": players }).to_string()
 }
 
 fn hash_password(password: &str, salt: &[u8; 16]) -> [u8; 32] {

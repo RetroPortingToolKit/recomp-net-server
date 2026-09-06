@@ -53,11 +53,27 @@ Server → clients (on request, on change, and ~1 Hz while anyone is connected):
       "max_slots": 2,
       "has_password": true,
       "host_endpoint": "203.0.113.10:7777",
-      "lan_endpoints": ["192.168.1.42:7777"]
+      "lan_endpoints": ["192.168.1.42:7777"],
+      "host_country": "JP",
+      "allow_spectators": true,
+      "max_spectators": 4,
+      "spectator_count": 1
     }
+  ],
+  "players": [
+    { "display_name": "Marisa", "country": "JP", "lobby_id": "...",
+      "lobby_name": "Friday Fights", "hosting": true },
+    { "display_name": "Reimu", "country": "DE", "lobby_id": "",
+      "lobby_name": "", "hosting": false }
   ]
 }
 ```
+
+`allow_spectators` / `max_spectators` / `spectator_count` describe the
+lobby's gallery (a browser shows "No" or "1/4"). `players` is everyone
+connected to the hub, seated or browsing, sorted by name; `lobby_id` is
+empty for a player who is only browsing. Both are additive: older clients
+ignore them.
 
 Passwords are never listed — only `has_password`.
 `host_endpoint` is the public/STUN UDP address for list latency.
