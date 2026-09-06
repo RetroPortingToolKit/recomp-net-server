@@ -2040,13 +2040,9 @@ async fn handle_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
  * manage its OWN seat: taking a free seat is immediate, taking an occupied
  * one needs that player's consent, so it is a request the occupant answers.
  * The server arbitrates, which also makes two simultaneous requests resolve
- * in arrival order rather than racing. Slot 0 stays pinned to the host / sim
- * authority, exactly as in `handle_move`. */
-
-/// Find the seat a player currently occupies, in either table.
-fn slot_of_player(lobby: &Lobby, player_id: &str) -> Option<usize> {
-    lobby.seat_of(player_id)
-}
+ * in arrival order rather than racing. Both tables count: a spectator may
+ * take a free player seat or ask a player for a taken one, and the reverse,
+ * with the same consent rule either way. */
 
 /// A player moves ITSELF into a free seat.
 async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
@@ -2149,24 +2145,16 @@ async fn handle_seat_swap_request(
         let Some(lobby) = g.lobbies.get(&lid) else {
             return Ok(());
         };
-        let Some(from) = slot_of_player(lobby, player_id) else {
+        let Some(from) = lobby.seat_of(player_id) else {
             return Ok(());
         };
-        /* Self-service stays inside the player table. A spectator asking to
-         * move itself would index `slots` with a spectator seat, and -- worse
-         * than the panic that used to be -- promoting yourself into the match
-         * is the host's call, not the gallery's. */
-        if is_spectator_seat(from) {
-            drop(g);
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "spectator", "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
-        if target >= lobby.slots.len() || target == from {
+        /* Either table, both directions -- like `seat_move`, but for a TAKEN
+         * seat: nothing moves until the occupant says yes, so a spectator
+         * asking a player for its seat is as legitimate as a player asking
+         * another player. (Whether the host may end up in the gallery is
+         * the client's rule: it knows if its backend can run the match that
+         * way; the launch path here already sizes the relay for it.) */
+        if lobby.seat(target).is_none() || target == from {
             drop(g);
             send_to(
                 hub,
@@ -2176,7 +2164,7 @@ async fn handle_seat_swap_request(
             .await;
             return Ok(());
         }
-        let Some(occupant) = lobby.slots[target].as_ref() else {
+        let Some(occupant) = lobby.seat(target).and_then(|c| c.as_ref()) else {
             drop(g);
             send_to(
                 hub,
@@ -2186,8 +2174,9 @@ async fn handle_seat_swap_request(
             .await;
             return Ok(());
         };
-        let asker_name = lobby.slots[from]
-            .as_ref()
+        let asker_name = lobby
+            .seat(from)
+            .and_then(|c| c.as_ref())
             .map(|s| s.display_name.clone())
             .unwrap_or_default();
         (
@@ -2225,10 +2214,8 @@ async fn handle_seat_swap_answer(
         let Some(lobby) = g.lobbies.get_mut(&lid) else {
             return Ok(());
         };
-        let (Some(mine), Some(theirs)) = (
-            slot_of_player(lobby, player_id),
-            slot_of_player(lobby, &asker),
-        ) else {
+        let (Some(mine), Some(theirs)) = (lobby.seat_of(player_id), lobby.seat_of(&asker))
+        else {
             /* The asker left, or seats moved under us — decline quietly. */
             drop(g);
             send_to(
@@ -2239,25 +2226,26 @@ async fn handle_seat_swap_answer(
             .await;
             return Ok(());
         };
-        /* Either side having been moved to the gallery since the ask is the
-         * same situation as the asker having left: the trade no longer means
-         * what it meant, and `slots.swap` below would index out of range. */
-        if is_spectator_seat(mine) || is_spectator_seat(theirs) {
-            drop(g);
-            send_to(
-                hub,
-                &asker,
-                json!({ "op": "seat_swap_result", "accept": false, "ok": true }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
-        if !accept {
+        if !accept || mine == theirs {
             (lid.clone(), false)
         } else {
-            lobby.slots.swap(mine, theirs);
+            /* Take/put rather than `slots.swap`: the two seats may live in
+             * different tables (a spectator trading into the match). */
+            let a = lobby.seat_mut(mine).and_then(Option::take);
+            let b = lobby.seat_mut(theirs).and_then(Option::take);
+            if let Some(cell) = lobby.seat_mut(mine) {
+                *cell = b;
+            }
+            if let Some(cell) = lobby.seat_mut(theirs) {
+                *cell = a;
+            }
             for s in lobby.slots.iter_mut().flatten() {
                 s.ready = false;
+            }
+            /* A seat change across tables changes relay slots, as it does
+             * for `seat_move`; the paths are re-measured after it. */
+            if is_spectator_seat(mine) != is_spectator_seat(theirs) {
+                clear_lobby_ice_paths(lobby);
             }
             (lid.clone(), true)
         }
