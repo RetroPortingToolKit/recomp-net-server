@@ -954,6 +954,7 @@ async fn handle_text(
         "create" => handle_create(hub, player_id, peer_ip, msg).await?,
         "join" => handle_join(hub, player_id, peer_ip, msg).await?,
         "set_ready" => handle_set_ready(hub, player_id, msg).await?,
+        "chat" => handle_chat(hub, player_id, msg).await?,
         "set_match_caps" => handle_set_match_caps(hub, player_id, msg).await?,
         "set_host_endpoint" => handle_set_host_endpoint(hub, player_id, msg).await?,
         "path_report" => handle_path_report(hub, player_id, msg).await?,
@@ -2677,6 +2678,60 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             }
             metrics::ws_lobby_started(&game_name, n);
         }
+    }
+    Ok(())
+}
+
+/// Lobby chat. One line from a seated client (player or spectator), echoed to
+/// EVERYONE seated including the sender: the room's order is this server's
+/// order, so no client appends its own line locally. Not stored — a late
+/// joiner starts from the first line after they arrive.
+const CHAT_MAX_CHARS: usize = 240;
+
+async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let text = msg.text.unwrap_or_default();
+    /* One line, no control characters, capped — a chat box is not a channel
+     * for anything a client cannot render as a line of text. */
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(CHAT_MAX_CHARS)
+        .collect();
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let (fwd, targets) = {
+        let g = hub.inner.lock().await;
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "not_in_lobby", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get(&lid) else {
+            return Ok(());
+        };
+        let Some(sender) = lobby.everyone().find(|s| s.player_id == player_id) else {
+            return Ok(());
+        };
+        let fwd = json!({
+            "op": "chat",
+            "lobby_id": lid,
+            "from_player_id": player_id,
+            "from": sender.display_name,
+            "text": text,
+        })
+        .to_string();
+        let targets: Vec<String> = lobby.everyone().map(|s| s.player_id.clone()).collect();
+        (fwd, targets)
+    };
+    for t in targets {
+        send_to(hub, &t, fwd.clone()).await;
     }
     Ok(())
 }

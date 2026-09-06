@@ -288,6 +288,27 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
+### Lobby chat
+
+Any seated member (player or spectator) may send a line; the server echoes it
+to **everyone seated, sender included**, so the room's order is the server's
+order and no client appends its own line. Lines are not stored — a late joiner
+sees only what arrives after them. Text is trimmed, control characters are
+dropped, and it is capped at 240 characters; an empty line is ignored.
+
+```json
+{ "op": "chat", "text": "gg last time, ready when you are" }
+```
+
+Server → members:
+
+```json
+{ "op": "chat", "lobby_id": "…", "from_player_id": "…", "from": "Marisa",
+  "text": "gg last time, ready when you are" }
+```
+
+Errors: `not_in_lobby`.
+
 Client → server (host only; requires seated `player_count >= 2`). Online MotK/BPE
 lobbies **always** open the lobby UDP SFU (`transport=sfu`, §108). Waiting-room
 ICE `path_report` is telemetry only and does **not** select `ice_p2p`.
