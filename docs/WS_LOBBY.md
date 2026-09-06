@@ -71,7 +71,27 @@ Server → clients (on request, on change, and ~1 Hz while anyone is connected):
 
 `tag` is the first 8 characters of that connection's player id: a client
 finds its own row by comparing with its id, since display names are not
-unique across the hub.
+unique across the hub. Each row also carries `game_name`, the title that
+client last listed for; a filtered `list` (with `game_name`) returns only
+the players of that title, and the unfiltered broadcast carries everyone,
+for the client to filter.
+
+### Server chat (per game)
+
+```json
+{ "op": "server_chat", "text": "anyone up for a set?" }
+```
+
+Relayed, after the profanity filter, to every client whose last `list`
+named the same `game_name` as the sender -- seated in a room or not:
+
+```json
+{ "op": "server_chat", "game_name": "…", "from_player_id": "…",
+  "from": "Marisa", "country": "JP", "text": "anyone up for a set?" }
+```
+
+No history is kept. A client that has not listed for a title yet gets
+`error` / `no_game`.
 
 `allow_spectators` / `max_spectators` / `spectator_count` describe the
 lobby's gallery (a browser shows "No" or "1/4"). `players` is everyone
@@ -345,6 +365,15 @@ front: the header is trivially spoofable by anyone reaching the server
 directly, and trusting it would let a client choose its own flag.
 
 ### Lobby chat
+
+Relayed lines pass through the profanity / slur filter first
+(`src/chat_filter.rs`; word list `data/chat_filter_words.txt`, a copy of
+recomp-net's `data/chat_filter_words.txt` -- keep them identical). Matches
+become one `*` per character; matching folds case, Latin diacritics,
+full-width ASCII and leetspeak, and tolerates repeated or spaced-out
+letters. `CHAT_FILTER=0` disables it; `CHAT_FILTER_EXTRA_PATH` appends a
+file of extra entries in the same format. Clients run the same filter on
+every line they display, so a LAN room without a server is filtered too.
 
 Any seated member (player or spectator) may send a line; the server echoes it
 to **everyone seated, sender included**, so the room's order is the server's

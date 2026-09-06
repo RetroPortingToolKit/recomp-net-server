@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod chat_filter;
 pub mod config;
 pub mod input_relay;
 pub mod ip_country;

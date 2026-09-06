@@ -264,6 +264,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("input relay")?;
 
+    recomp_net_server::chat_filter::init(
+        config.chat_filter_enabled,
+        config.chat_filter_extra_path.as_deref(),
+    );
+
     let state = AppState {
         pool: pool.clone(),
         config: Arc::new(config.clone()),

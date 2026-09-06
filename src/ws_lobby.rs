@@ -116,6 +116,9 @@ struct ClientMeta {
     peer_ip: String,
     /// ISO 3166-1 alpha-2 from GeoIP on peer_ip; "" when unknown / private.
     country: String,
+    /// The title this client is browsing for, from its `list` requests.
+    /// Scopes the players-online list and the per-game server chat.
+    game_name: String,
     lobby_id: Option<String>,
     /// Password-ok join waiting on missing mods (not seated).
     pending_mod_lobby: Option<String>,
@@ -571,6 +574,8 @@ struct OnlinePlayerRow {
     /// row (a display name is not unique across the hub) without the hub
     /// publishing whole ids to every browser.
     tag: String,
+    /// The title this client is browsing for ("" until its first `list`).
+    game_name: String,
 }
 
 /// The built-in RIR table's answer, or "" when it has none. Private addresses
@@ -671,6 +676,10 @@ fn lobby_list_json_filtered(
     let mut players: Vec<OnlinePlayerRow> = hub
         .clients
         .values()
+        .filter(|c| match filter_game {
+            Some(g) if !g.is_empty() => c.game_name == g,
+            _ => true,
+        })
         .map(|c| {
             let lobby = c.lobby_id.as_ref().and_then(|id| hub.lobbies.get(id));
             OnlinePlayerRow {
@@ -680,6 +689,7 @@ fn lobby_list_json_filtered(
                 lobby_name: lobby.map(|l| l.name.clone()).unwrap_or_default(),
                 hosting: lobby.is_some_and(|l| l.host_player_id == c.player_id),
                 tag: c.player_id.chars().take(8).collect(),
+                game_name: c.game_name.clone(),
             }
         })
         .collect();
@@ -1033,6 +1043,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 display_name: format!("Player-{}", &player_id[..8.min(player_id.len())]),
                 country: hub.country_for(&peer_ip),
                 peer_ip: peer_ip.clone(),
+                game_name: String::new(),
                 lobby_id: None,
                 pending_mod_lobby: None,
                 tx: tx.clone(),
@@ -1127,6 +1138,14 @@ async fn handle_text(
             .await;
         }
         "list" => {
+            /* The title a client lists for is the title it is playing: it
+             * scopes what "players online" and the server chat mean to it. */
+            if let Some(g) = msg.game_name.as_deref().filter(|s| !s.is_empty()) {
+                let mut guard = hub.inner.lock().await;
+                if let Some(c) = guard.clients.get_mut(player_id) {
+                    c.game_name = g.to_string();
+                }
+            }
             let filter_game = msg.game_name.as_deref().filter(|s| !s.is_empty());
             let filter_ver = msg
                 .game_version
@@ -1146,6 +1165,7 @@ async fn handle_text(
         "join" => handle_join(hub, player_id, peer_ip, msg).await?,
         "set_ready" => handle_set_ready(hub, player_id, msg).await?,
         "chat" => handle_chat(hub, player_id, msg).await?,
+        "server_chat" => handle_server_chat(hub, player_id, msg).await?,
         "set_match_caps" => handle_set_match_caps(hub, player_id, msg).await?,
         "set_host_endpoint" => handle_set_host_endpoint(hub, player_id, msg).await?,
         "path_report" => handle_path_report(hub, player_id, msg).await?,
@@ -2958,6 +2978,11 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
     if text.is_empty() {
         return Ok(());
     }
+    /* Profanity and slurs are masked here, before any peer sees the line
+     * (see chat_filter.rs); clients mask again on arrival, which is what
+     * covers LAN rooms and older servers. */
+    let text = crate::chat_filter::apply(text);
+    let text = text.as_str();
     let (fwd, targets) = {
         let g = hub.inner.lock().await;
         let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
@@ -2985,6 +3010,59 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
         })
         .to_string();
         let targets: Vec<String> = lobby.everyone().map(|s| s.player_id.clone()).collect();
+        (fwd, targets)
+    };
+    for t in targets {
+        send_to(hub, &t, fwd.clone()).await;
+    }
+    Ok(())
+}
+
+/// Per-game chat outside any room: every client browsing for the same
+/// title hears it, seated or not. Same shape and same filter as lobby
+/// chat; no history, so a newcomer sees only what is said after arriving.
+async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let text = msg.text.unwrap_or_default();
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(CHAT_MAX_CHARS)
+        .collect();
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let text = crate::chat_filter::apply(text);
+    let (fwd, targets) = {
+        let g = hub.inner.lock().await;
+        let Some(sender) = g.clients.get(player_id) else {
+            return Ok(());
+        };
+        if sender.game_name.is_empty() {
+            drop(g);
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "no_game", "ok": false }).to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+        let fwd = json!({
+            "op": "server_chat",
+            "game_name": sender.game_name,
+            "from_player_id": player_id,
+            "from": sender.display_name,
+            "country": sender.country,
+            "text": text,
+        })
+        .to_string();
+        let targets: Vec<String> = g
+            .clients
+            .values()
+            .filter(|c| c.game_name == sender.game_name)
+            .map(|c| c.player_id.clone())
+            .collect();
         (fwd, targets)
     };
     for t in targets {

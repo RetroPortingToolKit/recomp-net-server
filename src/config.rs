@@ -63,6 +63,12 @@ pub struct Config {
     /// itself -- which is also the case where every peer otherwise arrives as
     /// the proxy's loopback address and nobody gets a flag at all.
     pub trust_proxy_header: bool,
+    /// Mask profanity / slurs in relayed chat (default on). `CHAT_FILTER=0`
+    /// turns it off; clients still filter on arrival.
+    pub chat_filter_enabled: bool,
+    /// Optional file of extra chat-filter entries (same format as the
+    /// built-in list), appended at startup. `CHAT_FILTER_EXTRA_PATH`.
+    pub chat_filter_extra_path: Option<String>,
 }
 
 impl Config {
@@ -158,10 +164,18 @@ impl Config {
         let geoip_db_path = env::var("GEOIP_DB_PATH").ok().filter(|s| !s.is_empty());
         let trust_proxy_header =
             parse_bool_env(&env::var("TRUST_PROXY_HEADER").unwrap_or_default());
+        let chat_filter_enabled = match env::var("CHAT_FILTER") {
+            Ok(v) if !v.trim().is_empty() => parse_bool_env(&v),
+            _ => true,
+        };
+        let chat_filter_extra_path =
+            env::var("CHAT_FILTER_EXTRA_PATH").ok().filter(|s| !s.is_empty());
 
         Ok(Config {
             geoip_db_path,
             trust_proxy_header,
+            chat_filter_enabled,
+            chat_filter_extra_path,
             bind_addr,
             database_url,
             require_auth,
