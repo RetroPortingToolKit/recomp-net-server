@@ -15,7 +15,13 @@ secrets/
 *.db
 *.sqlite
 *.sqlite3
-data/
+data/*
+# ...except the built-in IP->country table, which is the whole point of being
+# distributable: it is public RIR allocation data with no PII, it is what makes
+# flags work with nothing installed, and a deployment cannot build without it.
+# Regenerate with tools/gen_ip_country.py; the RIR sources it downloads stay
+# ignored by the line above.
+!data/ip_country.bin
 
 # Rust
 /target/

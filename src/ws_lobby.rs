@@ -164,29 +164,38 @@ impl WsLobbyHub {
                 }
                 Err(e) => warn!(path = p, error = %e, "GeoIP database not loaded; no flags"),
             },
-            /* Said out loud. An unset GEOIP_DB_PATH used to log nothing at
-             * all, so a deployment that had simply forgotten the variable was
-             * indistinguishable from one whose database was fine and whose
-             * players all happened to be on private addresses. Both show no
-             * flags; only one is a mistake. */
-            None => info!("GEOIP_DB_PATH not set; country flags off"),
+            /* Not an error, and no longer "no flags": the built-in table is
+             * compiled in and covers every deployment with nothing to
+             * install. GEOIP_DB_PATH is an accuracy upgrade, not a
+             * prerequisite. */
+            None => {
+                let (v4, v6) = crate::ip_country::range_counts();
+                info!(
+                    ipv4_ranges = v4,
+                    ipv6_ranges = v6,
+                    "GEOIP_DB_PATH not set; using the built-in RIR country table"
+                );
+            }
         }
         hub
     }
 
     /// Country (alpha-2, upper case) for a peer IP, or "" when the lookup
-    /// cannot say: no database, a private / loopback address, an unparsable
-    /// one, or an IP the database does not cover.
+    /// cannot say: a private / loopback address, an unparsable one, or an
+    /// address no table covers.
+    ///
+    /// The built-in RIR table always answers; GEOIP_DB_PATH adds MaxMind on
+    /// top and takes precedence where it has a record.
     pub fn country_for(&self, ip: &str) -> String {
-        let Some(reader) = self.geoip.as_ref() else {
-            /* No startup log to repeat here -- with_geoip already said which
-             * state we are in, and this runs once per connect. */
-            return String::new();
-        };
         let Ok(addr) = ip.trim().parse::<std::net::IpAddr>() else {
             debug!(ip, "geoip: unparsable peer address; no flag");
             return String::new();
         };
+        /* Answered FIRST, before either table, so both paths obey it. A
+         * private address has no country in any database, and this is the
+         * usual reason flags are missing -- in testing, and in production
+         * behind a reverse proxy, where every peer arrives as the proxy's
+         * loopback address. */
         let private = match addr {
             std::net::IpAddr::V4(v4) => {
                 v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
@@ -199,34 +208,34 @@ impl WsLobbyHub {
             }
         };
         if private {
-            /* The usual reason flags are missing in testing, and the usual
-             * reason they are missing in production behind a reverse proxy --
-             * where every peer arrives as the proxy's loopback address. Worth
-             * one line per connect to tell those apart from a bad database. */
             debug!(ip, "geoip: private/loopback peer address; no flag");
             return String::new();
         }
-        let Ok(found) = reader.lookup(addr) else {
-            debug!(ip, "geoip: lookup failed; no flag");
-            return String::new();
+        let Some(reader) = self.geoip.as_ref() else {
+            /* No MaxMind configured: the built-in table answers, so a
+             * deployment that installs nothing still shows flags. */
+            return builtin_country(addr);
         };
-        match found.decode::<maxminddb::geoip2::Country>() {
-            Ok(Some(c)) => {
-                let code = c
+        /* MaxMind is configured, so it wins -- it is the more accurate answer
+         * and the operator asked for it. The built-in table still backs it up
+         * where the database has no record, so adding MaxMind can only ever
+         * improve coverage, never reduce it. */
+        let from_db = match reader.lookup(addr) {
+            Ok(found) => match found.decode::<maxminddb::geoip2::Country>() {
+                Ok(Some(c)) => c
                     .country
                     .iso_code
                     .map(|s| s.to_ascii_uppercase())
-                    .unwrap_or_default();
-                if code.is_empty() {
-                    debug!(ip, "geoip: database has no country for this address");
-                }
-                code
-            }
-            _ => {
-                debug!(ip, "geoip: database has no record for this address");
-                String::new()
-            }
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        };
+        if !from_db.is_empty() {
+            return from_db;
         }
+        debug!(ip, "geoip: no MaxMind record; falling back to the built-in table");
+        builtin_country(addr)
     }
 
     pub async fn client_count(&self) -> usize {
@@ -542,6 +551,18 @@ struct LobbyListRow<'a> {
     lan_endpoints: &'a [String],
     /// Host's country (alpha-2) from GeoIP; "" when unknown.
     host_country: String,
+}
+
+/// The built-in RIR table's answer, or "" when it has none. Private addresses
+/// are filtered by the caller before this is reached.
+fn builtin_country(addr: std::net::IpAddr) -> String {
+    match crate::ip_country::lookup(addr) {
+        Some(cc) => cc,
+        None => {
+            debug!(%addr, "geoip: built-in table has no record for this address");
+            String::new()
+        }
+    }
 }
 
 /// Normalize empty / missing version to `"dev"` (local builds).
@@ -3020,20 +3041,34 @@ mod geoip_tests {
     }
 
     #[test]
-    fn no_database_means_no_flag_and_no_panic() {
-        /* country_for must be safe to call in every deployment, including one
-         * that never configured a database -- which is the default. */
+    fn a_deployment_that_installs_nothing_still_gets_flags() {
+        /* The whole point of the built-in table. This is the DEFAULT
+         * configuration -- no GEOIP_DB_PATH, nothing downloaded -- and it has
+         * to answer, or flags remain a per-deployment setup step. */
         let hub = WsLobbyHub::with_geoip(None);
-        assert_eq!(hub.country_for("8.8.8.8"), "");
+        assert_eq!(hub.country_for("8.8.8.8"), "US");
+    }
+
+    #[test]
+    fn private_and_malformed_addresses_still_have_no_country() {
+        /* The built-in table must not change this: a LAN peer has no country,
+         * and neither does a string that is not an address. */
+        let hub = WsLobbyHub::with_geoip(None);
         assert_eq!(hub.country_for("127.0.0.1"), "");
+        assert_eq!(hub.country_for("192.168.1.4"), "");
+        assert_eq!(hub.country_for("10.0.0.7"), "");
+        assert_eq!(hub.country_for("::1"), "");
         assert_eq!(hub.country_for("not-an-ip"), "");
         assert_eq!(hub.country_for(""), "");
     }
 
     #[test]
-    fn a_bad_database_path_leaves_flags_off_rather_than_failing_to_start() {
+    fn a_bad_database_path_falls_back_instead_of_failing() {
+        /* A mistyped GEOIP_DB_PATH used to mean no flags at all. It now costs
+         * accuracy, not the feature -- and the server still starts. */
         let hub = WsLobbyHub::with_geoip(Some("/nonexistent/GeoLite2-Country.mmdb"));
-        assert_eq!(hub.country_for("8.8.8.8"), "");
+        assert_eq!(hub.country_for("8.8.8.8"), "US");
+        assert_eq!(hub.country_for("127.0.0.1"), "");
     }
 }
 

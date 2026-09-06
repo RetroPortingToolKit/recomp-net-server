@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod input_relay;
+pub mod ip_country;
 pub mod metrics;
 pub mod players;
 pub mod public_ip;

@@ -298,10 +298,23 @@ member row of `lobby_update` / `launch`, and `"host_country"` on each
 configured, the address is private or loopback, or the lookup has no answer.
 Clients draw it as a flag before the name. Nothing else depends on it.
 
-**No flags? The startup log says which of the three it is.** `GEOIP_DB_PATH
-not set; country flags off`, `GeoIP database not loaded` (with the error), or
-`GeoIP country database loaded; flags on`. With the database loaded, run at
-`RUST_LOG=debug` and each connect logs why a lookup came back empty.
+**Flags work with nothing installed.** A country table built from the Regional
+Internet Registries' published delegation records is committed at
+`data/ip_country.bin` and compiled into the binary, so every deployment
+resolves the same address to the same country with no account, no licence key
+and no download. `GEOIP_DB_PATH` is now an *accuracy upgrade*, not a
+prerequisite: where MaxMind has a record it wins, and where it does not the
+built-in table still answers, so adding it can only improve coverage.
+
+The trade is that RIR records give the country a range was ALLOCATED to rather
+than where it is used today, so a multinational holder or a re-routed block can
+report the registrant's country. Regenerate the table with
+`python3 tools/gen_ip_country.py`; quarterly is plenty.
+
+**No flags? The startup log says which state you are in.** `using the built-in
+RIR country table`, `GeoIP database not loaded` (with the error, and the
+built-in table still answering), or `GeoIP country database loaded; flags on`.
+Run at `RUST_LOG=debug` and each connect logs why a lookup came back empty.
 
 **Behind a reverse proxy, set `TRUST_PROXY_HEADER=1`.** The country is
 resolved from the TCP source address, which behind a proxy is the proxy --
