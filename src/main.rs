@@ -269,7 +269,9 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config.clone()),
         rooms: Arc::new(Mutex::new(RoomRegistry::default())),
         signals: Arc::new(Mutex::new(SignalStore::default())),
-        ws_lobby: recomp_net_server::ws_lobby::WsLobbyHub::new(),
+        ws_lobby: recomp_net_server::ws_lobby::WsLobbyHub::with_geoip(
+            config.geoip_db_path.as_deref(),
+        ),
         input_relay,
         debug: debug_cli,
     };

@@ -38,5 +38,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 socket2 = "0.6.5"
+maxminddb = "0.30"
 nix = { version = "0.31.3", features = ["socket", "uio", "net"] }
 libc = "0.2"

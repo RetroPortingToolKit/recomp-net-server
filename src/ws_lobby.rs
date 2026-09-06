@@ -64,6 +64,8 @@ struct Slot {
     /// Peer memory-card offer (opaque JSON from set_ready): whether the peer
     /// has a card and opted in to bring it. Read on seat 1 by the host.
     memcard_offer: Option<Value>,
+    /// Country (alpha-2) from GeoIP on the peer's IP; "" when unknown.
+    country: String,
     /// Waiting-room ICE path report: "direct" | "relay" | "fail".
     ice_path: Option<String>,
     ice_path_at: Option<Instant>,
@@ -112,6 +114,8 @@ struct ClientMeta {
     display_name: String,
     /// TCP source IP as seen by the lobby (LAN vs WAN / hairpin signal).
     peer_ip: String,
+    /// ISO 3166-1 alpha-2 from GeoIP on peer_ip; "" when unknown / private.
+    country: String,
     lobby_id: Option<String>,
     /// Password-ok join waiting on missing mods (not seated).
     pending_mod_lobby: Option<String>,
@@ -127,6 +131,8 @@ struct HubInner {
 #[derive(Clone, Default)]
 pub struct WsLobbyHub {
     inner: Arc<Mutex<HubInner>>,
+    /// GeoIP country reader (None = flags off). Shared, read-only.
+    geoip: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
 }
 
 impl Default for HubInner {
@@ -142,6 +148,60 @@ impl Default for HubInner {
 impl WsLobbyHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A hub that resolves each client's country from a MaxMind Country
+    /// database. A missing or unreadable file is logged and flags stay off;
+    /// nothing else about the lobby depends on it.
+    pub fn with_geoip(path: Option<&str>) -> Self {
+        let mut hub = Self::default();
+        if let Some(p) = path {
+            match maxminddb::Reader::open_readfile(p) {
+                Ok(r) => {
+                    info!(path = p, "GeoIP country database loaded");
+                    hub.geoip = Arc::new(Some(r));
+                }
+                Err(e) => warn!(path = p, error = %e, "GeoIP database not loaded; no flags"),
+            }
+        }
+        hub
+    }
+
+    /// Country (alpha-2, upper case) for a peer IP, or "" when the lookup
+    /// cannot say: no database, a private / loopback address, an unparsable
+    /// one, or an IP the database does not cover.
+    pub fn country_for(&self, ip: &str) -> String {
+        let Some(reader) = self.geoip.as_ref() else {
+            return String::new();
+        };
+        let Ok(addr) = ip.trim().parse::<std::net::IpAddr>() else {
+            return String::new();
+        };
+        let private = match addr {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if private {
+            return String::new();
+        }
+        let Ok(found) = reader.lookup(addr) else {
+            return String::new();
+        };
+        match found.decode::<maxminddb::geoip2::Country>() {
+            Ok(Some(c)) => c
+                .country
+                .iso_code
+                .map(|s| s.to_ascii_uppercase())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     pub async fn client_count(&self) -> usize {
@@ -411,6 +471,9 @@ fn slot_json(i: usize, slot: &Slot) -> Value {
     if let Some(offer) = &slot.memcard_offer {
         row["memcard_offer"] = offer.clone();
     }
+    if !slot.country.is_empty() {
+        row["country"] = json!(slot.country);
+    }
     row
 }
 
@@ -430,6 +493,8 @@ struct LobbyListRow<'a> {
     host_endpoint: &'a str,
     /// Same-LAN probe candidates (RFC1918 host:port).
     lan_endpoints: &'a [String],
+    /// Host's country (alpha-2) from GeoIP; "" when unknown.
+    host_country: String,
 }
 
 /// Normalize empty / missing version to `"dev"` (local builds).
@@ -500,6 +565,11 @@ fn lobby_list_json_filtered(
                 .unwrap_or(0),
             host_endpoint: &l.host_endpoint,
             lan_endpoints: &l.lan_endpoints,
+            host_country: l
+                .everyone()
+                .find(|s| s.player_id == l.host_player_id)
+                .map(|s| s.country.clone())
+                .unwrap_or_default(),
         })
         .collect();
     json!({ "op": "lobby_list", "lobbies": rows }).to_string()
@@ -806,8 +876,13 @@ async fn client_leave(state: &AppState, player_id: &str) {
             return;
         };
         if lobby.host_player_id == player_id {
-            Some((lid, true))
+            Some((lid, true, String::new()))
         } else {
+            let name = lobby
+                .everyone()
+                .find(|s| s.player_id == player_id)
+                .map(|s| s.display_name.clone())
+                .unwrap_or_default();
             if let Some(lobby) = g.lobbies.get_mut(&lid) {
                 for s in lobby.slots.iter_mut().chain(lobby.spectators.iter_mut()) {
                     if s.as_ref().map(|x| x.player_id.as_str()) == Some(player_id) {
@@ -817,15 +892,18 @@ async fn client_leave(state: &AppState, player_id: &str) {
                 lobby.guest_endpoint.clear();
                 clear_lobby_ice_paths(lobby);
             }
-            Some((lid, false))
+            Some((lid, false, name))
         }
     };
-    if let Some((lid, is_host)) = action {
+    if let Some((lid, is_host, name)) = action {
         if is_host {
             destroy_lobby(state, &lid).await;
         } else {
             emit_lobby_update(hub, &lid).await;
             broadcast_list(hub).await;
+            if !name.is_empty() {
+                chat_system(hub, &lid, &format!("{name} has left.")).await;
+            }
         }
     }
 }
@@ -841,6 +919,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
             ClientMeta {
                 player_id: player_id.clone(),
                 display_name: format!("Player-{}", &player_id[..8.min(player_id.len())]),
+                country: hub.country_for(&peer_ip),
                 peer_ip: peer_ip.clone(),
                 lobby_id: None,
                 pending_mod_lobby: None,
@@ -1326,9 +1405,17 @@ async fn handle_create(
             bios_offer: None,
             mod_offer: None,
             memcard_offer: None,
+            country: String::new(),
             ice_path: None,
             ice_path_at: None,
         });
+        if let Some(host_slot) = slots[0].as_mut() {
+            host_slot.country = g
+                .clients
+                .get(player_id)
+                .map(|c| c.country.clone())
+                .unwrap_or_default();
+        }
 
         let match_caps = sanitize_match_caps(msg.match_caps);
         g.lobbies.insert(
@@ -1570,6 +1657,21 @@ async fn handle_join(
             emit_lobby_update(hub, &lobby_id).await;
             broadcast_list(hub).await;
             metrics::ws_lobby_join_ok();
+            {
+                let name = {
+                    let g = hub.inner.lock().await;
+                    g.clients
+                        .get(player_id)
+                        .map(|c| c.display_name.clone())
+                        .unwrap_or_default()
+                };
+                let line = if is_spectator_seat(slot) {
+                    format!("{name} has joined as a spectator.")
+                } else {
+                    format!("{name} has joined.")
+                };
+                chat_system(hub, &lobby_id, &line).await;
+            }
             Ok(())
         }
     }
@@ -1695,16 +1797,22 @@ fn seat_joiner_locked(
             }
         };
         let display_name = unique_display_name(lobby, &requested_name, Some(player_id));
-        let new_slot = Slot {
+        let mut new_slot = Slot {
             player_id: player_id.to_string(),
             display_name: display_name.clone(),
             ready: false,
             bios_offer: None,
             mod_offer: None,
             memcard_offer: None,
+            country: String::new(),
             ice_path: None,
             ice_path_at: None,
         };
+        new_slot.country = g
+            .clients
+            .get(player_id)
+            .map(|c| c.country.clone())
+            .unwrap_or_default();
         match lobby.seat_mut(seat) {
             Some(cell) => *cell = Some(new_slot),
             None => return SeatResult::Err("full"),
@@ -1743,6 +1851,7 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
     struct KickOk {
         lid: String,
         victim: String,
+        victim_name: String,
     }
     let outcome: Option<KickOk> = {
         let mut g = hub.inner.lock().await;
@@ -1796,6 +1905,10 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
             .await;
             return Ok(());
         }
+        let victim_name = lobby
+            .seat_mut(slot)
+            .and_then(|cell| cell.as_ref().map(|s| s.display_name.clone()))
+            .unwrap_or_default();
         if let Some(cell) = lobby.seat_mut(slot) {
             *cell = None;
         }
@@ -1807,9 +1920,9 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
         if let Some(c) = g.clients.get_mut(&victim) {
             c.lobby_id = None;
         }
-        Some(KickOk { lid, victim })
+        Some(KickOk { lid, victim, victim_name })
     };
-    if let Some(KickOk { lid, victim }) = outcome {
+    if let Some(KickOk { lid, victim, victim_name }) = outcome {
         send_to(
             hub,
             &victim,
@@ -1818,6 +1931,9 @@ async fn handle_kick(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
         .await;
         emit_lobby_update(hub, &lid).await;
         broadcast_list(hub).await;
+        if !victim_name.is_empty() {
+            chat_system(hub, &lid, &format!("{victim_name} was kicked.")).await;
+        }
     }
     Ok(())
 }
@@ -1965,7 +2081,7 @@ async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
             .await;
             return Ok(());
         };
-        let Some(from) = slot_of_player(lobby, player_id) else {
+        let Some(from) = lobby.seat_of(player_id) else {
             drop(g);
             send_to(
                 hub,
@@ -1975,21 +2091,10 @@ async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
             .await;
             return Ok(());
         };
-        /* Self-service stays inside the player table. A spectator asking to
-         * move itself would index `slots` with a spectator seat, and -- worse
-         * than the panic that used to be -- promoting yourself into the match
-         * is the host's call, not the gallery's. */
-        if is_spectator_seat(from) {
-            drop(g);
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "spectator", "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
-        if to >= lobby.slots.len() || from == to {
+        /* Either table, both directions -- but only onto an EMPTY seat. A
+         * taken seat is seat_swap_request's business (consent), and the
+         * gallery is not a way around it. */
+        if lobby.seat(to).is_none() || from == to {
             drop(g);
             send_to(
                 hub,
@@ -2001,7 +2106,7 @@ async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
         }
         /* Occupied seats are not takeable without consent — that is what
          * seat_swap_request is for. */
-        if lobby.slots[to].is_some() {
+        if lobby.seat(to).is_some_and(|c| c.is_some()) {
             drop(g);
             send_to(
                 hub,
@@ -2011,10 +2116,16 @@ async fn handle_seat_move(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
             .await;
             return Ok(());
         }
-        lobby.slots.swap(from, to);
+        /* Take/put rather than swap: the two seats may live in different
+         * tables (see `move`). */
+        let moving = lobby.seat_mut(from).and_then(Option::take);
+        if let Some(cell) = lobby.seat_mut(to) {
+            *cell = moving;
+        }
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
         }
+        clear_lobby_ice_paths(lobby);
         lid
     };
     emit_lobby_update(hub, &lid).await;
@@ -2482,7 +2593,13 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         /* Read off `lobby` before the borrow ends: `g.next_session` below
          * needs `g` mutably. */
         let spectators_n = lobby.spectator_count();
-        let max_slots_for_relay = lobby.max_slots;
+        /* The host may watch from the gallery and still run the match. It
+         * keeps session slot 0 -- the seat every host-only path (save states,
+         * card sync, the start) keys on -- with its pad muted, and the player
+         * seats shift up one session slot behind it. The relay therefore
+         * needs one more forwarded slot, and the gallery starts one higher. */
+        let host_spectates = lobby.seat_of(player_id).is_some_and(is_spectator_seat);
+        let max_slots_for_relay = lobby.max_slots + usize::from(host_spectates);
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
@@ -2497,11 +2614,22 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             old_relay,
             prefer_lan,
             peer_ips,
+            host_spectates,
         ))
     };
 
-    let (lid, sid, n, spectators_n, max_slots_for_relay, use_relay, old_relay, prefer_lan, peer_ips) =
-        match prepared {
+    let (
+        lid,
+        sid,
+        n,
+        spectators_n,
+        max_slots_for_relay,
+        use_relay,
+        old_relay,
+        prefer_lan,
+        peer_ips,
+        host_spectates,
+    ) = match prepared {
         Ok(v) => v,
         Err(code) => {
             send_to(
@@ -2638,7 +2766,11 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
              * different namespace from the lobby seat index above. A spectator
              * sends as spectator_relay_base + its gallery index; every player
              * seat is below it. */
-            "spectator_relay_base": lobby.max_slots,
+            "spectator_relay_base": lobby.max_slots + usize::from(host_spectates),
+            /* The host is in the gallery but runs the match from session
+             * slot 0 with its pad muted; players sit at lobby seat + 1. Every
+             * peer derives its session slot from this, so it is said once. */
+            "host_spectates": host_spectates,
             "transport": if relay_endpoint.is_some() { "sfu" } else { "ice_p2p" },
         });
         if let Some(caps) = &lobby.match_caps {
@@ -2680,6 +2812,31 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         }
     }
     Ok(())
+}
+
+/// A system line in the lobby chat ("X has joined."): no sender, `system`
+/// set, sent to everyone currently seated. Not stored, like every chat line.
+async fn chat_system(hub: &WsLobbyHub, lobby_id: &str, text: &str) {
+    let (fwd, targets) = {
+        let g = hub.inner.lock().await;
+        let Some(lobby) = g.lobbies.get(lobby_id) else {
+            return;
+        };
+        let fwd = json!({
+            "op": "chat",
+            "lobby_id": lobby_id,
+            "from_player_id": "",
+            "from": "",
+            "system": true,
+            "text": text,
+        })
+        .to_string();
+        let targets: Vec<String> = lobby.everyone().map(|s| s.player_id.clone()).collect();
+        (fwd, targets)
+    };
+    for t in targets {
+        send_to(hub, &t, fwd.clone()).await;
+    }
 }
 
 /// Lobby chat. One line from a seated client (player or spectator), echoed to
@@ -2792,6 +2949,7 @@ mod spectator_tests {
             bios_offer: None,
             mod_offer: None,
             memcard_offer: None,
+            country: String::new(),
             ice_path: None,
             ice_path_at: None,
         }

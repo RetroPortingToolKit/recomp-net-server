@@ -50,6 +50,10 @@ pub struct Config {
     pub input_relay_lan_gateway: String,
     /// When true, allow advertising 127.0.0.1 (same-machine-only testing).
     pub input_relay_allow_loopback: bool,
+    /// MaxMind GeoLite2/GeoIP2 Country database (.mmdb). When set, every
+    /// client's country is resolved from its TCP source IP and shown as a
+    /// flag in lobbies. Unset = no flags; private / loopback peers never get one.
+    pub geoip_db_path: Option<String>,
 }
 
 impl Config {
@@ -142,7 +146,10 @@ impl Config {
         let input_relay_allow_loopback =
             parse_bool_env(&env::var("INPUT_RELAY_ALLOW_LOOPBACK").unwrap_or_default());
 
+        let geoip_db_path = env::var("GEOIP_DB_PATH").ok().filter(|s| !s.is_empty());
+
         Ok(Config {
+            geoip_db_path,
             bind_addr,
             database_url,
             require_auth,

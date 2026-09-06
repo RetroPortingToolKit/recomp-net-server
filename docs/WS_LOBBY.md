@@ -288,6 +288,16 @@ Host may update caps while in the room (broadcasts `lobby_update`):
 
 Errors: `not_in_lobby`, `not_host`, `gone`, `bad_match_caps`.
 
+### Country flags (GeoIP)
+
+With `GEOIP_DB_PATH` pointing at a MaxMind Country database (`GeoLite2-Country.mmdb`
+or GeoIP2), every client's country is resolved once, at connect, from its TCP
+source address, and published as ISO 3166-1 alpha-2: `"country"` on each
+member row of `lobby_update` / `launch`, and `"host_country"` on each
+`lobby_list` row. The field is omitted / empty when the database is not
+configured, the address is private or loopback, or the lookup has no answer.
+Clients draw it as a flag before the name. Nothing else depends on it.
+
 ### Lobby chat
 
 Any seated member (player or spectator) may send a line; the server echoes it
@@ -308,6 +318,24 @@ Server → members:
 ```
 
 Errors: `not_in_lobby`.
+
+### Host in the gallery
+
+If the host seated itself in the gallery, `start` still succeeds (two seated
+*players* are required). The launch message carries `"host_spectates": true`,
+the relay is opened with one extra player slot, and `spectator_relay_base`
+moves up by one: the host runs the match from session slot 0 with a muted pad
+and every player seat is its lobby seat + 1 in session terms.
+
+The server also emits **system lines** on membership changes, to everyone
+seated, with no sender and `"system": true`: `"<name> has joined."`,
+`"<name> has joined as a spectator."`, `"<name> has left."`,
+`"<name> was kicked."`.
+
+```json
+{ "op": "chat", "lobby_id": "…", "from_player_id": "", "from": "",
+  "system": true, "text": "Marisa has joined." }
+```
 
 Client → server (host only; requires seated `player_count >= 2`). Online MotK/BPE
 lobbies **always** open the lobby UDP SFU (`transport=sfu`, §108). Waiting-room
