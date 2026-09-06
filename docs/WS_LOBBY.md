@@ -30,6 +30,16 @@ Client may then send:
 { "op": "hello", "display_name": "Alex" }
 ```
 
+`hello` may be sent again at any time, and is how a client renames: the
+server updates the hub-wide row, and, when the client is seated, the seat
+too (deduplicated within that room like a join, then broadcast as
+`lobby_update`). The reply carries the accepted name, which differs from
+the requested one when the room already had it:
+
+```json
+{ "op": "hello_ok", "ok": true, "display_name": "Alex (2)" }
+```
+
 ## Listing
 
 Client → server:

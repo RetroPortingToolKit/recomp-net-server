@@ -1124,27 +1124,29 @@ async fn handle_text(
     let msg: InMsg = serde_json::from_str(text).map_err(|e| e.to_string())?;
     match msg.op.as_str() {
         "hello" => {
+            /* `hello` is the identity message, not a handshake: a client
+             * re-sends it when the player renames, and everything that shows
+             * a name has to follow. Before this, a rename reached the hub
+             * only on the next reconnect, so the players-online list and the
+             * seat table both kept the name the player first typed. */
             let hello_game = msg.game_name.clone().filter(|s| !s.is_empty());
-            if msg.display_name.is_some() || hello_game.is_some() {
+            let hello_name = msg.display_name.clone().filter(|s| !s.is_empty());
+            let (accepted_name, renamed_in) = {
                 let mut g = hub.inner.lock().await;
-                if let Some(c) = g.clients.get_mut(player_id) {
-                    if let Some(name) = msg.display_name.filter(|s| !s.is_empty()) {
-                        c.display_name = name;
-                    }
-                    /* The title comes in on the FIRST message a client sends,
-                     * not only on `list`: server chat and the players-online
-                     * scope must not depend on having browsed first. */
-                    if let Some(g_name) = hello_game {
-                        c.game_name = g_name;
-                    }
-                }
-            }
+                apply_identity(&mut g, player_id, hello_name, hello_game)
+            };
             send_to(
                 hub,
                 player_id,
-                json!({ "op": "hello_ok", "ok": true }).to_string(),
+                /* The accepted name, which is not always the requested one
+                 * (see the dedupe above). */
+                json!({ "op": "hello_ok", "ok": true, "display_name": accepted_name })
+                    .to_string(),
             )
             .await;
+            if let Some(lid) = renamed_in {
+                emit_lobby_update(hub, &lid).await;
+            }
         }
         "list" => {
             /* The title a client lists for is the title it is playing: it
@@ -3041,6 +3043,61 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
     Ok(())
 }
 
+/// Apply an identity (`hello`) to a connected client: the hub-wide row, and
+/// -- when it is seated -- the seat everyone in its room reads, which is
+/// deduplicated within that room exactly as a join is. Returns the accepted
+/// name (not always the requested one) and the lobby that needs a
+/// `lobby_update`, if any.
+fn apply_identity(
+    g: &mut HubInner,
+    player_id: &str,
+    name: Option<String>,
+    game: Option<String>,
+) -> (String, Option<String>) {
+    let mut renamed_in = None;
+    if let Some(c) = g.clients.get_mut(player_id) {
+        if let Some(n) = name.clone() {
+            c.display_name = n;
+        }
+        /* The title comes in on the FIRST message a client sends, not only
+         * on `list`: server chat and the players-online scope must not
+         * depend on having browsed first. */
+        if let Some(gn) = game {
+            c.game_name = gn;
+        }
+    }
+    if let Some(n) = name {
+        let lid = g.clients.get(player_id).and_then(|c| c.lobby_id.clone());
+        if let Some(lid) = lid {
+            if let Some(unique) = g
+                .lobbies
+                .get(&lid)
+                .map(|l| unique_display_name(l, &n, Some(player_id)))
+            {
+                if let Some(lobby) = g.lobbies.get_mut(&lid) {
+                    if let Some(slot) = lobby.everyone_mut().find(|s| s.player_id == player_id) {
+                        if slot.display_name != unique {
+                            slot.display_name = unique.clone();
+                            renamed_in = Some(lid.clone());
+                        }
+                    }
+                }
+                /* The hub row follows the seat, exactly as it does on join,
+                 * so one player never reads as two different names. */
+                if let Some(c) = g.clients.get_mut(player_id) {
+                    c.display_name = unique;
+                }
+            }
+        }
+    }
+    let accepted = g
+        .clients
+        .get(player_id)
+        .map(|c| c.display_name.clone())
+        .unwrap_or_default();
+    (accepted, renamed_in)
+}
+
 /// The title a client counts as playing, for the players-online list and
 /// for server chat. It is the TITLE ONLY and never the version: two builds
 /// of one game are one audience, even when the lobby list hides one from
@@ -3284,6 +3341,28 @@ mod game_scope_tests {
         );
     }
 
+    fn seat(g: &mut HubInner, lobby_id: &str, index: usize, player_id: &str, name: &str) {
+        let l = g.lobbies.get_mut(lobby_id).unwrap();
+        l.slots[index] = Some(Slot {
+            player_id: player_id.into(),
+            display_name: name.into(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            memcard_offer: None,
+            country: String::new(),
+            ice_path: None,
+            ice_path_at: None,
+        });
+    }
+
+    fn seat_name(g: &HubInner, lobby_id: &str, index: usize) -> String {
+        g.lobbies[lobby_id].slots[index]
+            .as_ref()
+            .map(|s| s.display_name.clone())
+            .unwrap_or_default()
+    }
+
     fn lobby(g: &mut HubInner, id: &str, game: &str) {
         g.lobbies.insert(
             id.to_string(),
@@ -3352,6 +3431,73 @@ mod game_scope_tests {
         client(&mut g, "c", "Crash Bash", None);
         assert_eq!(game_scope_for(&g, "a"), game_scope_for(&g, "b"));
         assert_eq!(game_scope_for(&g, "a"), game_scope_for(&g, "c"));
+    }
+
+    #[test]
+    fn a_rename_reaches_the_seat_and_the_hub_row() {
+        /* The bug this covers: a rename only ever reached the server in the
+         * first hello, so the players-online list and the seat both kept the
+         * name the player first typed until the next reconnect. */
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Crash Bash");
+        client(&mut g, "a", "Crash Bash", Some("L"));
+        seat(&mut g, "L", 0, "a", "Alex");
+
+        let (accepted, renamed) = apply_identity(&mut g, "a", Some("Zephyr".into()), None);
+        assert_eq!(accepted, "Zephyr");
+        assert_eq!(renamed.as_deref(), Some("L"));
+        assert_eq!(seat_name(&g, "L", 0), "Zephyr");
+        assert_eq!(g.clients["a"].display_name, "Zephyr");
+    }
+
+    #[test]
+    fn renaming_onto_a_name_the_room_has_deduplicates() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Crash Bash");
+        client(&mut g, "a", "Crash Bash", Some("L"));
+        client(&mut g, "b", "Crash Bash", Some("L"));
+        seat(&mut g, "L", 0, "a", "Alex");
+        seat(&mut g, "L", 1, "b", "Marisa");
+
+        let (accepted, renamed) = apply_identity(&mut g, "a", Some("Marisa".into()), None);
+        assert_eq!(accepted, "Marisa (2)");
+        assert_eq!(renamed.as_deref(), Some("L"));
+        assert_eq!(seat_name(&g, "L", 0), "Marisa (2)");
+        /* The hub row matches the seat, or one player reads as two names. */
+        assert_eq!(g.clients["a"].display_name, "Marisa (2)");
+        assert_eq!(seat_name(&g, "L", 1), "Marisa");
+    }
+
+    #[test]
+    fn renaming_while_unseated_still_updates_the_hub_row() {
+        let mut g = hub_inner();
+        client(&mut g, "a", "Crash Bash", None);
+        let (accepted, renamed) = apply_identity(&mut g, "a", Some("Zephyr".into()), None);
+        assert_eq!(accepted, "Zephyr");
+        assert!(renamed.is_none());
+        assert_eq!(g.clients["a"].display_name, "Zephyr");
+    }
+
+    #[test]
+    fn a_hello_that_renames_nothing_moves_nothing() {
+        /* Re-sending the same name must not spam the room with updates. */
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Crash Bash");
+        client(&mut g, "a", "Crash Bash", Some("L"));
+        seat(&mut g, "L", 0, "a", "Alex");
+        let (accepted, renamed) = apply_identity(&mut g, "a", Some("Alex".into()), None);
+        assert_eq!(accepted, "Alex");
+        assert!(renamed.is_none());
+    }
+
+    #[test]
+    fn a_hello_carrying_only_a_title_leaves_the_name_alone() {
+        let mut g = hub_inner();
+        client(&mut g, "a", "", None);
+        g.clients.get_mut("a").unwrap().display_name = "Alex".into();
+        let (accepted, _) = apply_identity(&mut g, "a", None, Some("Crash Bash".into()));
+        assert_eq!(accepted, "Alex");
+        assert_eq!(g.clients["a"].game_name, "Crash Bash");
     }
 
     #[test]
