@@ -22,6 +22,8 @@ data/*
 # Regenerate with tools/gen_ip_country.py; the RIR sources it downloads stay
 # ignored by the line above.
 !data/ip_country.bin
+# The chat filter word list is source (include_str! at build), not data.
+!data/chat_filter_words.txt
 
 # Rust
 /target/
