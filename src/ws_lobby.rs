@@ -567,6 +567,10 @@ struct OnlinePlayerRow {
     lobby_id: String,
     lobby_name: String,
     hosting: bool,
+    /// First 8 chars of the connection id, so a client can find its own
+    /// row (a display name is not unique across the hub) without the hub
+    /// publishing whole ids to every browser.
+    tag: String,
 }
 
 /// The built-in RIR table's answer, or "" when it has none. Private addresses
@@ -675,6 +679,7 @@ fn lobby_list_json_filtered(
                 lobby_id: lobby.map(|l| l.lobby_id.clone()).unwrap_or_default(),
                 lobby_name: lobby.map(|l| l.name.clone()).unwrap_or_default(),
                 hosting: lobby.is_some_and(|l| l.host_player_id == c.player_id),
+                tag: c.player_id.chars().take(8).collect(),
             }
         })
         .collect();

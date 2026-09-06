@@ -62,12 +62,16 @@ Server → clients (on request, on change, and ~1 Hz while anyone is connected):
   ],
   "players": [
     { "display_name": "Marisa", "country": "JP", "lobby_id": "...",
-      "lobby_name": "Friday Fights", "hosting": true },
+      "lobby_name": "Friday Fights", "hosting": true, "tag": "3f9a1c02" },
     { "display_name": "Reimu", "country": "DE", "lobby_id": "",
-      "lobby_name": "", "hosting": false }
+      "lobby_name": "", "hosting": false, "tag": "b71e40d9" }
   ]
 }
 ```
+
+`tag` is the first 8 characters of that connection's player id: a client
+finds its own row by comparing with its id, since display names are not
+unique across the hub.
 
 `allow_spectators` / `max_spectators` / `spectator_count` describe the
 lobby's gallery (a browser shows "No" or "1/4"). `players` is everyone
