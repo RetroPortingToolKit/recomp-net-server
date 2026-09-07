@@ -396,6 +396,100 @@ struct InMsg {
     error: Option<String>,
 }
 
+/* ---- client-supplied display strings ------------------------------------
+ * Every name a client sends is rebroadcast to its peers -- `display_name`
+ * becomes chat's `from` and the seat/players-online rows, `name` is the room
+ * title in `lobby_list`, `game_name` scopes both. They used to be assigned
+ * raw, at three separate sites (`hello`, `create`, `join`), while a chat LINE
+ * three functions away was capped, control-stripped and filtered. One gate,
+ * applied once at the deserialization boundary, is what stops the next
+ * handler from forgetting: see sanitize_in_place below. */
+
+/// Characters, and bytes, a name may occupy.
+///
+/// Both, because clients store these in a fixed 64-byte field
+/// (`PSX_LOBBY_NAME_LEN`, `RecompLauncherCNetplayOnlinePlayer::display_name`).
+/// Cutting here, on a character boundary, is what keeps a client from cutting
+/// mid-sequence: a char cap alone is not a byte cap when one emoji is four.
+const NAME_MAX_CHARS: usize = 32;
+const NAME_MAX_BYTES: usize = 63; // the 64-byte client field, less its NUL
+
+/// Mechanical hygiene for one name: drop control characters (the rule
+/// `handle_chat` already applies to a line), cap, trim. `None` when nothing
+/// survives, so every existing `.filter(|s| !s.is_empty())` call site and
+/// every `unwrap_or_else` default behaves exactly as before.
+fn sanitize_name(s: Option<String>) -> Option<String> {
+    let s = s?;
+    let mut out = String::new();
+    for c in s.chars().filter(|c| !c.is_control()).take(NAME_MAX_CHARS) {
+        if out.len() + c.len_utf8() > NAME_MAX_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    let out = out.trim();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.to_string())
+    }
+}
+
+/// A name that trips the word list is REFUSED, not masked.
+///
+/// A chat line is a moment and a mask reads as one. A player name sits in the
+/// seat table, the players-online panel and every line that player sends; a
+/// room title sits in the lobby browser in front of everyone shopping for a
+/// game. Masking either just publishes the same word with stars in it, for as
+/// long as it exists -- so the client is told to pick another one instead and
+/// the name it asked for is never applied.
+fn name_is_refused(name: &str) -> bool {
+    crate::chat_filter::apply(name) != name
+}
+
+/// A password is VALIDATED, never rewritten.
+///
+/// Sanitizing one is worse than refusing it: silently dropping a character
+/// leaves the host with a password that is not the one they typed, and both
+/// sides then disagree about a secret. Nothing here is ever shown to a peer
+/// (only `has_password`, and the value itself is salted and hashed), so the
+/// filter has no business in it -- this only rejects what no honest client
+/// can produce.
+const PASSWORD_MAX_BYTES: usize = 128;
+
+fn password_is_invalid(pw: &str) -> bool {
+    pw.len() > PASSWORD_MAX_BYTES || pw.chars().any(|c| c.is_control())
+}
+
+impl InMsg {
+    /// The gate: every client-supplied string is cleaned or refused HERE, once,
+    /// before any handler runs.
+    ///
+    /// `Some(code)` refuses the whole message -- the caller answers with that
+    /// error and dispatches nothing, so a bad name cannot ride in on a
+    /// `create` or a `join` only to be refused after the room exists.
+    fn sanitize_in_place(&mut self) -> Option<&'static str> {
+        self.display_name = sanitize_name(self.display_name.take());
+        self.name = sanitize_name(self.name.take());
+        /* A title is a SCOPING KEY, not prose: clients filter the lobby list
+         * and the server chat by string equality on it. Masking or refusing it
+         * would silently split one game into two sets of rooms that cannot see
+         * each other, so it gets the hygiene pass and nothing more. */
+        self.game_name = sanitize_name(self.game_name.take());
+
+        if matches!(self.display_name.as_deref(), Some(n) if name_is_refused(n)) {
+            return Some("name_rejected");
+        }
+        if matches!(self.name.as_deref(), Some(n) if name_is_refused(n)) {
+            return Some("lobby_name_rejected");
+        }
+        if matches!(self.password.as_deref(), Some(pw) if password_is_invalid(pw)) {
+            return Some("password_invalid");
+        }
+        None
+    }
+}
+
 fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
     let Some(v) = caps else {
         return None;
@@ -1121,7 +1215,16 @@ async fn handle_text(
     text: &str,
 ) -> Result<(), String> {
     let hub = &state.ws_lobby;
-    let msg: InMsg = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut msg: InMsg = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if let Some(code) = msg.sanitize_in_place() {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": code, "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
+    }
     match msg.op.as_str() {
         "hello" => {
             /* `hello` is the identity message, not a handshake: a client
@@ -3632,5 +3735,111 @@ mod spectator_tests {
         /* The gallery never pressed Ready, and the match is still startable. */
         let all_ready = l.slots.iter().flatten().all(|s| s.ready) && player_count(&l) >= 2;
         assert!(all_ready);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    fn msg(json: &str) -> InMsg {
+        serde_json::from_str(json).expect("parse")
+    }
+
+    #[test]
+    fn control_characters_never_reach_a_peer() {
+        /* The gap this closes: a name went to every peer as chat's `from`
+         * while a chat LINE was control-stripped three functions away. */
+        let mut m = msg(r#"{"op":"hello","display_name":"Ma\nri\tsa "}"#);
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(m.display_name.as_deref(), Some("Marisa"));
+    }
+
+    #[test]
+    fn a_name_is_capped_in_characters_and_in_bytes() {
+        let long = "a".repeat(200);
+        let mut m = msg(&format!(r#"{{"op":"hello","display_name":"{long}"}}"#));
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(
+            m.display_name.as_deref().unwrap().chars().count(),
+            NAME_MAX_CHARS
+        );
+
+        /* 32 four-byte characters is 128 bytes -- over the 64-byte field every
+         * client stores this in, so the BYTE cap has to bind first. */
+        let wide = "\u{1F600}".repeat(64);
+        let mut m = msg(&format!(r#"{{"op":"hello","display_name":"{wide}"}}"#));
+        assert_eq!(m.sanitize_in_place(), None);
+        let got = m.display_name.as_deref().unwrap();
+        assert!(got.len() <= NAME_MAX_BYTES, "{} bytes", got.len());
+        /* Cut on a character boundary, so no client truncates mid-sequence. */
+        assert!(got.chars().all(|c| c == '\u{1F600}'));
+    }
+
+    #[test]
+    fn a_name_that_trims_to_nothing_is_none() {
+        let mut m = msg(r#"{"op":"hello","display_name":"  \t "}"#);
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(m.display_name, None);
+    }
+
+    #[test]
+    fn a_profane_name_is_refused_not_masked() {
+        let mut m = msg(r#"{"op":"hello","display_name":"fuck"}"#);
+        assert_eq!(m.sanitize_in_place(), Some("name_rejected"));
+        /* Refused at the boundary, so the caller answers `name_rejected` and
+         * dispatches nothing: `hello`, `create` and `join` all carry a name,
+         * and none of them may apply this one. */
+        let mut m = msg(r#"{"op":"create","display_name":"sh1t","name":"Room"}"#);
+        assert_eq!(m.sanitize_in_place(), Some("name_rejected"));
+        let mut m = msg(r#"{"op":"join","display_name":"f.u.c.k"}"#);
+        assert_eq!(m.sanitize_in_place(), Some("name_rejected"));
+    }
+
+    #[test]
+    fn an_ordinary_name_passes_untouched() {
+        let mut m =
+            msg(r#"{"op":"hello","display_name":"Scunthorpe","game_name":"Crash Bash"}"#);
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(m.display_name.as_deref(), Some("Scunthorpe"));
+        assert_eq!(m.game_name.as_deref(), Some("Crash Bash"));
+    }
+
+    #[test]
+    fn a_room_title_is_refused_but_a_game_title_is_a_key() {
+        /* A room title sits in the lobby browser in front of everyone
+         * shopping for a game, so it is refused like a player name and the
+         * host is asked to rename the room. */
+        let mut m = msg(r#"{"op":"create","name":"fuck lobby","game_name":"Crash Bash"}"#);
+        assert_eq!(m.sanitize_in_place(), Some("lobby_name_rejected"));
+
+        /* A scoping key: clients match the lobby list and the server chat on
+         * string equality, so touching it would split one game in two. */
+        let mut m = msg(r#"{"op":"create","name":"Reimu's Room","game_name":"Crash Bash"}"#);
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(m.name.as_deref(), Some("Reimu's Room"));
+        assert_eq!(m.game_name.as_deref(), Some("Crash Bash"));
+    }
+
+    #[test]
+    fn a_password_is_validated_never_rewritten() {
+        /* Dropping a character would leave the host holding a password that
+         * is not the one they typed, so anything unusable is refused whole. */
+        let mut m = msg(r#"{"op":"create","password":"hunter2 !@#$%^&*()"}"#);
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(m.password.as_deref(), Some("hunter2 !@#$%^&*()"));
+
+        /* Never filtered: a password is never shown to anyone, and it is
+         * salted and hashed before it is stored. */
+        let mut m = msg(r#"{"op":"create","password":"fuck"}"#);
+        assert_eq!(m.sanitize_in_place(), None);
+        assert_eq!(m.password.as_deref(), Some("fuck"));
+
+        let mut m = msg(r#"{"op":"join","password":"a\u0009b"}"#);
+        assert_eq!(m.sanitize_in_place(), Some("password_invalid"));
+
+        let long = "a".repeat(PASSWORD_MAX_BYTES + 1);
+        let mut m = msg(&format!(r#"{{"op":"join","password":"{long}"}}"#));
+        assert_eq!(m.sanitize_in_place(), Some("password_invalid"));
     }
 }
