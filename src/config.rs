@@ -63,6 +63,30 @@ pub struct Config {
     /// itself -- which is also the case where every peer otherwise arrives as
     /// the proxy's loopback address and nobody gets a flag at all.
     pub trust_proxy_header: bool,
+    /// ---- Discord login (all optional; absent = the server behaves exactly
+    /// as it did before Discord existed) ------------------------------------
+    ///
+    /// `DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET`. The secret never appears
+    /// in the repo and is read only from the environment, like the JWT keys.
+    /// With either unset the login routes refuse to start a flow and every
+    /// client is a guest.
+    pub discord_client_id: Option<String>,
+    pub discord_client_secret: Option<String>,
+    /// `DISCORD_REDIRECT_URL` -- must match the Discord app registration byte
+    /// for byte.
+    pub discord_redirect_url: Option<String>,
+    /// `DISCORD_REQUIRED`. **Default false, and that default is the
+    /// compatibility promise**: a client that knows nothing about Discord
+    /// connects, seats, chats and hosts exactly as it does today. Turning this
+    /// on is a deliberate act that locks out every client older than the
+    /// integration, so it stays off until every shipped port has caught up.
+    pub discord_required: bool,
+    /// `GUEST_CAN_CHAT` / `GUEST_CAN_HOST`. Default true, i.e. today's
+    /// behaviour. These are the levers to pull if abuse arrives before every
+    /// client has updated -- they degrade what an unauthenticated client may
+    /// do without disconnecting it.
+    pub guest_can_chat: bool,
+    pub guest_can_host: bool,
     /// Mask profanity / slurs in relayed chat (default on). `CHAT_FILTER=0`
     /// turns it off; clients still filter on arrival.
     pub chat_filter_enabled: bool,
@@ -79,6 +103,22 @@ impl Config {
         let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8765".to_string());
         let database_url = env::var("DATABASE_URL").ok().filter(|s| !s.is_empty());
         let require_auth = parse_bool_env(&env::var("REQUIRE_AUTH").unwrap_or_default());
+        let discord_client_id = env::var("DISCORD_CLIENT_ID").ok().filter(|s| !s.trim().is_empty());
+        let discord_client_secret =
+            env::var("DISCORD_CLIENT_SECRET").ok().filter(|s| !s.trim().is_empty());
+        let discord_redirect_url =
+            env::var("DISCORD_REDIRECT_URL").ok().filter(|s| !s.trim().is_empty());
+        let discord_required = parse_bool_env(&env::var("DISCORD_REQUIRED").unwrap_or_default());
+        /* Default TRUE for both: absent configuration must mean "behaves as it
+         * always did", never "quietly stricter". */
+        let guest_can_chat = match env::var("GUEST_CAN_CHAT") {
+            Ok(v) if !v.trim().is_empty() => parse_bool_env(&v),
+            _ => true,
+        };
+        let guest_can_host = match env::var("GUEST_CAN_HOST") {
+            Ok(v) if !v.trim().is_empty() => parse_bool_env(&v),
+            _ => true,
+        };
         let jwt_secret_current = env::var("JWT_SECRET_CURRENT")
             .ok()
             .filter(|s| !s.is_empty());
@@ -179,6 +219,12 @@ impl Config {
             bind_addr,
             database_url,
             require_auth,
+            discord_client_id,
+            discord_client_secret,
+            discord_redirect_url,
+            discord_required,
+            guest_can_chat,
+            guest_can_host,
             jwt_secret_current,
             jwt_secret_previous,
             default_input_delay,

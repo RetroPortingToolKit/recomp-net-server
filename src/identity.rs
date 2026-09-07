@@ -150,6 +150,98 @@ pub async fn link_discord(pool: &SqlitePool, p: &DiscordProfile) -> Result<Playe
     })
 }
 
+/// Who a connection is.
+///
+/// # The compatibility contract
+///
+/// `Guest` is not a degraded mode bolted on for old clients -- it *is* the
+/// behaviour the server has always had, kept intact and given a name. A client
+/// that has never heard of Discord sends the `hello` it always sent, gets the
+/// ephemeral per-connection id it always got, and picks its own display name
+/// exactly as before. Nothing in that path is new, and nothing in it may be
+/// made to depend on Discord.
+///
+/// The two identities differ in exactly one visible way, and it is the point
+/// of the whole exercise: an `Account` has a name the SERVER owns, so it
+/// survives reconnects and can carry a report or a ban. A `Guest` names
+/// itself, every time, and can be nothing but a moment.
+///
+/// The connection's hub key stays the ephemeral uuid in both cases. Attaching
+/// the account beside it rather than replacing it is what keeps every existing
+/// lobby, seat and signal path untouched -- moderation reads `account` when it
+/// is there and falls back to the peer address when it is not.
+#[derive(Debug, Clone)]
+pub enum Identity {
+    Account(Player),
+    Guest,
+}
+
+impl Identity {
+    pub fn account(&self) -> Option<&Player> {
+        match self {
+            Identity::Account(p) => Some(p),
+            Identity::Guest => None,
+        }
+    }
+    /// The seat name the server will publish, if it owns one. `None` leaves
+    /// the client's own `display_name` in charge, which is the old path.
+    pub fn server_handle(&self) -> Option<&str> {
+        self.account().map(|p| p.handle.as_str())
+    }
+    pub fn is_guest(&self) -> bool {
+        matches!(self, Identity::Guest)
+    }
+}
+
+/// What an unauthenticated client is allowed to do.
+///
+/// `Default` is the compatibility promise expressed as code rather than as a
+/// comment: it permits everything, so a deployment that has opted into none of
+/// this behaves exactly as it always has. Each field is a lever to pull later,
+/// on purpose, one at a time.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestPolicy {
+    pub discord_required: bool,
+    pub can_chat: bool,
+    pub can_host: bool,
+}
+
+impl Default for GuestPolicy {
+    fn default() -> Self {
+        Self { discord_required: false, can_chat: true, can_host: true }
+    }
+}
+
+impl GuestPolicy {
+    pub fn from_config(c: &crate::config::Config) -> Self {
+        Self {
+            discord_required: c.discord_required,
+            can_chat: c.guest_can_chat,
+            can_host: c.guest_can_host,
+        }
+    }
+}
+
+/// Why a guest was turned away from `op`, or `None` when it may proceed.
+///
+/// Note what is NOT gateable: `list` and `join`. A server an older client
+/// cannot browse or sit down in is not backwards compatible with it, whatever
+/// the flags say -- so seating stays open even under `discord_required`, and
+/// only the things abuse actually travels through can be closed.
+pub fn guest_refusal(p: &GuestPolicy, op: &str) -> Option<&'static str> {
+    if !matches!(op, "chat" | "server_chat" | "create") {
+        return None;
+    }
+    if p.discord_required {
+        return Some("login_required");
+    }
+    match op {
+        "chat" | "server_chat" if !p.can_chat => Some("login_required_chat"),
+        "create" if !p.can_host => Some("login_required_host"),
+        _ => None,
+    }
+}
+
 /// Change the presentational handle. `Err` when the requested name does not
 /// survive the shared gate — here the player DID choose it, so refusing is
 /// fair and actionable: they can type another one.
@@ -258,6 +350,46 @@ mod tests {
         assert!(set_handle(&pool, p.id, "fuck").await.is_err());
         let again = link_discord(&pool, &profile("reimu_h", Some("Reimu"))).await.unwrap();
         assert_eq!(again.handle, "Reimu");
+    }
+
+    #[test]
+    fn a_default_deployment_refuses_a_guest_nothing() {
+        let cfg = GuestPolicy::default();
+        for op in ["chat", "server_chat", "create", "join", "hello", "list"] {
+            assert_eq!(guest_refusal(&cfg, op), None, "op {op}");
+        }
+    }
+
+    #[test]
+    fn the_levers_only_bite_when_they_are_pulled() {
+        let mut cfg = GuestPolicy::default();
+        cfg.can_chat = false;
+        assert_eq!(guest_refusal(&cfg, "chat"), Some("login_required_chat"));
+        assert_eq!(guest_refusal(&cfg, "create"), None, "hosting is a separate lever");
+        assert_eq!(guest_refusal(&cfg, "join"), None, "seating is never gated");
+
+        let mut cfg = GuestPolicy::default();
+        cfg.discord_required = true;
+        assert_eq!(guest_refusal(&cfg, "chat"), Some("login_required"));
+        assert_eq!(guest_refusal(&cfg, "create"), Some("login_required"));
+        /* Even fully locked down, a guest still lists and joins: the ask was
+         * backwards compatibility, and a server that cannot be browsed by an
+         * older client is not compatible with it. */
+        assert_eq!(guest_refusal(&cfg, "list"), None);
+        assert_eq!(guest_refusal(&cfg, "join"), None);
+    }
+
+    #[test]
+    fn a_guest_names_itself_and_an_account_does_not() {
+        assert_eq!(Identity::Guest.server_handle(), None);
+        assert!(Identity::Guest.is_guest());
+        let p = Player {
+            id: Uuid::new_v4(),
+            discord_id: "1".into(),
+            discord_username: "reimu_h".into(),
+            handle: "Reimu".into(),
+        };
+        assert_eq!(Identity::Account(p).server_handle(), Some("Reimu"));
     }
 
     #[test]
