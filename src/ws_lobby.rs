@@ -405,46 +405,16 @@ struct InMsg {
  * applied once at the deserialization boundary, is what stops the next
  * handler from forgetting: see sanitize_in_place below. */
 
-/// Characters, and bytes, a name may occupy.
-///
-/// Both, because clients store these in a fixed 64-byte field
-/// (`PSX_LOBBY_NAME_LEN`, `RecompLauncherCNetplayOnlinePlayer::display_name`).
-/// Cutting here, on a character boundary, is what keeps a client from cutting
-/// mid-sequence: a char cap alone is not a byte cap when one emoji is four.
-const NAME_MAX_CHARS: usize = 32;
-const NAME_MAX_BYTES: usize = 63; // the 64-byte client field, less its NUL
-
-/// Mechanical hygiene for one name: drop control characters (the rule
-/// `handle_chat` already applies to a line), cap, trim. `None` when nothing
-/// survives, so every existing `.filter(|s| !s.is_empty())` call site and
-/// every `unwrap_or_else` default behaves exactly as before.
+/// The name gate lives in `names` so the Discord login path shares it rather
+/// than growing a second copy. Re-exported here under the names this file has
+/// always used.
 fn sanitize_name(s: Option<String>) -> Option<String> {
-    let s = s?;
-    let mut out = String::new();
-    for c in s.chars().filter(|c| !c.is_control()).take(NAME_MAX_CHARS) {
-        if out.len() + c.len_utf8() > NAME_MAX_BYTES {
-            break;
-        }
-        out.push(c);
-    }
-    let out = out.trim();
-    if out.is_empty() {
-        None
-    } else {
-        Some(out.to_string())
-    }
+    crate::names::sanitize(s)
 }
 
-/// A name that trips the word list is REFUSED, not masked.
-///
-/// A chat line is a moment and a mask reads as one. A player name sits in the
-/// seat table, the players-online panel and every line that player sends; a
-/// room title sits in the lobby browser in front of everyone shopping for a
-/// game. Masking either just publishes the same word with stars in it, for as
-/// long as it exists -- so the client is told to pick another one instead and
-/// the name it asked for is never applied.
+/// A name that trips the word list is REFUSED, not masked. See `names`.
 fn name_is_refused(name: &str) -> bool {
-    crate::chat_filter::apply(name) != name
+    crate::names::is_refused(name)
 }
 
 /// A password is VALIDATED, never rewritten.
@@ -3762,7 +3732,7 @@ mod name_tests {
         assert_eq!(m.sanitize_in_place(), None);
         assert_eq!(
             m.display_name.as_deref().unwrap().chars().count(),
-            NAME_MAX_CHARS
+            crate::names::NAME_MAX_CHARS
         );
 
         /* 32 four-byte characters is 128 bytes -- over the 64-byte field every
@@ -3771,7 +3741,7 @@ mod name_tests {
         let mut m = msg(&format!(r#"{{"op":"hello","display_name":"{wide}"}}"#));
         assert_eq!(m.sanitize_in_place(), None);
         let got = m.display_name.as_deref().unwrap();
-        assert!(got.len() <= NAME_MAX_BYTES, "{} bytes", got.len());
+        assert!(got.len() <= crate::names::NAME_MAX_BYTES, "{} bytes", got.len());
         /* Cut on a character boundary, so no client truncates mid-sequence. */
         assert!(got.chars().all(|c| c == '\u{1F600}'));
     }
