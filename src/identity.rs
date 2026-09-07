@@ -362,14 +362,12 @@ mod tests {
 
     #[test]
     fn the_levers_only_bite_when_they_are_pulled() {
-        let mut cfg = GuestPolicy::default();
-        cfg.can_chat = false;
+        let cfg = GuestPolicy { can_chat: false, ..Default::default() };
         assert_eq!(guest_refusal(&cfg, "chat"), Some("login_required_chat"));
         assert_eq!(guest_refusal(&cfg, "create"), None, "hosting is a separate lever");
         assert_eq!(guest_refusal(&cfg, "join"), None, "seating is never gated");
 
-        let mut cfg = GuestPolicy::default();
-        cfg.discord_required = true;
+        let cfg = GuestPolicy { discord_required: true, ..Default::default() };
         assert_eq!(guest_refusal(&cfg, "chat"), Some("login_required"));
         assert_eq!(guest_refusal(&cfg, "create"), Some("login_required"));
         /* Even fully locked down, a guest still lists and joins: the ask was
