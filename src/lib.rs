@@ -1,9 +1,11 @@
 pub mod auth;
 pub mod chat_filter;
 pub mod config;
+pub mod identity;
 pub mod input_relay;
 pub mod ip_country;
 pub mod metrics;
+pub mod names;
 pub mod players;
 pub mod public_ip;
 pub mod rooms;
