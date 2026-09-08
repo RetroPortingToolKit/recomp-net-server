@@ -28,6 +28,123 @@ pub fn api_router() -> Router<AppState> {
         .route("/v1/rooms/{room_id}/signal", post(post_signal))
         .route("/v1/rooms/{room_id}/signals", get(get_signals))
         .route("/v1/turn-credentials", get(turn_creds))
+        /* Discord login. Three endpoints, no cookies and no browser session on
+         * our side: the pairing code carries the whole flow. */
+        .route("/auth/discord/start", post(discord_start))
+        .route("/auth/discord/callback", get(discord_callback))
+        .route("/auth/discord/poll", post(discord_poll))
+}
+
+// ---- Discord login ---------------------------------------------------------
+
+#[derive(Serialize)]
+struct DiscordStart {
+    /// Opaque pairing code. The launcher keeps it and polls with it; it is also
+    /// the OAuth `state`, which is how the callback finds this login.
+    code: String,
+    /// The URL the launcher opens in the player's browser.
+    url: String,
+}
+
+/// Begin a login. 503 when the operator has not configured Discord, which is
+/// also how a launcher discovers that this server does not offer logins.
+async fn discord_start(State(state): State<AppState>) -> Result<Json<DiscordStart>, ApiError> {
+    let code = state.discord_logins.begin().await;
+    let url = crate::discord_auth::authorize_url(&state.config, &code)
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    Ok(Json(DiscordStart { code, url }))
+}
+
+#[derive(Deserialize)]
+struct DiscordCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Where Discord sends the player's browser. The launcher is not here — it is
+/// polling — so this returns a small page for a human to read and close.
+async fn discord_callback(
+    State(state): State<AppState>,
+    Query(q): Query<DiscordCallback>,
+) -> axum::response::Html<String> {
+    let pairing = q.state.unwrap_or_default();
+    if let Some(err) = q.error {
+        /* The player pressed Cancel, or Discord refused. Park it so the
+         * launcher stops polling instead of spinning until the TTL. */
+        state.discord_logins_finish_err(&pairing, &err).await;
+        return page("Login cancelled", "You can close this window and try again.");
+    }
+    let Some(code) = q.code else {
+        state
+            .discord_logins_finish_err(&pairing, "no_code")
+            .await;
+        return page("Login failed", "Discord did not return a code.");
+    };
+    match crate::discord_auth::on_callback(
+        &state.config,
+        &state.pool,
+        &state.http,
+        &state.discord_logins,
+        &pairing,
+        &code,
+    )
+    .await
+    {
+        Ok(done) => page(
+            "Signed in",
+            &format!("Welcome, {}. You can close this window and return to the game.",
+                     html_escape(&done.handle)),
+        ),
+        Err(e) if e == "not_in_guild" => page(
+            "Not a member",
+            "This server is for members of our Discord only. Join it, then sign in again.",
+        ),
+        Err(_) => page(
+            "Login failed",
+            "Something went wrong signing you in. Close this window and try again.",
+        ),
+    }
+}
+
+/// The launcher asks "is it done yet?". 202 = still waiting.
+#[derive(Deserialize)]
+struct DiscordPollReq {
+    code: String,
+}
+
+async fn discord_poll(
+    State(state): State<AppState>,
+    Json(req): Json<DiscordPollReq>,
+) -> Result<Json<crate::discord_auth::Completed>, ApiError> {
+    match state.discord_logins.take(&req.code).await {
+        Some(Ok(done)) => Ok(Json(done)),
+        Some(Err(e)) => Err(ApiError::new(StatusCode::FORBIDDEN, e)),
+        None => Err(ApiError::new(StatusCode::ACCEPTED, "pending")),
+    }
+}
+
+/// The callback's replies are read by a person in a browser, not by the game,
+/// so they are a page rather than JSON.
+fn page(title: &str, body: &str) -> axum::response::Html<String> {
+    axum::response::Html(format!(
+        "<!doctype html><meta charset=utf-8><title>{t}</title>\
+         <body style=\"font:16px/1.5 system-ui;margin:4rem auto;max-width:32rem;\
+         color:#e8e8ea;background:#0a0d16\"><h1 style=\"font-size:1.3rem\">{t}</h1>\
+         <p>{b}</p></body>",
+        t = html_escape(title),
+        b = html_escape(body)
+    ))
+}
+
+/// The handle comes from a Discord display name, i.e. from a person, so it is
+/// escaped before it goes into a page. Everything else here is a literal.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[derive(Serialize)]

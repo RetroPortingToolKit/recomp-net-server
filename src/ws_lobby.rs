@@ -112,6 +112,15 @@ struct Lobby {
 struct ClientMeta {
     player_id: String,
     display_name: String,
+    /// The signed-in account, when there is one.
+    ///
+    /// Attached BESIDE the connection's ephemeral `player_id`, never replacing
+    /// it. That is the whole compatibility trick: every lobby, seat, signal and
+    /// relay path still keys on the id it always did, and only the code that
+    /// cares about identity -- naming, and later reports and bans -- looks
+    /// here. `None` is a guest, which is exactly the behaviour this server has
+    /// always had.
+    account: Option<crate::identity::Player>,
     /// TCP source IP as seen by the lobby (LAN vs WAN / hairpin signal).
     peer_ip: String,
     /// ISO 3166-1 alpha-2 from GeoIP on peer_ip; "" when unknown / private.
@@ -322,6 +331,11 @@ struct InMsg {
     op: String,
     #[serde(default)]
     display_name: Option<String>,
+    /// Our own session JWT, from POST /auth/discord/poll. OPTIONAL, and its
+    /// absence is the whole compatibility story: a client that has never heard
+    /// of Discord simply does not send it and is a guest, exactly as before.
+    #[serde(default)]
+    session: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -1105,6 +1119,9 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
             ClientMeta {
                 player_id: player_id.clone(),
                 display_name: format!("Player-{}", &player_id[..8.min(player_id.len())]),
+                /* A connection starts as a guest and may be upgraded by a
+                 * `hello` carrying a session. It is never downgraded. */
+                account: None,
                 country: hub.country_for(&peer_ip),
                 peer_ip: peer_ip.clone(),
                 game_name: String::new(),
@@ -1203,7 +1220,40 @@ async fn handle_text(
              * only on the next reconnect, so the players-online list and the
              * seat table both kept the name the player first typed. */
             let hello_game = msg.game_name.clone().filter(|s| !s.is_empty());
-            let hello_name = msg.display_name.clone().filter(|s| !s.is_empty());
+            let mut hello_name = msg.display_name.clone().filter(|s| !s.is_empty());
+
+            /* A session upgrades this connection from guest to account. The
+             * server then OWNS the name: an account's handle is the thing a
+             * report or a ban hangs off, so it must not be whatever the client
+             * felt like sending. A guest keeps naming itself, as always. */
+            if let Some(tok) = msg.session.as_deref().filter(|s| !s.is_empty()) {
+                match crate::auth::verify_session_token(&state.config, tok)
+                    .ok()
+                    .and_then(|c| uuid::Uuid::parse_str(&c.sub).ok())
+                {
+                    Some(uuid) => match crate::identity::load_player(&state.pool, &uuid).await {
+                        Ok(Some(player)) => {
+                            hello_name = Some(player.handle.clone());
+                            let mut g = hub.inner.lock().await;
+                            if let Some(c) = g.clients.get_mut(player_id) {
+                                c.account = Some(player);
+                            }
+                        }
+                        /* A valid token for a row that is gone: treat as a
+                         * guest rather than half-authenticating. */
+                        _ => {}
+                    },
+                    None => {
+                        send_to(
+                            hub,
+                            player_id,
+                            json!({ "op": "error", "code": "session_invalid", "ok": false })
+                                .to_string(),
+                        )
+                        .await;
+                    }
+                }
+            }
             let (accepted_name, renamed_in) = {
                 let mut g = hub.inner.lock().await;
                 apply_identity(&mut g, player_id, hello_name, hello_game)
@@ -3404,6 +3454,7 @@ mod game_scope_tests {
             ClientMeta {
                 player_id: id.to_string(),
                 display_name: id.to_string(),
+                account: None,
                 peer_ip: "127.0.0.1".into(),
                 country: String::new(),
                 game_name: game.to_string(),

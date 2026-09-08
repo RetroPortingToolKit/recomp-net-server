@@ -41,3 +41,4 @@ socket2 = "0.6.5"
 maxminddb = "0.30"
 nix = { version = "0.31.3", features = ["socket", "uio", "net"] }
 libc = "0.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset", "http2", "form"] }
