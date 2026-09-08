@@ -150,6 +150,26 @@ pub async fn link_discord(pool: &SqlitePool, p: &DiscordProfile) -> Result<Playe
     })
 }
 
+/// Read a linked player back by our internal id, for a returning session.
+pub async fn load_player(pool: &SqlitePool, id: &Uuid) -> Result<Option<Player>> {
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT discord_id, discord_username, netplay_handle FROM players WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(discord_id, username, handle)| {
+        /* A row with no discord_id is a pre-Discord anonymous player: it has
+         * no handle the server owns, so it is not an account for this purpose. */
+        Some(Player {
+            id: *id,
+            discord_id: discord_id.clone(),
+            discord_username: username.unwrap_or_default(),
+            handle: handle.filter(|h| !h.is_empty())?,
+        })
+    }))
+}
+
 /// Who a connection is.
 ///
 /// # The compatibility contract
@@ -341,6 +361,30 @@ mod tests {
         let a = link_discord(&pool, &profile("reimu_h", Some("Reimu"))).await.unwrap();
         let b = link_discord(&pool, &second).await.unwrap();
         assert_ne!(a.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn a_session_loads_the_server_owned_handle() {
+        let pool = pool().await;
+        let p = link_discord(&pool, &profile("reimu_h", Some("Reimu"))).await.unwrap();
+        let back = load_player(&pool, &p.id).await.unwrap().expect("account");
+        assert_eq!(back.handle, "Reimu");
+        assert_eq!(back.discord_id, p.discord_id);
+    }
+
+    #[tokio::test]
+    async fn a_pre_discord_row_is_not_an_account() {
+        /* An anonymous player from before Discord has no handle the server
+         * owns, so it must not be mistaken for a signed-in one. */
+        let pool = pool().await;
+        let (id, _tok) = crate::players::create_player(&pool).await.unwrap();
+        assert!(load_player(&pool, &id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_id_is_not_an_account() {
+        let pool = pool().await;
+        assert!(load_player(&pool, &Uuid::new_v4()).await.unwrap().is_none());
     }
 
     #[tokio::test]

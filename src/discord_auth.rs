@@ -325,9 +325,11 @@ mod tests {
 
     #[test]
     fn the_authorize_url_asks_for_guild_scope_only_when_gating() {
-        let mut cfg = crate::config::Config::default();
-        cfg.discord_client_id = Some("123".into());
-        cfg.discord_redirect_url = Some("https://x.example/auth/discord/callback".into());
+        let mut cfg = crate::config::Config {
+            discord_client_id: Some("123".into()),
+            discord_redirect_url: Some("https://x.example/auth/discord/callback".into()),
+            ..Default::default()
+        };
 
         let url = authorize_url(&cfg, "st").unwrap();
         assert!(url.contains("scope=identify&"), "{url}");
