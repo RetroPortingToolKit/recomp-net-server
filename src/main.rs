@@ -270,6 +270,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let state = AppState {
+        discord_logins: recomp_net_server::discord_auth::LoginStore::default(),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("http client")?,
         pool: pool.clone(),
         config: Arc::new(config.clone()),
         rooms: Arc::new(Mutex::new(RoomRegistry::default())),

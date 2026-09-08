@@ -12,7 +12,11 @@ pub const DEFAULT_DATABASE_URL: &str = "sqlite:recomp-net-server.db?mode=rwc";
 /// Default recomp-net protocol magic `"RNET"` / `0x524E4554`.
 pub const DEFAULT_PROTOCOL_MAGIC: u32 = 0x524E_4554;
 
+/// `Default` exists only in test builds. Production must go through
+/// `Config::from_env`, which validates; a defaulted Config has an empty bind
+/// address and no signing key, and offering that to non-test code is a footgun.
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct Config {
     pub bind_addr: String,
     pub database_url: Option<String>,
@@ -81,6 +85,13 @@ pub struct Config {
     /// on is a deliberate act that locks out every client older than the
     /// integration, so it stays off until every shipped port has caught up.
     pub discord_required: bool,
+    /// `DISCORD_GUILD_ID`. When set, a login must be a member of this guild.
+    ///
+    /// This is what makes a Discord ban a netplay ban: someone removed from
+    /// the server stops passing the membership check on their next login, with
+    /// no separate ban list to maintain. Unset = any Discord account may play.
+    /// Setting it also adds the `guilds.members.read` scope to the login.
+    pub discord_guild_id: Option<String>,
     /// `GUEST_CAN_CHAT` / `GUEST_CAN_HOST`. Default true, i.e. today's
     /// behaviour. These are the levers to pull if abuse arrives before every
     /// client has updated -- they degrade what an unauthenticated client may
@@ -109,6 +120,7 @@ impl Config {
         let discord_redirect_url =
             env::var("DISCORD_REDIRECT_URL").ok().filter(|s| !s.trim().is_empty());
         let discord_required = parse_bool_env(&env::var("DISCORD_REQUIRED").unwrap_or_default());
+        let discord_guild_id = env::var("DISCORD_GUILD_ID").ok().filter(|s| !s.trim().is_empty());
         /* Default TRUE for both: absent configuration must mean "behaves as it
          * always did", never "quietly stricter". */
         let guest_can_chat = match env::var("GUEST_CAN_CHAT") {
@@ -223,6 +235,7 @@ impl Config {
             discord_client_secret,
             discord_redirect_url,
             discord_required,
+            discord_guild_id,
             guest_can_chat,
             guest_can_host,
             jwt_secret_current,
