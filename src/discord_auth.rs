@@ -143,7 +143,15 @@ impl LoginStore {
     /// session.
     pub async fn take(&self, code: &str) -> Option<std::result::Result<Completed, String>> {
         let mut g = self.inner.lock().await;
-        let done = g.get(code)?.outcome.is_some();
+        /* A code we have never heard of, or no longer hold, is FINISHED --
+         * not pending. Answering "pending" here is what left a launcher
+         * polling forever with nothing to report: entries only leave this map
+         * by completing or by ageing out, and a server restart drops all of
+         * them, so "unknown" always means this login can never complete. */
+        let Some(entry) = g.get(code) else {
+            return Some(Err("expired".into()));
+        };
+        let done = entry.outcome.is_some();
         if !done {
             /* Still waiting, and still valid -- unless it has aged out. */
             if g.get(code).is_some_and(|p| p.started.elapsed() >= PENDING_TTL) {
@@ -353,8 +361,10 @@ mod tests {
             }),
         )
         .await;
-        assert!(s.take(&code).await.is_some());
-        assert!(s.take(&code).await.is_none(), "the code is spent");
+        assert!(matches!(s.take(&code).await, Some(Ok(_))), "redeemed once");
+        /* Spent. It now answers "expired" rather than "pending" -- still not
+         * replayable, but the launcher can tell it apart from waiting. */
+        assert!(matches!(s.take(&code).await, Some(Err(ref e)) if e == "expired"));
     }
 
     #[tokio::test]
@@ -367,9 +377,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_code_is_not_pending() {
+    async fn an_unknown_code_is_finished_not_pending() {
+        /* The launcher has to be able to tell "still waiting" from "this can
+         * never finish". Before, both looked like waiting, and a login whose
+         * pairing code the server no longer held hung until the app was
+         * closed. */
         let s = LoginStore::default();
-        assert!(s.take("nope").await.is_none());
+        assert!(matches!(s.take("never-issued").await, Some(Err(ref e)) if e == "expired"));
+
+        /* A code that DID exist and completed is also gone afterwards, and
+         * reports the same way rather than reverting to pending. */
+        let code = s.begin().await;
+        s.finish(&code, Err("nope".into())).await;
+        assert!(s.take(&code).await.is_some());
+        assert!(matches!(s.take(&code).await, Some(Err(ref e)) if e == "expired"));
     }
 
     #[test]
