@@ -33,6 +33,68 @@ pub fn api_router() -> Router<AppState> {
         .route("/auth/discord/start", post(discord_start))
         .route("/auth/discord/callback", get(discord_callback))
         .route("/auth/discord/poll", post(discord_poll))
+        /* The browserless path: a device trades its stored key for a session.
+         * This is what a handheld or a console does at startup, and what a PC
+         * does on every later launch instead of signing in again. */
+        .route("/auth/session", post(session_from_secret))
+        .route("/auth/secret/revoke", post(revoke_secret))
+}
+
+#[derive(Deserialize)]
+struct SecretReq {
+    secret: String,
+    /// Revoke every key this player holds, not just this one. The "I lost a
+    /// device and cannot remember which key was on it" case.
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Serialize)]
+struct SessionIssued {
+    session: String,
+    player_id: String,
+    handle: String,
+    discord_username: String,
+}
+
+/// Key in, short-lived session out. The long-lived credential is used here and
+/// nowhere else -- the lobby only ever sees the session.
+async fn session_from_secret(
+    State(state): State<AppState>,
+    Json(req): Json<SecretReq>,
+) -> Result<Json<SessionIssued>, ApiError> {
+    let player = crate::secrets::redeem(&state.pool, &req.secret)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, "invalid_secret"))?;
+    let session = crate::auth::issue_session_token(&state.config, &player.id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(SessionIssued {
+        session,
+        player_id: player.id.to_string(),
+        handle: player.handle,
+        discord_username: player.discord_username,
+    }))
+}
+
+/// Retire a key. Authenticated BY the key itself, so a device can always sign
+/// itself out without needing a browser or a session first.
+async fn revoke_secret(
+    State(state): State<AppState>,
+    Json(req): Json<SecretReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.all {
+        let player = crate::secrets::redeem(&state.pool, &req.secret)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, "invalid_secret"))?;
+        let n = crate::secrets::revoke_all(&state.pool, &player.id)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        return Ok(Json(serde_json::json!({ "revoked": n })));
+    }
+    let ok = crate::secrets::revoke(&state.pool, &req.secret)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "revoked": if ok { 1 } else { 0 } })))
 }
 
 // ---- Discord login ---------------------------------------------------------

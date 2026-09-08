@@ -10,6 +10,7 @@ pub mod names;
 pub mod players;
 pub mod public_ip;
 pub mod rooms;
+pub mod secrets;
 pub mod routes;
 pub mod signal;
 pub mod turn_credentials;
