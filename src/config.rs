@@ -138,6 +138,41 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        /* Discord login has three env vars of its own AND needs the JWT key,
+         * because the last thing a successful login does is mint a session.
+         * Say so at startup, not at the end of a player's sign-in: an
+         * incomplete setup here otherwise surfaces as "Login failed" after
+         * the player has already authorised in their browser, which points
+         * at nothing.
+         *
+         * Warned, not fatal. The rest of the server -- LAN, guest play, the
+         * lobby list -- works perfectly without Discord, and refusing to boot
+         * would take working netplay down over an optional feature. */
+        if discord_client_id.is_some()
+            || discord_client_secret.is_some()
+            || discord_redirect_url.is_some()
+        {
+            let mut missing: Vec<&str> = Vec::new();
+            if discord_client_id.is_none() {
+                missing.push("DISCORD_CLIENT_ID");
+            }
+            if discord_client_secret.is_none() {
+                missing.push("DISCORD_CLIENT_SECRET");
+            }
+            if discord_redirect_url.is_none() {
+                missing.push("DISCORD_REDIRECT_URL");
+            }
+            if jwt_secret_current.is_none() {
+                missing.push("JWT_SECRET_CURRENT");
+            }
+            if !missing.is_empty() {
+                tracing::warn!(
+                    missing = missing.join(", "),
+                    "Discord login is partly configured and CANNOT complete a                      sign-in; players will reach 'Login failed' after                      authorising. Set the listed variables, or unset every                      DISCORD_* variable to turn sign-in off cleanly."
+                );
+            }
+        }
+
         if require_auth && jwt_secret_current.is_none() {
             bail!(
                 "REQUIRE_AUTH is set but JWT_SECRET_CURRENT is missing. \
