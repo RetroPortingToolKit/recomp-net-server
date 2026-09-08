@@ -43,6 +43,11 @@ pub fn api_router() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct ChallengeReq {
+    /* Read by nobody, on purpose. The nonce does not depend on who is asking,
+     * and looking the player up here would turn this into an oracle for
+     * whether an account exists. The field stays because it documents what a
+     * client sends and because a later rate-limit will want it. */
+    #[allow(dead_code)]
     player_id: String,
 }
 
