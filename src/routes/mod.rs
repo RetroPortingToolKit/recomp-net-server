@@ -39,6 +39,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/auth/challenge", post(auth_challenge))
         .route("/auth/session", post(session_from_secret))
         .route("/auth/secret/revoke", post(revoke_secret))
+        .route("/auth/handle", post(set_handle))
 }
 
 #[derive(Deserialize)]
@@ -128,6 +129,35 @@ async fn session_from_secret(
         handle: player.handle,
         discord_username: player.discord_username,
     }))
+}
+
+#[derive(Deserialize)]
+struct HandleReq {
+    player_id: String,
+    nonce: String,
+    proof: String,
+    handle: String,
+}
+
+/// Change the presentational handle, proved by a device key.
+///
+/// Refused when the name trips the word list -- and here refusing is right,
+/// because the player typed this one and can type another. That is the mirror
+/// of `identity::default_handle_for`, which must NOT refuse, since a Discord
+/// name is not something the player can fix from inside the game.
+async fn set_handle(
+    State(state): State<AppState>,
+    Json(req): Json<HandleReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let uuid = parse_player(&req.player_id)?;
+    spend_nonce(&state, &req.nonce).await?;
+    crate::secrets::verify_proof(&state.pool, &uuid, &req.nonce, &req.proof)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, "invalid_secret"))?;
+    let handle = crate::identity::set_handle(&state.pool, uuid, &req.handle)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "handle_rejected"))?;
+    Ok(Json(serde_json::json!({ "handle": handle })))
 }
 
 /// Retire a key, proved by that key, so a device can always sign itself out
