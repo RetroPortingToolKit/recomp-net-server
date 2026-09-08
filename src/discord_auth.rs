@@ -68,10 +68,45 @@ struct Pending {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Completed {
     pub session: String,
+    /// The long-lived per-device key, returned ONCE. The launcher writes it to
+    /// its netplay_secret file; it is unrecoverable after this response.
+    pub netplay_secret: String,
     pub player_id: String,
     pub handle: String,
     /// Shown as the disambiguator when two players share a handle.
     pub discord_username: String,
+}
+
+/// One-shot nonces for device challenge-response.
+///
+/// In memory, not the database: a nonce is worthless after sixty seconds and
+/// after one use, so persisting it would be storing litter. A server restart
+/// costs a device one retry.
+#[derive(Clone, Default)]
+pub struct ChallengeStore {
+    inner: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+const NONCE_TTL: Duration = Duration::from_secs(60);
+
+impl ChallengeStore {
+    pub async fn issue(&self) -> String {
+        let mut g = self.inner.lock().await;
+        g.retain(|_, t| t.elapsed() < NONCE_TTL);
+        let n = random_code();
+        g.insert(n.clone(), Instant::now());
+        n
+    }
+
+    /// True once per nonce. Taking it here is what makes a captured proof
+    /// worthless: the nonce it was computed over is already spent.
+    pub async fn take(&self, nonce: &str) -> bool {
+        let mut g = self.inner.lock().await;
+        match g.remove(nonce) {
+            Some(t) => t.elapsed() < NONCE_TTL,
+            None => false,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -258,9 +293,13 @@ pub async fn complete(
     let player = identity::link_discord(pool, &profile).await?;
     let session = crate::auth::issue_session_token(cfg, &player.id)
         .map_err(|e| anyhow!("session token: {e}"))?;
+    /* One key per sign-in, i.e. per device: this login happened on some
+     * machine, and that machine is what the key belongs to. */
+    let netplay_secret = crate::secrets::issue(pool, &player.id, "").await?;
 
     Ok(Completed {
         session,
+        netplay_secret,
         player_id: player.id.to_string(),
         handle: player.handle,
         discord_username: player.discord_username,
@@ -307,6 +346,7 @@ mod tests {
             &code,
             Ok(Completed {
                 session: "jwt".into(),
+                netplay_secret: "rnp_x".into(),
                 player_id: "p".into(),
                 handle: "Reimu".into(),
                 discord_username: "reimu_h".into(),
@@ -315,6 +355,15 @@ mod tests {
         .await;
         assert!(s.take(&code).await.is_some());
         assert!(s.take(&code).await.is_none(), "the code is spent");
+    }
+
+    #[tokio::test]
+    async fn a_nonce_works_exactly_once() {
+        let c = ChallengeStore::default();
+        let n = c.issue().await;
+        assert!(c.take(&n).await);
+        assert!(!c.take(&n).await, "spent: a captured proof is worthless");
+        assert!(!c.take("never-issued").await);
     }
 
     #[tokio::test]

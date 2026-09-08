@@ -274,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         discord_logins: recomp_net_server::discord_auth::LoginStore::default(),
+        discord_challenges: recomp_net_server::discord_auth::ChallengeStore::default(),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()

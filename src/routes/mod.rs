@@ -33,6 +33,126 @@ pub fn api_router() -> Router<AppState> {
         .route("/auth/discord/start", post(discord_start))
         .route("/auth/discord/callback", get(discord_callback))
         .route("/auth/discord/poll", post(discord_poll))
+        /* The browserless path: a device trades its stored key for a session.
+         * This is what a handheld or a console does at startup, and what a PC
+         * does on every later launch instead of signing in again. */
+        .route("/auth/challenge", post(auth_challenge))
+        .route("/auth/session", post(session_from_secret))
+        .route("/auth/secret/revoke", post(revoke_secret))
+}
+
+#[derive(Deserialize)]
+struct ChallengeReq {
+    /* Read by nobody, on purpose. The nonce does not depend on who is asking,
+     * and looking the player up here would turn this into an oracle for
+     * whether an account exists. The field stays because it documents what a
+     * client sends and because a later rate-limit will want it. */
+    #[allow(dead_code)]
+    player_id: String,
+}
+
+#[derive(Serialize)]
+struct ChallengeIssued {
+    nonce: String,
+    /// Seconds. The device has this long to answer before the nonce is dead.
+    expires_in: u64,
+}
+
+/// Step one of every device authentication: get a nonce to prove against.
+///
+/// Deliberately unauthenticated and deliberately uninformative — it answers
+/// the same way for a real player id and a made-up one, so it is not a way to
+/// ask whether an account exists.
+async fn auth_challenge(
+    State(state): State<AppState>,
+    Json(_req): Json<ChallengeReq>,
+) -> Json<ChallengeIssued> {
+    Json(ChallengeIssued {
+        nonce: state.discord_challenges.issue().await,
+        expires_in: 60,
+    })
+}
+
+#[derive(Deserialize)]
+struct ProofReq {
+    player_id: String,
+    nonce: String,
+    /// HMAC-SHA256 over the nonce, keyed by SHA-256 of the device's key. The
+    /// key itself is never sent.
+    proof: String,
+    /// Revoke every key this player holds, not just the proving one. The "I
+    /// lost a device and cannot remember which key was on it" case.
+    #[serde(default)]
+    all: bool,
+}
+
+fn parse_player(id: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(id).map_err(|_| ApiError::new(StatusCode::FORBIDDEN, "invalid_secret"))
+}
+
+/// Spend the nonce first, whatever happens next. A nonce that survived a
+/// failed proof would let an attacker grind guesses against one challenge.
+async fn spend_nonce(state: &AppState, nonce: &str) -> Result<(), ApiError> {
+    if state.discord_challenges.take(nonce).await {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::FORBIDDEN, "bad_nonce"))
+    }
+}
+
+#[derive(Serialize)]
+struct SessionIssued {
+    session: String,
+    player_id: String,
+    handle: String,
+    discord_username: String,
+}
+
+/// Proof in, short-lived session out. This is what a browserless device does
+/// at startup, and what a PC does on later launches instead of signing in
+/// again. The key stays on the device.
+async fn session_from_secret(
+    State(state): State<AppState>,
+    Json(req): Json<ProofReq>,
+) -> Result<Json<SessionIssued>, ApiError> {
+    let uuid = parse_player(&req.player_id)?;
+    spend_nonce(&state, &req.nonce).await?;
+    let player = crate::secrets::verify_proof(&state.pool, &uuid, &req.nonce, &req.proof)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, "invalid_secret"))?;
+    let session = crate::auth::issue_session_token(&state.config, &player.id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(SessionIssued {
+        session,
+        player_id: player.id.to_string(),
+        handle: player.handle,
+        discord_username: player.discord_username,
+    }))
+}
+
+/// Retire a key, proved by that key, so a device can always sign itself out
+/// without a browser or a session first.
+async fn revoke_secret(
+    State(state): State<AppState>,
+    Json(req): Json<ProofReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let uuid = parse_player(&req.player_id)?;
+    spend_nonce(&state, &req.nonce).await?;
+    if req.all {
+        /* Prove first: "forget every device" must not be something an
+         * onlooker can trigger with a player id alone. */
+        crate::secrets::verify_proof(&state.pool, &uuid, &req.nonce, &req.proof)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, "invalid_secret"))?;
+        let n = crate::secrets::revoke_all(&state.pool, &uuid)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        return Ok(Json(serde_json::json!({ "revoked": n })));
+    }
+    let ok = crate::secrets::revoke_by_proof(&state.pool, &uuid, &req.nonce, &req.proof)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "revoked": if ok { 1 } else { 0 } })))
 }
 
 // ---- Discord login ---------------------------------------------------------
