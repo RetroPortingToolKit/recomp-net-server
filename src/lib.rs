@@ -41,6 +41,8 @@ pub struct AppState {
     pub input_relay: input_relay::InputRelay,
     /// Discord logins in flight, keyed by the pairing code the launcher polls.
     pub discord_logins: discord_auth::LoginStore,
+    /// One-shot nonces for device challenge-response.
+    pub discord_challenges: discord_auth::ChallengeStore,
     /// Shared outbound HTTP client for the Discord API.
     pub http: reqwest::Client,
     /// When true (CLI `--debug`): HTTP trace layer + verbose lobby logs.

@@ -77,6 +77,38 @@ pub struct Completed {
     pub discord_username: String,
 }
 
+/// One-shot nonces for device challenge-response.
+///
+/// In memory, not the database: a nonce is worthless after sixty seconds and
+/// after one use, so persisting it would be storing litter. A server restart
+/// costs a device one retry.
+#[derive(Clone, Default)]
+pub struct ChallengeStore {
+    inner: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+const NONCE_TTL: Duration = Duration::from_secs(60);
+
+impl ChallengeStore {
+    pub async fn issue(&self) -> String {
+        let mut g = self.inner.lock().await;
+        g.retain(|_, t| t.elapsed() < NONCE_TTL);
+        let n = random_code();
+        g.insert(n.clone(), Instant::now());
+        n
+    }
+
+    /// True once per nonce. Taking it here is what makes a captured proof
+    /// worthless: the nonce it was computed over is already spent.
+    pub async fn take(&self, nonce: &str) -> bool {
+        let mut g = self.inner.lock().await;
+        match g.remove(nonce) {
+            Some(t) => t.elapsed() < NONCE_TTL,
+            None => false,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LoginStore {
     inner: Arc<Mutex<HashMap<String, Pending>>>,
@@ -323,6 +355,15 @@ mod tests {
         .await;
         assert!(s.take(&code).await.is_some());
         assert!(s.take(&code).await.is_none(), "the code is spent");
+    }
+
+    #[tokio::test]
+    async fn a_nonce_works_exactly_once() {
+        let c = ChallengeStore::default();
+        let n = c.issue().await;
+        assert!(c.take(&n).await);
+        assert!(!c.take(&n).await, "spent: a captured proof is worthless");
+        assert!(!c.take("never-issued").await);
     }
 
     #[tokio::test]
