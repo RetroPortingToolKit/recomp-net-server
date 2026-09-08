@@ -594,3 +594,39 @@ Either side may send `{ "op": "ping" }`; reply is `{ "op": "pong" }`.
 - Architecture: [HOW_IT_WORKS.md](HOW_IT_WORKS.md)
 - HTTP `/v1` rooms API: [LOBBY.md](LOBBY.md)
 - Privacy: [PRIVACY.md](PRIVACY.md)
+
+## Backwards compatibility with pre-Discord clients
+
+Discord login is **additive**. A client that has never heard of it connects,
+lists, joins, seats, chats and hosts exactly as it did before, and that is a
+promise the code keeps rather than a note asking people to be careful.
+
+How it holds:
+
+- **The connection key did not change.** A connection is still identified by
+  the ephemeral `Uuid::new_v4()` minted at connect. An authenticated account is
+  attached *beside* it, never in place of it, so every lobby, seat, signal and
+  relay path is untouched.
+- **`hello` gained an optional field and no required one.** Absent, the client
+  is a `Guest` and names itself with `display_name`, as always. Present and
+  valid, the server owns the name (`netplay_handle`) so it can survive a
+  reconnect and carry a report.
+- **The schema migration is additive.** `002` only adds columns, and its unique
+  index on `discord_id` is *partial* (`WHERE discord_id IS NOT NULL`), so the
+  pre-Discord anonymous rows are unaffected.
+- **Every switch defaults to permissive.** `GuestPolicy::default()` allows
+  everything; `DISCORD_REQUIRED`, `GUEST_CAN_CHAT` and `GUEST_CAN_HOST` are all
+  opt-in. A deployment that sets none of the `DISCORD_*` variables cannot tell
+  the difference. Absent configuration means "as it always was", never
+  "quietly stricter".
+
+### What is deliberately not gateable
+
+`list` and `join` are never refused for being a guest, even with
+`DISCORD_REQUIRED=1`. A server an older client cannot browse or sit down in is
+not compatible with it, whatever the flag says. Only the paths abuse actually
+travels through — chat, and hosting a room — can be closed.
+
+`DISCORD_REQUIRED` is the one switch that does lock out older clients by
+design. It stays off until every shipped port has caught up, and turning it on
+should be treated as a breaking deployment, not a tightening.
