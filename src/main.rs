@@ -252,10 +252,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to connect database {db_url}"))?;
 
-    let migr_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    sqlx::migrate::Migrator::new(migr_path)
-        .await
-        .context("migrations load")?
+    /* Migrations are embedded at compile time, not read from disk. Reading them
+     * from CARGO_MANIFEST_DIR only worked while every deployment was also a
+     * build tree; a binary bundled on one machine and extracted on another
+     * would have looked for the build machine's absolute path and failed to
+     * start. sqlx::migrate! bakes migrations/ into the executable, so the
+     * bundle is self-contained. */
+    sqlx::migrate!("./migrations")
         .run(&pool)
         .await
         .context("migrations run")?;

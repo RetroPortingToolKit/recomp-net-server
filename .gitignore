@@ -38,3 +38,6 @@ data/*
 # Logs
 *.log
 psx_last_run_report.json
+
+# Deployment bundles produced by tools/bundle.sh
+/dist/
