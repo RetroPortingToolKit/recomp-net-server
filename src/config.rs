@@ -168,7 +168,7 @@ impl Config {
             if !missing.is_empty() {
                 tracing::warn!(
                     missing = missing.join(", "),
-                    "Discord login is partly configured and CANNOT complete a                      sign-in; players will reach 'Login failed' after                      authorising. Set the listed variables, or unset every                      DISCORD_* variable to turn sign-in off cleanly."
+                    "Discord login is partly configured and cannot complete a sign-in. Players will reach 'Login failed' after authorising in their browser. Set the listed variables, or unset every DISCORD_* variable to turn sign-in off cleanly."
                 );
             }
         }
