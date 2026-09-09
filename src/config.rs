@@ -117,6 +117,19 @@ pub struct Config {
     /// a row inside this window is still steering matches and must not be
     /// deleted for being old.
     pub automatch_rematch_cooldown_secs: u64,
+    /// `AUTOMATCH_RULESETS_PATH`. Absent or unusable = automatch off. There is
+    /// no separate enable flag: one place to look, and no state where a flag
+    /// and the config disagree.
+    pub automatch_rulesets_path: String,
+    /// `AUTOMATCH_QUEUE_MAX`, `AUTOMATCH_ACCEPT_SECS`,
+    /// `AUTOMATCH_START_DELAY_SECS`.
+    pub automatch_queue_max: usize,
+    pub automatch_accept_secs: u64,
+    pub automatch_start_delay_secs: u64,
+    /// `AUTOMATCH_DODGE_COOLDOWNS`, seconds, by strikes in the last 24 h.
+    /// Empty means dodges are recorded but cost nothing -- a deployment may
+    /// want the record before it wants the penalty.
+    pub automatch_dodge_cooldowns: Vec<u64>,
 }
 
 impl Config {
@@ -149,6 +162,23 @@ impl Config {
         let automatch_retention_days = parse_u64_env("AUTOMATCH_RETENTION_DAYS", 30);
         let automatch_rematch_cooldown_secs =
             parse_u64_env("AUTOMATCH_REMATCH_COOLDOWN_SECS", 300);
+        let automatch_rulesets_path = env::var("AUTOMATCH_RULESETS_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "data/automatch_rulesets.toml".to_string());
+        let automatch_queue_max = parse_u64_env("AUTOMATCH_QUEUE_MAX", 256) as usize;
+        let automatch_accept_secs = parse_u64_env("AUTOMATCH_ACCEPT_SECS", 15).max(5);
+        let automatch_start_delay_secs = parse_u64_env("AUTOMATCH_START_DELAY_SECS", 3);
+        /* A malformed ladder degrades to "no penalty", not to a default
+         * somebody did not ask for: the operator said something about
+         * cooldowns and guessing over them is worse than charging nothing. */
+        let automatch_dodge_cooldowns = match env::var("AUTOMATCH_DODGE_COOLDOWNS") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .filter_map(|t| t.trim().parse::<u64>().ok())
+                .collect(),
+            _ => vec![60, 300, 900],
+        };
 
         let jwt_secret_current = env::var("JWT_SECRET_CURRENT")
             .ok()
@@ -294,6 +324,11 @@ impl Config {
             guest_can_host,
             automatch_retention_days,
             automatch_rematch_cooldown_secs,
+            automatch_rulesets_path,
+            automatch_queue_max,
+            automatch_accept_secs,
+            automatch_start_delay_secs,
+            automatch_dodge_cooldowns,
             jwt_secret_current,
             jwt_secret_previous,
             default_input_delay,

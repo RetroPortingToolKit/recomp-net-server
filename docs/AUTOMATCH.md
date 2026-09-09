@@ -246,6 +246,46 @@ already-small pool:
 | Combined RTT to relay | `AUTOMATCH_RTT_START_MS` (120) | +`AUTOMATCH_RTT_STEP_MS` (60) every `AUTOMATCH_RTT_WIDEN_SECS` (20), to `AUTOMATCH_RTT_MAX_MS` (400), then unlimited |
 | Avoid last opponent | on | off after `AUTOMATCH_REMATCH_COOLDOWN_SECS` (300) or once RTT is unlimited |
 
+### The floor under D and P
+
+The measurement is not only a filter. `recomp-net/docs/architecture.md`
+("Delay-sync admission") stores local input at wire tick `T + D` and admits
+tick `T` only when every remote slot has its row for `T + D` — so the input has
+exactly `D` frames of wall time to make a **one-way** trip. Online is always
+peer → relay → peer, and each `rtt_ms` is a peer's own round trip to the relay,
+so:
+
+```text
+  one_way(A→B) = rtt_a/2 + rtt_b/2 = (rtt_a + rtt_b) / 2
+  frames       = ceil(one_way / frame_ms) + 1     # the +1 is jitter margin
+```
+
+That number becomes a **floor**, never a ceiling:
+
+- **Rollback off** — there is nowhere else to put the latency, so `D` carries
+  all of it.
+- **Rollback on** — `D` stays where the ruleset put it and the prediction
+  runway `P` absorbs the remainder, which is the whole reason to run rollback
+  on a long link. Past `D + 16` the runway is clamped out and `D` takes the
+  shortfall; a link longer than that cannot be papered over.
+- **Nothing measured** — the ruleset runs exactly as authored. Raising a floor
+  off a number nobody took would be inventing the reason for it.
+- **A short link never lowers what the ruleset asked for.** Both players agreed
+  to the advertised delay by queueing; a good connection is not a reason to
+  overrule it.
+
+`frame_ms` defaults to 60 Hz and a ruleset may override it (a 50 Hz title sets
+`frame_ms = 20.0`). The default errs safe: a PAL frame is longer, so 60 Hz
+maths asks for *more* frames than a 50 Hz game needs, and too much delay plays
+badly where too little stalls the sim.
+
+The floor is published on `automatch_found` as `input_delay`,
+`input_prediction` and `frames_needed`, so the accept gate shows the delay the
+player is agreeing to rather than the ruleset's advertised one — being told
+"delay 2" and then playing at 6 reads as a bug. The room stores the floored
+caps, so `launch` carries them and a peer applies them at boot like any other
+cap.
+
 **Slot 0 goes to the older ticket.** Under the SFU it carries no mechanical
 advantage, but the rule is deterministic and it shows up in the log, which
 "whichever the map iterated first" does not. Revisit if slot 0 ever turns out
@@ -258,10 +298,28 @@ matters is **each peer → relay**, not peer ↔ peer. Match quality is therefor
 predictable from each ticket on its own, before any pairing, with no pairwise
 probing at all — `rtt_a + rtt_b` is the estimate.
 
-Measure it honestly. WS `ping`/`pong` is TCP and is a rough proxy; the real
-number is a small UDP probe against the relay's advertised port, which the
-client can run while queued and report. v1 may ship the TCP proxy, but the
-field is `est_rtt_ms` and the client is told it is an estimate.
+**Measured, as of this version, by a UDP probe against the relay itself.**
+The relay answers packet type `200` with type `201` — the same 14 bytes back,
+nonce included — before any session lookup, precisely so a client can measure
+the path while it is sitting in a queue with no session to belong to. Same size
+in and out, so it is not an amplifier; it is still a reflector, so the length is
+exact rather than a maximum and replies are capped at 8 per source per second.
+
+The client times the round trip and reports it (`automatch_rtt`, or `rtt_ms` on
+`automatch_queue`). Where to probe is published on both `automatch_rulesets_ok`
+and `automatch_queued` as `probe: { endpoint, magic, type }`.
+
+`rtt_ms` is **client-reported** and belongs in LOBBY.md's trust table as such.
+It is clamped to `MAX_REPORTED_RTT_MS` (2000). The grief case is reporting HIGH
+to force delay on an opponent; reporting low only stalls the liar's own sim,
+which is its own answer.
+
+A ticket that has not measured yet is held out of pairing for
+`PROBE_GRACE_SECS` (3). A client that probes *before* queueing never waits at
+all; this is for one that queues first and measures second, where pairing
+immediately would qualify the match on a number that was one second away. The
+grace is a delay, not a requirement: a client that never probes still matches
+once it lapses, and the filter passes on unknown.
 
 With one VPS in one region a cross-globe pair is bad no matter what the
 algorithm does. Show the estimate in the accept modal and let the widening
