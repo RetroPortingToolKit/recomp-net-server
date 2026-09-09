@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod automatch;
 pub mod chat_filter;
 pub mod config;
 pub mod discord_auth;

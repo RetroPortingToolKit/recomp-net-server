@@ -104,6 +104,19 @@ pub struct Config {
     /// Optional file of extra chat-filter entries (same format as the
     /// built-in list), appended at startup. `CHAT_FILTER_EXTRA_PATH`.
     pub chat_filter_extra_path: Option<String>,
+    /// `AUTOMATCH_RETENTION_DAYS`. How long the two automatch tables keep
+    /// history. `0` means "prune a row once it stops affecting a decision",
+    /// which is a floor, not a purge -- see `automatch::cutoff_secs`.
+    ///
+    /// It has a dial because `automatch_pairings` records who played whom,
+    /// and keeping that forever should be a deliberate choice rather than an
+    /// inherited default (`docs/PRIVACY.md`).
+    pub automatch_retention_days: u64,
+    /// `AUTOMATCH_REMATCH_COOLDOWN_SECS`. How long the pairing loop prefers a
+    /// different opponent. Also the floor under the pairings table's prune:
+    /// a row inside this window is still steering matches and must not be
+    /// deleted for being old.
+    pub automatch_rematch_cooldown_secs: u64,
 }
 
 impl Config {
@@ -131,6 +144,12 @@ impl Config {
             Ok(v) if !v.trim().is_empty() => parse_bool_env(&v),
             _ => true,
         };
+        /* Retention has a default rather than being required, but the
+         * default is a real answer (30 days) instead of "forever". */
+        let automatch_retention_days = parse_u64_env("AUTOMATCH_RETENTION_DAYS", 30);
+        let automatch_rematch_cooldown_secs =
+            parse_u64_env("AUTOMATCH_REMATCH_COOLDOWN_SECS", 300);
+
         let jwt_secret_current = env::var("JWT_SECRET_CURRENT")
             .ok()
             .filter(|s| !s.is_empty());
@@ -273,6 +292,8 @@ impl Config {
             discord_guild_id,
             guest_can_chat,
             guest_can_host,
+            automatch_retention_days,
+            automatch_rematch_cooldown_secs,
             jwt_secret_current,
             jwt_secret_previous,
             default_input_delay,

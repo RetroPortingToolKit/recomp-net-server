@@ -486,8 +486,18 @@ int  (*automatch_accept)(void* ctx, int accept);
 const char* (*automatch_error)(void* ctx);
 ```
 
-Everything after both-accept is the existing `launch_pending` →
-`fill_launch` → boot path, untouched.
+These have **landed** in recomp-ui, along with
+`RecompLauncherCNetplayRuleset` / `RecompLauncherCNetplayFound` and the
+`RECOMP_LAUNCHER_AUTOMATCH_*` state enum; the header is the ABI truth and
+carries the per-field notes. The launcher draws the ⚡ Automatch button in
+online netplay (LAN keeps Join Direct), the queue-type picker when a server
+offers more than one ruleset, the elapsed clock and queue population while
+waiting, and the accept gate. Everything after both-accept is the existing
+`launch_pending` → `fill_launch` → boot path, untouched.
+
+No backend implements the callbacks yet, so the button is gated off
+`automatch_available` and sits disabled with the reason in its tooltip rather
+than being offered and then found not to work.
 
 Two things the launcher owns and the server cannot:
 
@@ -542,6 +552,12 @@ Additive in the same way the Discord login was:
 There is no `AUTOMATCH_ENABLED`. Automatch is on when rulesets load and off
 when they do not, so there is one place to look and no state where the flag and
 the config disagree.
+
+**Implemented today: `AUTOMATCH_RETENTION_DAYS` and
+`AUTOMATCH_REMATCH_COOLDOWN_SECS`** (`src/automatch.rs`, `004_automatch.sql`) —
+the two tables and the sweep that prunes them, which is the part that outlives
+a process and therefore could not wait for the queue. The rest of this table is
+read by nothing yet: setting one changes no behaviour until the queue lands.
 
 ## Related
 

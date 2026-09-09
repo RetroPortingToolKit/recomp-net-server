@@ -303,6 +303,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    /* Automatch history prunes itself, starting now and then daily. Spawned
+     * unconditionally: the tables exist whether or not this deployment runs
+     * automatch, and a server that used it and then turned it off still owes
+     * the rows a sweep. */
+    recomp_net_server::automatch::spawn_sweep(
+        pool.clone(),
+        config.automatch_retention_days,
+        config.automatch_rematch_cooldown_secs,
+    );
+
     let turn_configured =
         recomp_net_server::turn_credentials::TurnCredentialConfig::from_env().is_some();
 
