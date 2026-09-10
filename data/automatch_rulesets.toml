@@ -64,7 +64,7 @@
 # and queueing with, say, localization on is not.
 [[ruleset]]
 id        = "standard"
-label     = "Standard"
+label     = "Standard (wide, English)"
 game_name = "Gundam Wing Endless Duel"
 max_slots = 2
 
@@ -96,6 +96,29 @@ widescreen        = true
 widescreen_hud    = true   # always written out: absent, this key defaults to
                            # TRUE, so spelling it is the only way false is real
 ws_extra          = 43     # margin in pixels per side (256 + 2*43 = 342)
+
+# THE MOD SET THIS QUEUE RUNS.
+#
+# Equality, not permission: a player's own sim-affecting selection must be
+# exactly this. Missing something the queue runs desyncs; so does running
+# something extra, which is why "at least this" would be the wrong rule.
+#
+# The value is the mod runtime's OWN canonical form -- one line per enabled
+# feature, sorted, with resolved option values -- and it is compared byte for
+# byte, so it is copied from a build's log rather than typed from memory. Any
+# build prints its own at startup:
+#     netplay: sim-affecting mod set for automatch:
+#     gwed.enhancement.widescreen@1.0.0/widescreen
+#     gwed.localization@1.0.0/localization language=en
+#
+# Note the version and the option value are part of it. Bumping a package to
+# 1.0.1 changes this string, and the queue then correctly refuses builds that
+# have not been updated -- which is the point, not a nuisance.
+#
+# This is the piece that makes a MOD queue possible at all. Without it a
+# ruleset can only say "vanilla", and a game whose players nearly all run a
+# translation has a queue nobody can use.
+mod_set = "gwed.enhancement.widescreen@1.0.0/widescreen\ngwed.localization@1.0.0/localization language=en\n"
 ignore_aspect     = false
 rollback          = true   # the SFU path every online match runs
 input_delay       = 2      # frames; the client clamps to 2..20
@@ -126,3 +149,31 @@ force_input_relay = false
 # input_delay       = 2
 # force_turn        = false
 # force_input_relay = false
+
+
+# ── Gundam Wing: Endless Duel — authentic ───────────────────────────────────
+# The 4:3, untranslated pool: no enabled sim-affecting features at all.
+#
+# Two queues rather than one because the mod set is an EQUALITY, so a player
+# is only ever in the pool that matches their own selection. Offering both
+# means neither group is locked out; the cost is that the two pools are
+# separate, which at this population is the real trade-off to weigh.
+#
+# An omitted mod_set means "vanilla" -- the same as an empty one, and the same
+# rule every v1 ruleset had before mod queues existed.
+[[ruleset]]
+id        = "authentic"
+label     = "Authentic (4:3, Japanese)"
+game_name = "Gundam Wing Endless Duel"
+max_slots = 2
+
+[ruleset.match_caps]
+widescreen        = false
+widescreen_hud    = false
+ws_extra          = 0
+ignore_aspect     = false
+rollback          = true
+input_delay       = 2
+force_turn        = false
+force_input_relay = false
+mod_set           = ""
