@@ -1013,18 +1013,51 @@ fn lobby_list_json(hub: &HubInner) -> String {
     lobby_list_json_filtered(hub, None, None)
 }
 
+/// The list as ONE PARTICULAR CLIENT should see it.
+///
+/// A `list` request carries the caller's title and is filtered by it, but the
+/// two PUSHED paths -- the 1 Hz tick and the broadcast on every state change
+/// -- used to build one unfiltered payload and send that same blob to
+/// everyone. So a client that asked a filtered question got the right answer
+/// and had it overwritten a second later by a list containing every player and
+/// room on the server, whatever game they were playing. The filtering looked
+/// broken because the last word always came from the unfiltered path.
+///
+/// The scope is the client's own, resolved the same way chat resolves it
+/// (`game_scope_for`), so the players-online list, the room list and the chat
+/// audience all agree about what "here" means. A client that has not announced
+/// a title yet still sees everything -- it has not told us what to filter by,
+/// and showing it nothing would make a browser look empty rather than
+/// unfiltered.
+fn lobby_list_json_for(g: &HubInner, player_id: &str) -> String {
+    let scope = game_scope_for(g, player_id);
+    if scope.is_empty() {
+        return lobby_list_json(g);
+    }
+    lobby_list_json_filtered(g, Some(&scope), None)
+}
+
 async fn broadcast_list(hub: &WsLobbyHub) {
-    let (payload, ids) = {
-        let g = hub.inner.lock().await;
-        let payload = lobby_list_json(&g);
-        let ids: Vec<String> = g.clients.keys().cloned().collect();
-        (payload, ids)
-    };
     let g = hub.inner.lock().await;
+    let ids: Vec<String> = g.clients.keys().cloned().collect();
+    /* Built per SCOPE rather than per client: everyone playing one title gets
+     * a byte-identical list, and a server with three titles on it does three
+     * serializations instead of one per connection. */
+    let mut by_scope: HashMap<String, String> = HashMap::new();
     for id in ids {
-        if let Some(c) = g.clients.get(&id) {
-            let _ = c.tx.send(payload.clone());
-        }
+        let Some(c) = g.clients.get(&id) else { continue };
+        let scope = game_scope_for(&g, &id);
+        let payload = by_scope
+            .entry(scope.clone())
+            .or_insert_with(|| {
+                if scope.is_empty() {
+                    lobby_list_json(&g)
+                } else {
+                    lobby_list_json_filtered(&g, Some(&scope), None)
+                }
+            })
+            .clone();
+        let _ = c.tx.send(payload);
     }
 }
 
@@ -1219,7 +1252,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 if !g.clients.contains_key(&player_tick) {
                     break;
                 }
-                lobby_list_json(&g)
+                lobby_list_json_for(&g, &player_tick)
             };
             send_to(&hub_tick, &player_tick, payload).await;
         }
@@ -4629,5 +4662,70 @@ mod name_tests {
         let long = "a".repeat(PASSWORD_MAX_BYTES + 1);
         let mut m = msg(&format!(r#"{{"op":"join","password":"{long}"}}"#));
         assert_eq!(m.sanitize_in_place(), Some("password_invalid"));
+    }
+}
+
+#[cfg(test)]
+mod list_scope_tests {
+    use super::*;
+
+    fn client(g: &mut HubInner, id: &str, name: &str, game: &str) {
+        let (tx, _rx) = broadcast::channel(8);
+        g.clients.insert(
+            id.to_string(),
+            ClientMeta {
+                player_id: id.to_string(),
+                display_name: name.to_string(),
+                account: None,
+                peer_ip: "127.0.0.1".into(),
+                country: String::new(),
+                game_name: game.to_string(),
+                lobby_id: None,
+                pending_mod_lobby: None,
+                probe_rtt_ms: -1,
+                tx,
+            },
+        );
+    }
+
+    /// The bug this exists to prevent: `list` was filtered by title, but the
+    /// PUSHED list (the 1 Hz tick and the broadcast on every change) was not.
+    /// A client asked a filtered question, got the right answer, and had it
+    /// overwritten a second later by every player on the server. It looked
+    /// like the filter did not work, when in fact the last word came from a
+    /// path that never filtered at all -- which is why this asserts on the
+    /// PUSHED payload and not on the request path.
+    #[test]
+    fn a_pushed_list_carries_only_the_recipients_own_title() {
+        let mut g = HubInner::default();
+        client(&mut g, "p1", "GundamPlayer", "Gundam Wing Endless Duel");
+        client(&mut g, "p2", "YugiohPlayer", "Yu-Gi-Oh! Forbidden Memories");
+
+        let seen = lobby_list_json_for(&g, "p1");
+        assert!(seen.contains("GundamPlayer"));
+        assert!(
+            !seen.contains("YugiohPlayer"),
+            "another title's player leaked into a pushed list: {seen}"
+        );
+
+        /* And symmetrically, so this is a scope rule rather than one title
+         * happening to sort first. */
+        let seen = lobby_list_json_for(&g, "p2");
+        assert!(seen.contains("YugiohPlayer"));
+        assert!(!seen.contains("GundamPlayer"));
+    }
+
+    /// A client that has not said what it is playing has not told us what to
+    /// filter by. Showing it nothing would make the browser look empty rather
+    /// than unfiltered, which is the worse failure of the two.
+    #[test]
+    fn a_client_with_no_title_yet_still_sees_everyone() {
+        let mut g = HubInner::default();
+        client(&mut g, "p1", "GundamPlayer", "Gundam Wing Endless Duel");
+        client(&mut g, "p2", "Browsing", "");
+
+        let seen = lobby_list_json_for(&g, "p2");
+        assert!(seen.contains("GundamPlayer"));
+        assert!(seen.contains("Browsing"));
     }
 }
