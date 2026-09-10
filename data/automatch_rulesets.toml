@@ -51,6 +51,12 @@
 # ---------------------------------------------------------------------------
 
 
+# ONE QUEUE, deliberately. A mod set is an equality, so every additional
+# ruleset splits the population into another pool that only matches itself.
+# At this size one pool that most players fall into beats several that nobody
+# is waiting in. Add the 4:3/Japanese counterpart when there are enough
+# players for two pools to both fill.
+
 # ── Gundam Wing: Endless Duel (SNES) ────────────────────────────────────────
 # Verified against the running client 2026-09-10: the announced game_name was
 # read off the wire, and the caps keys and their defaults from that build's
@@ -121,7 +127,15 @@ ws_extra          = 43     # margin in pixels per side (256 + 2*43 = 342)
 mod_set = "gwed.enhancement.widescreen@1.0.0/widescreen\ngwed.localization@1.0.0/localization language=en\n"
 ignore_aspect     = false
 rollback          = true   # the SFU path every online match runs
-input_delay       = 2      # frames; the client clamps to 2..20
+
+# NO input_delay. The delay is NEGOTIATED, by the same RTT rules a
+# human-hosted room uses: the server reads both peers' measured round trip to
+# the relay and applies the launcher's own tier table (D = 3 on a short link
+# up to 10 on a long one, runway P = 4 + D). An authored delay here would be a
+# FLOOR that only ever raises that, so pinning 2 would say "delay 2" in the
+# queue picker while the match actually runs 4 or 6 -- which reads as a bug to
+# the player agreeing to it. Left out, the picker advertises "Delay auto" and
+# the accept gate shows the number this particular pair will really run.
 force_turn        = false  # let ICE choose; the relay is already in the path
 force_input_relay = false
 
@@ -150,30 +164,3 @@ force_input_relay = false
 # force_turn        = false
 # force_input_relay = false
 
-
-# ── Gundam Wing: Endless Duel — authentic ───────────────────────────────────
-# The 4:3, untranslated pool: no enabled sim-affecting features at all.
-#
-# Two queues rather than one because the mod set is an EQUALITY, so a player
-# is only ever in the pool that matches their own selection. Offering both
-# means neither group is locked out; the cost is that the two pools are
-# separate, which at this population is the real trade-off to weigh.
-#
-# An omitted mod_set means "vanilla" -- the same as an empty one, and the same
-# rule every v1 ruleset had before mod queues existed.
-[[ruleset]]
-id        = "authentic"
-label     = "Authentic (4:3, Japanese)"
-game_name = "Gundam Wing Endless Duel"
-max_slots = 2
-
-[ruleset.match_caps]
-widescreen        = false
-widescreen_hud    = false
-ws_extra          = 0
-ignore_aspect     = false
-rollback          = true
-input_delay       = 2
-force_turn        = false
-force_input_relay = false
-mod_set           = ""

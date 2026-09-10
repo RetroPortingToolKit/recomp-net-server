@@ -199,8 +199,14 @@ fn validate(e: &RulesetEntry, seen: &[(String, String)]) -> Result<(), &'static 
 /// rather than authored, so it cannot drift from what the match will run.
 fn summarize(caps: &Value) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(d) = caps.get("input_delay").and_then(|v| v.as_i64()) {
-        parts.push(format!("Delay {d}"));
+    /* An authored delay is a floor the link can raise, so it is advertised as
+     * a minimum. A ruleset that authors NONE is saying "negotiate it", and
+     * printing the internal default 2 there would advertise a number the
+     * match will almost never run -- the accept gate then shows 6 and reads
+     * as a bug. Say which of the two it is. */
+    match caps.get("input_delay").and_then(|v| v.as_i64()) {
+        Some(d) => parts.push(format!("Delay {d}+")),
+        None => parts.push("Delay auto".into()),
     }
     match caps.get("rollback").and_then(|v| v.as_bool()) {
         Some(true) => parts.push("Rollback on".into()),
@@ -282,6 +288,64 @@ pub fn frames_needed(rtt_a: i32, rtt_b: i32, frame_ms: f64) -> u32 {
     (one_way / frame_ms).ceil() as u32 + JITTER_MARGIN_FRAMES
 }
 
+/* ── The hosted-lobby rules ──────────────────────────────────────────────────
+ *
+ * Automatch negotiates delay the same way a human-hosted room does, rather
+ * than by its own arithmetic. That is a deliberate choice and worth stating:
+ * the pure one-way calculation above is CORRECT and still too optimistic in
+ * practice. The launcher's tables (recomp-ui launcher_imgui.cpp,
+ * np_rb_delay_frames_from_rtt_ms / np_rb_prediction_frames_from_rtt_ms) were
+ * moved up twice off measured soaks -- a TURN WAN link whose lobby RTT said
+ * D=3 actually needed D=5-6 once transit and jitter were counted, and the
+ * session spent its first minute invent-storming until arrival-driven
+ * auto-delay caught up. A queued player has no host to notice that and nudge
+ * the slider, so automatch has MORE reason to start at the settled number,
+ * not less.
+ *
+ * The tables are keyed on a ROUND TRIP between the two peers. Here that path
+ * is A -> relay -> B, whose round trip is rtt_a + rtt_b (each rtt is one
+ * peer's own round trip to the relay, so each contributes half of it twice).
+ *
+ * Keep these in step with the launcher's. They are duplicated rather than
+ * shared because one is Rust on a server and the other is C++ in a launcher,
+ * and a wire field carrying the table would put the client in charge of its
+ * own handicap.
+ */
+
+/// Rollback D, from the pair's round-trip time. WAN-aware tiers, floor 3.
+pub fn hosted_rollback_delay(rtt_ms: i32) -> u32 {
+    let rtt = rtt_ms.max(0);
+    let d = if rtt < 50 {
+        3
+    } else if rtt < 80 {
+        4
+    } else if rtt < 120 {
+        6
+    } else if rtt < 160 {
+        7
+    } else if rtt < 200 {
+        8
+    } else if rtt < 260 {
+        9
+    } else {
+        10
+    };
+    d.clamp(3, 12)
+}
+
+/// Invent runway: P = 4 + D, matching the launcher exactly.
+pub fn hosted_rollback_prediction(delay: u32) -> u32 {
+    (4 + delay.max(2)).clamp(6, MAX_PREDICTION)
+}
+
+/// Delay-only D. No runway to hide latency in, so the pad is larger: one-way
+/// frames (ceil(rtt / 33)) plus three for ICE/TURN variance and scheduling.
+pub fn hosted_delay_only(rtt_ms: i32) -> u32 {
+    let rtt = rtt_ms.max(0);
+    let one_way_frames = ((rtt + 32) / 33).max(1) as u32;
+    (one_way_frames + 3).clamp(3, MAX_DELAY)
+}
+
 /// The delay and prediction a match should actually run.
 ///
 /// A FLOOR, never a ceiling: the ruleset author picked a baseline and this can
@@ -323,16 +387,31 @@ pub fn delay_floor(caps: &Value, rtt_a: i32, rtt_b: i32, frame_ms: f64) -> Delay
         };
     }
 
+    /* The two peers' round trip through the relay -- what the hosted tables
+     * are keyed on. */
+    let pair_rtt = rtt_a.saturating_add(rtt_b);
+
     let (d, p) = if rollback {
-        /* D stays where the ruleset put it; the runway takes the remainder.
-         * If the runway cannot cover it either, D has to make up the shortfall
-         * -- a link longer than D + MAX_PREDICTION cannot be papered over. */
-        let want_p = needed.saturating_sub(base_d).max(base_p);
-        let p = want_p.clamp(MIN_PREDICTION, MAX_PREDICTION);
-        let shortfall = needed.saturating_sub(base_d + p);
-        (base_d + shortfall, p)
+        /* The tier table decides D, and the runway follows it. Still a FLOOR:
+         * a ruleset that authored a higher delay keeps it, because both
+         * players agreed to the advertised number by queueing and a good
+         * connection is not a reason to overrule them. */
+        let d = hosted_rollback_delay(pair_rtt).max(base_d);
+        let p = hosted_rollback_prediction(d).max(base_p);
+        /* A link longer than D + P still cannot be papered over; D takes the
+         * shortfall. P is then recomputed from the raised D rather than left
+         * behind, so the P = 4 + D invariant the launcher maintains holds
+         * here too -- a runway sized for a shorter delay than the one being
+         * run is the mismatch that invents into a stall. */
+        let shortfall = needed.saturating_sub(d + p);
+        if shortfall == 0 {
+            (d, p)
+        } else {
+            let d2 = d + shortfall;
+            (d2, hosted_rollback_prediction(d2).max(base_p))
+        }
     } else {
-        (needed.max(base_d), base_p)
+        (hosted_delay_only(pair_rtt).max(needed).max(base_d), base_p)
     };
 
     DelayFloor {
@@ -983,12 +1062,13 @@ mod tests {
     #[test]
     fn the_caps_summary_is_derived_from_the_caps() {
         /* Derived, not authored, so the picker cannot describe settings the
-         * match will not run. */
+         * match will not run. The delay reads "2+" because an authored delay
+         * is a floor the link can raise, never the number the match runs. */
         let rs = load_str(
             "[[ruleset]]\nid='r'\ngame_name='G'\n[ruleset.match_caps]\n\
              input_delay=2\nrollback=true\nturbo_loads=true\n",
         );
-        assert_eq!(rs.for_game("G")[0].caps_summary, "Delay 2 - Rollback on - Turbo loads");
+        assert_eq!(rs.for_game("G")[0].caps_summary, "Delay 2+ - Rollback on - Turbo loads");
     }
 
     /* ---- pairing ---- */
@@ -1223,31 +1303,77 @@ mod tests {
 
     #[test]
     fn without_rollback_the_delay_carries_all_of_it() {
-        /* 120 + 120 -> 120ms one way -> 8 frames + 1 = 9. */
+        /* Delay-sync has no runway, so D carries the link on its own, by the
+         * launcher's own delay-only rule: ceil(rtt/33) one-way frames plus a
+         * three-frame pad for ICE/TURN variance. 120 + 120 -> pair rtt 240 ->
+         * ceil(240/33) = 8, + 3 = 11. That is deliberately ABOVE the pure
+         * one-way arithmetic's 9: the pad is what the soaks said was missing.
+         */
         let caps = json!({"input_delay": 2, "rollback": false});
         let f = delay_floor(&caps, 120, 120, DEFAULT_FRAME_MS);
-        assert_eq!(f.input_delay, 9);
-        assert_eq!(f.needed, 9);
+        assert_eq!(f.input_delay, 11);
+        assert_eq!(f.needed, 9, "the raw requirement is still reported as-is");
+        assert_eq!(f.input_delay, hosted_delay_only(240));
     }
 
     #[test]
-    fn with_rollback_the_runway_absorbs_it_and_the_delay_stays_low() {
-        /* The whole reason to run rollback on a long link: D stays where the
-         * ruleset put it and P grows instead. */
+    fn with_rollback_the_tiers_set_the_delay_and_the_runway_follows() {
+        /* Automatch negotiates like a hosted room rather than by its own
+         * arithmetic. The launcher's tier table was moved up twice off
+         * measured soaks precisely because "keep D low, let P absorb it" spent
+         * the first minute of a WAN session invent-storming -- so D moves.
+         *
+         * 120 + 120 -> pair rtt 240 -> the >=200 tier -> D = 9, P = 4 + 9. */
         let caps = json!({"input_delay": 2, "rollback": true, "input_prediction": 2});
         let f = delay_floor(&caps, 120, 120, DEFAULT_FRAME_MS);
-        assert_eq!(f.input_delay, 2, "delay must not move while the runway can take it");
-        assert_eq!(f.input_prediction, 7, "9 needed, 2 covered by delay");
+        assert_eq!(f.input_delay, 9);
+        assert_eq!(f.input_prediction, 13);
+        assert_eq!(f.input_delay, hosted_rollback_delay(240));
+        assert_eq!(f.input_prediction, hosted_rollback_prediction(9));
+    }
+
+    #[test]
+    fn the_tiers_match_the_launcher_table_exactly() {
+        /* These numbers are the launcher's (np_rb_delay_frames_from_rtt_ms),
+         * and the two copies drifting apart would give a queued player a
+         * different handicap from a hosted one on the same link. */
+        for (rtt, want) in [(0, 3), (19, 3), (49, 3), (50, 4), (79, 4), (80, 6),
+                            (119, 6), (120, 7), (159, 7), (160, 8), (199, 8),
+                            (200, 9), (259, 9), (260, 10), (5000, 10)] {
+            assert_eq!(hosted_rollback_delay(rtt), want, "rtt {rtt}");
+        }
+        /* P = 4 + D, clamped 6..16 -- also the launcher's. */
+        assert_eq!(hosted_rollback_prediction(2), 6);
+        assert_eq!(hosted_rollback_prediction(3), 7);
+        assert_eq!(hosted_rollback_prediction(10), 14);
+        assert_eq!(hosted_rollback_prediction(20), MAX_PREDICTION);
+    }
+
+    #[test]
+    fn a_local_pair_still_gets_the_hosted_floor_of_three() {
+        /* The tables floor at 3 even on a LAN-grade link, which is above the
+         * pure arithmetic's answer. Automatch does not get to be more
+         * optimistic than a hosted room on the same connection. */
+        let caps = json!({"input_delay": 2, "rollback": true, "input_prediction": 2});
+        let f = delay_floor(&caps, 1, 1, DEFAULT_FRAME_MS);
+        assert_eq!(f.input_delay, 3);
     }
 
     #[test]
     fn a_link_longer_than_the_runway_pushes_the_delay_back_up() {
-        /* P is clamped at 16. Past D + 16 there is nowhere left to put the
-         * latency but D, and pretending otherwise would stall the sim. */
+        /* The tiers top out at D = 10, so on a link far past them D + P is
+         * still short of what the trip needs. There is nowhere left to put
+         * the latency but D, and pretending otherwise would stall the sim.
+         *
+         * 400 + 400 -> pair rtt 800 -> tier D = 10, P = 14, while the raw
+         * requirement is 25 frames. D absorbs the 1-frame shortfall and P is
+         * recomputed from the raised D. */
         let caps = json!({"input_delay": 2, "rollback": true, "input_prediction": 2});
         let f = delay_floor(&caps, 400, 400, DEFAULT_FRAME_MS);
-        assert_eq!(f.input_prediction, MAX_PREDICTION);
-        assert!(f.input_delay > 2, "delay took the shortfall: {}", f.input_delay);
+        assert!(f.input_delay > hosted_rollback_delay(800),
+                "delay took the shortfall: {}", f.input_delay);
+        assert_eq!(f.input_prediction, hosted_rollback_prediction(f.input_delay),
+                   "the runway is sized for the delay actually being run");
         assert!(f.input_delay + f.input_prediction >= f.needed.min(MAX_DELAY + MAX_PREDICTION));
     }
 
@@ -1274,7 +1400,7 @@ mod tests {
          * setting the match does not have. */
         let caps = json!({"input_delay": 2, "rollback": false});
         let out = caps_with_floor(&caps, delay_floor(&caps, 120, 120, DEFAULT_FRAME_MS));
-        assert_eq!(out["input_delay"], json!(9));
+        assert_eq!(out["input_delay"], json!(11));
         assert!(out.get("input_prediction").is_none());
     }
 
