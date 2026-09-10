@@ -40,8 +40,14 @@
 #
 # Refused at load, loudly, with the server still starting: an empty id or
 # game_name, a duplicate (game_name, id), max_slots other than 2, match_caps
-# that is not a table or serializes over 4096 bytes, and any `mods` key at all
-# (v1 is vanilla only). See src/automatch.rs validate().
+# that is not a table or serializes over 4096 bytes, and any `mods` key at all.
+# See src/automatch.rs validate().
+#
+# Note what "vanilla only" does and does not mean. It forbids a required mod
+# PLAN (`match_caps.mods`), because the seat gate would have to run a transfer
+# with no host to prompt. It does not forbid a ruleset from pinning a setting
+# that a preloaded package provides — every player already has those, and the
+# pin is what makes both peers identical rather than what makes them differ.
 # ---------------------------------------------------------------------------
 
 
@@ -49,6 +55,13 @@
 # Verified against the running client 2026-09-10: the announced game_name was
 # read off the wire, and the caps keys and their defaults from that build's
 # match-caps parser.
+#
+# This queue is WIDESCREEN. The package ships preloaded in every build, so
+# there is nothing to transfer and no player can be missing it; what the
+# ruleset does is pin the margin so both peers run one geometry. The client
+# treats a margin the ruleset asked for as part of the ruleset rather than as
+# a local divergence, which is why queueing with widescreen on is allowed here
+# and queueing with, say, localization on is not.
 [[ruleset]]
 id        = "standard"
 label     = "Standard"
@@ -62,10 +75,27 @@ max_slots = 2
 # queue is dark because this file has not caught up.
 
 [ruleset.match_caps]
-widescreen        = true  # vanilla: the wide view is a Mods package, and v1 is vanilla only
-widescreen_hud    = true  # MUST be explicit — this key defaults to TRUE when absent,
-                           # which would anchor the HUD wide inside a 4:3 frame
-ws_extra          = 0      # margin in pixels per side; 0 is the "do not patch" signal
+# WIDESCREEN, at the CI pin.
+#
+# 43 is the project's own number rather than one invented here:
+# SNESRECOMP_WS_EXTRA=43 is what the widescreen probes and the P16 gate run
+# against, giving a 342-wide frame — ceil_even(256 * 4/3), the 16:9 margin.
+# Any other value would make automatch matches a geometry nothing else in the
+# project has ever measured.
+#
+# The margin MUST come from here rather than from each client, because a
+# client derives it from its own WINDOW aspect. Two players on different
+# monitors compute different margins, their published caps disagree, and the
+# sprite-bounds patch declines on both — leaving a wide frame with 4:3 sprite
+# bounds. The server naming one number is what makes the two sims identical.
+#
+# `widescreen = true` with `ws_extra = 0` is the one combination to avoid: it
+# says "run wide" and then declines to say how wide, which is precisely the
+# disagreement the client logs as "[ws-patch] netplay caps disagree".
+widescreen        = true
+widescreen_hud    = true   # always written out: absent, this key defaults to
+                           # TRUE, so spelling it is the only way false is real
+ws_extra          = 43     # margin in pixels per side (256 + 2*43 = 342)
 ignore_aspect     = false
 rollback          = true   # the SFU path every online match runs
 input_delay       = 2      # frames; the client clamps to 2..20
