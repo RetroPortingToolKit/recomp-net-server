@@ -62,8 +62,8 @@ max_slots = 2
 # queue is dark because this file has not caught up.
 
 [ruleset.match_caps]
-widescreen        = false  # vanilla: the wide view is a Mods package, and v1 is vanilla only
-widescreen_hud    = false  # MUST be explicit — this key defaults to TRUE when absent,
+widescreen        = true  # vanilla: the wide view is a Mods package, and v1 is vanilla only
+widescreen_hud    = true  # MUST be explicit — this key defaults to TRUE when absent,
                            # which would anchor the HUD wide inside a 4:3 frame
 ws_extra          = 0      # margin in pixels per side; 0 is the "do not patch" signal
 ignore_aspect     = false
