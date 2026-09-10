@@ -225,6 +225,18 @@ pub fn describe() {
         "Successful WebSocket lobby creates"
     );
     describe_counter!(
+        "recomp_automatch_queued_total",
+        "Automatch tickets accepted into the queue"
+    );
+    describe_counter!(
+        "recomp_automatch_pairs_total",
+        "Automatch pairs offered at the accept gate"
+    );
+    describe_counter!(
+        "recomp_automatch_dodges_total",
+        "Automatch accept-gate declines and timeouts"
+    );
+    describe_counter!(
         "recomp_ws_lobby_joins_total",
         "WebSocket lobby join attempts by result"
     );
@@ -326,6 +338,23 @@ pub fn ws_disconnected() {
 pub fn ws_lobby_created() {
     bump(&WS_LOBBY_CREATES);
     counter!("recomp_ws_lobby_creates_total").increment(1);
+}
+
+/* ---- automatch ----------------------------------------------------------
+ * Labelled by nothing. Queue depth and dodges are about how the feature is
+ * going, not about who is playing: a per-player label here would be the one
+ * place this server put an identity into a metric. */
+
+pub fn automatch_queued() {
+    counter!("recomp_automatch_queued_total").increment(1);
+}
+
+pub fn automatch_paired() {
+    counter!("recomp_automatch_pairs_total").increment(1);
+}
+
+pub fn automatch_dodge() {
+    counter!("recomp_automatch_dodges_total").increment(1);
 }
 
 pub fn ws_lobby_join_ok() {

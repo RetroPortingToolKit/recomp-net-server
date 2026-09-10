@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,48 @@ const MIN_PACKET: usize = 14; // magic(4)+type(2)+session(4)+body(≥0)+checksum
 const HEADER_LEN: usize = 10;
 const RNET_PKT_START: u16 = 3;
 const RNET_PKT_DELAY_SYNC: u16 = 5;
+/// Latency probe, well clear of the session protocol's 1..7 so the two can
+/// grow without meeting. A probe carries no session and binds no seat: it is
+/// answered before the session lookup precisely so a client can measure the
+/// path BEFORE it has a match to measure it with.
+const RNET_PKT_PROBE: u16 = 200;
+const RNET_PKT_PROBE_ACK: u16 = 201;
+/// A probe is exactly the header plus a four-byte nonce, and the reply is the
+/// same bytes with the type changed.
+///
+/// Same size in and out, so this is not an amplifier. It is still a
+/// reflector -- anything that answers UDP is -- so the size is exact rather
+/// than a maximum, and `PROBE_RATE` bounds what one spoofed source can aim at
+/// a victim. Both together make the reflection worth less than the bandwidth
+/// of sending it.
+const PROBE_LEN: usize = 14;
+/// Probe replies per source address per second.
+const PROBE_RATE: u32 = 8;
+
+/// Per-source probe budget. Bounded by construction: the map is cleared
+/// wholesale each window rather than aged per entry, so a flood from many
+/// spoofed sources costs one second of memory and no scan.
+#[derive(Default)]
+struct ProbeLimiter {
+    window: Option<Instant>,
+    seen: HashMap<IpAddr, u32>,
+}
+
+impl ProbeLimiter {
+    fn allow(&mut self, src: IpAddr) -> bool {
+        let now = Instant::now();
+        match self.window {
+            Some(w) if now.duration_since(w) < Duration::from_secs(1) => {}
+            _ => {
+                self.window = Some(now);
+                self.seen.clear();
+            }
+        }
+        let n = self.seen.entry(src).or_insert(0);
+        *n += 1;
+        *n <= PROBE_RATE
+    }
+}
 const SESSION_IDLE: Duration = Duration::from_secs(120);
 /// Recent UDP + at least two bound seats ⇒ pads are actually flowing.
 const SESSION_ACTIVE: Duration = Duration::from_secs(5);
@@ -338,6 +380,7 @@ async fn recv_loop(
     fallback_source: Option<Ipv4Addr>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 2048];
+    let mut limiter = ProbeLimiter::default();
     loop {
         let RecvSas {
             n,
@@ -362,6 +405,27 @@ async fn recv_loop(
         let Some(session_id) = read_u32_le(pkt, 6) else {
             continue;
         };
+
+        /* Answered here -- before the session lookup, before any binding --
+         * because the whole point is to measure the path while the client is
+         * sitting in the automatch queue with no session to belong to. */
+        if pkt_type == RNET_PKT_PROBE {
+            if n != PROBE_LEN {
+                metrics::input_relay_drop("probe_size");
+                continue;
+            }
+            if !limiter.allow(src.ip()) {
+                metrics::input_relay_drop("probe_rate");
+                continue;
+            }
+            let mut reply = [0u8; PROBE_LEN];
+            reply.copy_from_slice(&pkt[..PROBE_LEN]);
+            reply[4..6].copy_from_slice(&RNET_PKT_PROBE_ACK.to_le_bytes());
+            if let Err(e) = send_one(&sock, &reply, src, local_dst).await {
+                debug!(%src, error = %e, "probe reply failed");
+            }
+            continue;
+        }
 
         // Collect fan-out targets under the lock, then send without holding it.
         let targets: Vec<SlotBinding> = {

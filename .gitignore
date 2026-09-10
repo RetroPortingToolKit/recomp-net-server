@@ -24,6 +24,11 @@ data/*
 !data/ip_country.bin
 # The chat filter word list is source (include_str! at build), not data.
 !data/chat_filter_words.txt
+# The automatch ruleset EXAMPLE is documentation, not data. A deployment's real
+# `data/automatch_rulesets.toml` stays ignored by the line above -- which is
+# right: it is that operator's queue configuration, and committing one would
+# turn automatch on for everybody who cloned this.
+!data/automatch_rulesets.example.toml
 
 # Rust
 /target/

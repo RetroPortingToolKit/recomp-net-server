@@ -250,24 +250,24 @@ pub async fn complete(
         ])
         .send()
         .await
-        .context("discord token exchange")?
+        .context("discord_unreachable: token exchange")?
         .error_for_status()
-        .context("discord rejected the code")?
+        .context("discord_rejected_code: check DISCORD_CLIENT_SECRET and that DISCORD_REDIRECT_URL matches the portal exactly")?
         .json()
         .await
-        .context("discord token response")?;
+        .context("discord_bad_token_response")?;
 
     let me: MeResponse = http
         .get(format!("{DISCORD_API}/users/@me"))
         .bearer_auth(&token.access_token)
         .send()
         .await
-        .context("discord users/@me")?
+        .context("discord_unreachable: users/@me")?
         .error_for_status()
-        .context("discord refused the profile")?
+        .context("discord_refused_profile")?
         .json()
         .await
-        .context("discord profile response")?;
+        .context("discord_bad_profile_response")?;
 
     /* Guild gating, when configured. This is the lever that makes a Discord
      * ban a netplay ban: someone removed from the server stops passing here on
@@ -290,12 +290,16 @@ pub async fn complete(
         global_name: me.global_name,
         avatar: me.avatar,
     };
-    let player = identity::link_discord(pool, &profile).await?;
+    let player = identity::link_discord(pool, &profile)
+        .await
+        .context("database: linking the Discord account")?;
     let session = crate::auth::issue_session_token(cfg, &player.id)
-        .map_err(|e| anyhow!("session token: {e}"))?;
+        .map_err(|e| anyhow!("session_signing: {e} -- set JWT_SECRET_CURRENT; a Discord login cannot be completed without it"))?;
     /* One key per sign-in, i.e. per device: this login happened on some
      * machine, and that machine is what the key belongs to. */
-    let netplay_secret = crate::secrets::issue(pool, &player.id, "").await?;
+    let netplay_secret = crate::secrets::issue(pool, &player.id, "")
+        .await
+        .context("database: issuing the device key")?;
 
     Ok(Completed {
         session,

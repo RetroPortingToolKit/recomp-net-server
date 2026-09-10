@@ -1,7 +1,7 @@
 # recomp-net-server
 
 Open-source lobby / signaling control plane for hosts that use the
-[`recomp-net`](https://github.com/TechnicallyComputers/recomp-net) delay-sync
+[`recomp-net`](https://github.com/RetroPortingToolKit/recomp-net) delay-sync
 library. Run your own matchmaking server, or point clients at a community
 instance.
 

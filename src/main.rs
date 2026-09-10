@@ -272,7 +272,17 @@ async fn main() -> anyhow::Result<()> {
         config.chat_filter_extra_path.as_deref(),
     );
 
+    /* Loaded once. There is no reload: a ruleset change means a restart, and
+     * a restart is cheap next to a queue that half the pool is holding
+     * different settings for. */
+    let automatch_rulesets = std::sync::Arc::new(
+        recomp_net_server::automatch::Rulesets::load(&config.automatch_rulesets_path),
+    );
+    let automatch_on = !automatch_rulesets.is_empty();
+
     let state = AppState {
+        automatch_rulesets,
+        automatch: recomp_net_server::automatch::Queue::default(),
         discord_logins: recomp_net_server::discord_auth::LoginStore::default(),
         discord_challenges: recomp_net_server::discord_auth::ChallengeStore::default(),
         http: reqwest::Client::builder()
@@ -303,6 +313,30 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    /* The queue driver: lapse dead offers, pair, push status. Spawned only
+     * when automatch is actually on -- a 1 Hz task that can never have work
+     * is a thing to explain in every log somebody reads. */
+    if automatch_on {
+        let am = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                recomp_net_server::ws_lobby::automatch_tick(&am).await;
+            }
+        });
+    }
+
+    /* Automatch history prunes itself, starting now and then daily. Spawned
+     * unconditionally: the tables exist whether or not this deployment runs
+     * automatch, and a server that used it and then turned it off still owes
+     * the rows a sweep. */
+    recomp_net_server::automatch::spawn_sweep(
+        pool.clone(),
+        config.automatch_retention_days,
+        config.automatch_rematch_cooldown_secs,
+    );
+
     let turn_configured =
         recomp_net_server::turn_credentials::TurnCredentialConfig::from_env().is_some();
 
@@ -316,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_configured = config.jwt_secret_current.is_some(),
         database = %db_url,
         turn_configured,
+        automatch = automatch_on,
         input_relay = config.input_relay_enabled,
         input_relay_bind = %config.input_relay_bind,
         input_relay_advertise = %format!(

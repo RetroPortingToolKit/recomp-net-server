@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod automatch;
 pub mod chat_filter;
 pub mod config;
 pub mod discord_auth;
@@ -45,6 +46,10 @@ pub struct AppState {
     pub discord_challenges: discord_auth::ChallengeStore,
     /// Shared outbound HTTP client for the Discord API.
     pub http: reqwest::Client,
+    /// Automatch queue types, loaded once at startup. Empty = automatch off.
+    pub automatch_rulesets: Arc<automatch::Rulesets>,
+    /// Tickets waiting and pairs on offer.
+    pub automatch: automatch::Queue,
     /// When true (CLI `--debug`): HTTP trace layer + verbose lobby logs.
     pub debug: bool,
 }

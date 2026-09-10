@@ -1,0 +1,47 @@
+# Automatch queue types. Copy to `automatch_rulesets.toml` (or point
+# AUTOMATCH_RULESETS_PATH at it) to turn automatch on for this deployment.
+#
+# There is no enable flag: automatch is on when this file loads at least one
+# usable ruleset and off when it does not.
+#
+# The server writes `match_caps` from these, so a ruleset IS the settings the
+# whole match runs -- both players agreed to them by queueing here. Refused at
+# load, loudly, with the server still starting: a `mods` key (v1 is vanilla
+# only), a `max_slots` other than 2, a duplicate (game_name, id), or caps that
+# are not a table / serialize over 4096 bytes.
+
+[[ruleset]]
+id        = "standard"
+label     = "Standard"
+game_name = "Star Wars: Masters of Teras Kasi"
+# Optional pin. Set it and only this release may queue here; omit it and any
+# release may, as long as both players are on the SAME one (the match key is
+# an equality bucket either way).
+game_version = "1.2.0"
+max_slots = 2
+
+[ruleset.match_caps]
+v                = 1
+input_delay      = 2
+rollback         = true
+input_prediction = 6
+turbo_loads      = true
+bios_hle         = true
+fast_boot        = false
+auto_skip_fmv    = false
+language         = "en"
+
+# A second queue type for the same title. Players pick between them; the two
+# pools are separate, which is the cost of offering the choice.
+[[ruleset]]
+id        = "classic"
+label     = "Classic (delay only)"
+game_name = "Star Wars: Masters of Teras Kasi"
+max_slots = 2
+
+[ruleset.match_caps]
+v           = 1
+input_delay = 4
+rollback    = false
+turbo_loads = true
+language    = "en"

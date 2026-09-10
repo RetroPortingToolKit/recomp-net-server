@@ -250,10 +250,22 @@ async fn discord_callback(
             "Not a member",
             "This server is for members of our Discord only. Join it, then sign in again.",
         ),
-        Err(_) => page(
-            "Login failed",
-            "Something went wrong signing you in. Close this window and try again.",
-        ),
+        Err(e) => {
+            /* The operator needs the whole chain, and gets it in the log. The
+             * player gets the short code in front of it, which is enough to
+             * quote in a bug report and gives away nothing. A login that fails
+             * with neither is the hardest kind of problem to act on -- this
+             * one reached "Something went wrong" with no log line at all. */
+            tracing::warn!(error = %e, "discord login failed");
+            let code = e.split(':').next().unwrap_or("unknown");
+            page(
+                "Login failed",
+                &format!(
+                    "Sign-in could not be completed ({}). Close this window and                      try again — if it keeps happening, the server operator can                      see the reason in the lobby server log.",
+                    html_escape(code)
+                ),
+            )
+        }
     }
 }
 

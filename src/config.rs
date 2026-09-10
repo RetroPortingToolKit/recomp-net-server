@@ -104,6 +104,32 @@ pub struct Config {
     /// Optional file of extra chat-filter entries (same format as the
     /// built-in list), appended at startup. `CHAT_FILTER_EXTRA_PATH`.
     pub chat_filter_extra_path: Option<String>,
+    /// `AUTOMATCH_RETENTION_DAYS`. How long the two automatch tables keep
+    /// history. `0` means "prune a row once it stops affecting a decision",
+    /// which is a floor, not a purge -- see `automatch::cutoff_secs`.
+    ///
+    /// It has a dial because `automatch_pairings` records who played whom,
+    /// and keeping that forever should be a deliberate choice rather than an
+    /// inherited default (`docs/PRIVACY.md`).
+    pub automatch_retention_days: u64,
+    /// `AUTOMATCH_REMATCH_COOLDOWN_SECS`. How long the pairing loop prefers a
+    /// different opponent. Also the floor under the pairings table's prune:
+    /// a row inside this window is still steering matches and must not be
+    /// deleted for being old.
+    pub automatch_rematch_cooldown_secs: u64,
+    /// `AUTOMATCH_RULESETS_PATH`. Absent or unusable = automatch off. There is
+    /// no separate enable flag: one place to look, and no state where a flag
+    /// and the config disagree.
+    pub automatch_rulesets_path: String,
+    /// `AUTOMATCH_QUEUE_MAX`, `AUTOMATCH_ACCEPT_SECS`,
+    /// `AUTOMATCH_START_DELAY_SECS`.
+    pub automatch_queue_max: usize,
+    pub automatch_accept_secs: u64,
+    pub automatch_start_delay_secs: u64,
+    /// `AUTOMATCH_DODGE_COOLDOWNS`, seconds, by strikes in the last 24 h.
+    /// Empty means dodges are recorded but cost nothing -- a deployment may
+    /// want the record before it wants the penalty.
+    pub automatch_dodge_cooldowns: Vec<u64>,
 }
 
 impl Config {
@@ -131,12 +157,70 @@ impl Config {
             Ok(v) if !v.trim().is_empty() => parse_bool_env(&v),
             _ => true,
         };
+        /* Retention has a default rather than being required, but the
+         * default is a real answer (30 days) instead of "forever". */
+        let automatch_retention_days = parse_u64_env("AUTOMATCH_RETENTION_DAYS", 30);
+        let automatch_rematch_cooldown_secs =
+            parse_u64_env("AUTOMATCH_REMATCH_COOLDOWN_SECS", 300);
+        let automatch_rulesets_path = env::var("AUTOMATCH_RULESETS_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "data/automatch_rulesets.toml".to_string());
+        let automatch_queue_max = parse_u64_env("AUTOMATCH_QUEUE_MAX", 256) as usize;
+        let automatch_accept_secs = parse_u64_env("AUTOMATCH_ACCEPT_SECS", 15).max(5);
+        let automatch_start_delay_secs = parse_u64_env("AUTOMATCH_START_DELAY_SECS", 3);
+        /* A malformed ladder degrades to "no penalty", not to a default
+         * somebody did not ask for: the operator said something about
+         * cooldowns and guessing over them is worse than charging nothing. */
+        let automatch_dodge_cooldowns = match env::var("AUTOMATCH_DODGE_COOLDOWNS") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .filter_map(|t| t.trim().parse::<u64>().ok())
+                .collect(),
+            _ => vec![60, 300, 900],
+        };
+
         let jwt_secret_current = env::var("JWT_SECRET_CURRENT")
             .ok()
             .filter(|s| !s.is_empty());
         let jwt_secret_previous = env::var("JWT_SECRET_PREVIOUS")
             .ok()
             .filter(|s| !s.is_empty());
+
+        /* Discord login has three env vars of its own AND needs the JWT key,
+         * because the last thing a successful login does is mint a session.
+         * Say so at startup, not at the end of a player's sign-in: an
+         * incomplete setup here otherwise surfaces as "Login failed" after
+         * the player has already authorised in their browser, which points
+         * at nothing.
+         *
+         * Warned, not fatal. The rest of the server -- LAN, guest play, the
+         * lobby list -- works perfectly without Discord, and refusing to boot
+         * would take working netplay down over an optional feature. */
+        if discord_client_id.is_some()
+            || discord_client_secret.is_some()
+            || discord_redirect_url.is_some()
+        {
+            let mut missing: Vec<&str> = Vec::new();
+            if discord_client_id.is_none() {
+                missing.push("DISCORD_CLIENT_ID");
+            }
+            if discord_client_secret.is_none() {
+                missing.push("DISCORD_CLIENT_SECRET");
+            }
+            if discord_redirect_url.is_none() {
+                missing.push("DISCORD_REDIRECT_URL");
+            }
+            if jwt_secret_current.is_none() {
+                missing.push("JWT_SECRET_CURRENT");
+            }
+            if !missing.is_empty() {
+                tracing::warn!(
+                    missing = missing.join(", "),
+                    "Discord login is partly configured and cannot complete a sign-in. Players will reach 'Login failed' after authorising in their browser. Set the listed variables, or unset every DISCORD_* variable to turn sign-in off cleanly."
+                );
+            }
+        }
 
         if require_auth && jwt_secret_current.is_none() {
             bail!(
@@ -238,6 +322,13 @@ impl Config {
             discord_guild_id,
             guest_can_chat,
             guest_can_host,
+            automatch_retention_days,
+            automatch_rematch_cooldown_secs,
+            automatch_rulesets_path,
+            automatch_queue_max,
+            automatch_accept_secs,
+            automatch_start_delay_secs,
+            automatch_dodge_cooldowns,
             jwt_secret_current,
             jwt_secret_previous,
             default_input_delay,

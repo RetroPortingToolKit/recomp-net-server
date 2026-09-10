@@ -107,6 +107,11 @@ struct Lobby {
     relay_session_id: Option<u32>,
     /// True after a successful `start` until the lobby is destroyed.
     started: bool,
+    /// Built by the server for a matched pair. Its host is a sentinel nobody
+    /// holds, so it has no host to inherit a departure and no business in the
+    /// browser -- both of which need saying rather than inferring from an
+    /// empty `host_player_id`.
+    automatch: bool,
 }
 
 struct ClientMeta {
@@ -131,6 +136,10 @@ struct ClientMeta {
     lobby_id: Option<String>,
     /// Password-ok join waiting on missing mods (not seated).
     pending_mod_lobby: Option<String>,
+    /// Round trip to the relay, as this client measured it with a UDP probe;
+    /// -1 until it reports one. Kept on the CONNECTION, not the ticket, so a
+    /// client that probes before it queues does not have to probe again.
+    probe_rtt_ms: i32,
     tx: broadcast::Sender<String>,
 }
 
@@ -408,6 +417,42 @@ struct InMsg {
     path: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    /* ---- automatch ---- */
+    /// Titles this ticket will accept, in the client's preference order. A
+    /// launcher that knows one game sends one entry; the server must not
+    /// assume that.
+    #[serde(default)]
+    titles: Option<Vec<InTitle>>,
+    /// Which queue, when the client already picked one.
+    #[serde(default)]
+    ruleset_id: Option<String>,
+    /// The client asserting it will boot vanilla. The server cannot check
+    /// this and does not pretend to -- it exists so a modified client is
+    /// making a false statement rather than exploiting an omission.
+    #[serde(default)]
+    mods_enabled: Option<bool>,
+    /// Echoed on `automatch_accept` so a late answer to a lapsed offer is
+    /// recognisably late rather than applied to the next one.
+    #[serde(default)]
+    match_id: Option<String>,
+    /// Round trip to the relay in milliseconds, measured by the client with a
+    /// UDP probe. Accepted on `automatch_rtt` and on `automatch_queue`.
+    #[serde(default)]
+    rtt_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InTitle {
+    #[serde(default)]
+    game_name: String,
+    #[serde(default)]
+    game_version: String,
+    #[serde(default)]
+    disc_fp: String,
+    #[serde(default)]
+    ruleset_id: String,
+    #[serde(default)]
+    max_slots: Option<usize>,
 }
 
 /* ---- client-supplied display strings ------------------------------------
@@ -708,6 +753,13 @@ fn lobby_list_json_filtered(
         .lobbies
         .values()
         .filter(|l| {
+            /* An automatch room is not joinable and must not be shopped for.
+             * It is only created at both-accept, so it never exists while
+             * unjoinable -- this is the belt to that braces, so a future
+             * rematch hold cannot leak one into the browser. */
+            if l.automatch {
+                return false;
+            }
             if let Some(g) = filter_game {
                 if !g.is_empty() && l.game_name != g {
                     return false;
@@ -1075,7 +1127,11 @@ async fn client_leave(state: &AppState, player_id: &str) {
         let Some(lobby) = g.lobbies.get(&lid) else {
             return;
         };
-        if lobby.host_player_id == player_id {
+        /* An automatch room's host is a sentinel, so nobody's departure is
+         * the host's. Left alone it would survive as a one-seat room forever;
+         * it dies when it can no longer be a match. */
+        let automatch_emptied = lobby.automatch && player_count(lobby) <= 2;
+        if lobby.host_player_id == player_id || automatch_emptied {
             Some((lid, true, String::new()))
         } else {
             let name = lobby
@@ -1127,6 +1183,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 game_name: String::new(),
                 lobby_id: None,
                 pending_mod_lobby: None,
+                probe_rtt_ms: -1,
                 tx: tx.clone(),
             },
         );
@@ -1186,6 +1243,14 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
 
     send_task.abort();
     tick_task.abort();
+    /* A ticket must not outlive its socket. Left behind it would block that
+     * ACCOUNT from ever queueing again (one ticket per account) and would keep
+     * being offered matches nobody is listening for. A pair already on offer
+     * settles as a dodge: the other player is sitting in front of a countdown
+     * either way, and closing the window is not a cheaper way to decline. */
+    if let Some(p) = state.automatch.remove_player(&player_id).await {
+        settle_declined(&state, &p, &player_id, "timeout").await;
+    }
     client_leave(&state, &player_id).await;
     {
         let mut g = hub.inner.lock().await;
@@ -1341,6 +1406,11 @@ async fn handle_text(
         "mod_xfer_cancel" => handle_mod_xfer_cancel(hub, player_id).await?,
         "mod_xfer_fail" => handle_mod_xfer_fail(hub, player_id, msg).await?,
         "get_turn_credentials" => handle_get_turn_credentials(hub, player_id).await?,
+        "automatch_rulesets" => handle_automatch_rulesets(state, player_id, msg).await?,
+        "automatch_queue" => handle_automatch_queue(state, player_id, msg).await?,
+        "automatch_cancel" => handle_automatch_cancel(state, player_id).await?,
+        "automatch_rtt" => handle_automatch_rtt(state, player_id, msg).await?,
+        "automatch_accept" => handle_automatch_accept(state, player_id, msg).await?,
         other => {
             send_to(
                 hub,
@@ -1709,6 +1779,7 @@ async fn handle_create(
                 match_caps: match_caps.clone(),
                 relay_session_id: None,
                 started: false,
+                automatch: false,
             },
         );
         if let Some(c) = g.clients.get_mut(player_id) {
@@ -2795,7 +2866,48 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
     Ok(())
 }
 
+/// `start` from a player: check they are the host, then run the shared path.
+///
+/// The check lives HERE and the work lives in `start_lobby`, because automatch
+/// rooms are started by the server and a second copy of the transport
+/// decision, the LAN-advertise heuristic and the launch broadcast is exactly
+/// how the two would drift apart.
 async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    let lid = {
+        let g = hub.inner.lock().await;
+        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
+            send_to(hub, player_id, am_err("not_in_lobby")).await;
+            return Ok(());
+        };
+        let Some(lobby) = g.lobbies.get(&lid) else {
+            send_to(hub, player_id, am_err("gone")).await;
+            return Ok(());
+        };
+        if lobby.host_player_id != player_id {
+            send_to(hub, player_id, am_err("not_host")).await;
+            return Ok(());
+        }
+        lid
+    };
+    if let Err(code) = start_lobby(state, &lid, msg.match_caps, Some(player_id)).await {
+        send_to(hub, player_id, am_err(code)).await;
+    }
+    Ok(())
+}
+
+/// Open the relay and launch a lobby.
+///
+/// `initiator` is the host that pressed Play, or None when the server is the
+/// host. Errors are RETURNED rather than sent: a server-started match has no
+/// player to address a `not_host` to, and the caller knows who (if anyone) is
+/// waiting on an answer.
+async fn start_lobby(
+    state: &AppState,
+    lid: &str,
+    raw_caps: Option<Value>,
+    initiator: Option<&str>,
+) -> Result<(), &'static str> {
     enum StartOut {
         Err(&'static str),
         Ok {
@@ -2805,20 +2917,15 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         },
     }
     let hub = &state.ws_lobby;
-    let fresh_caps = sanitize_match_caps(msg.match_caps);
+    let fresh_caps = sanitize_match_caps(raw_caps);
+    let lid = lid.to_string();
 
     // Phase 1: validate + allocate session_id (hold lobby lock briefly).
     let prepared = 'prep: {
         let mut g = hub.inner.lock().await;
-        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
-            break 'prep Err("not_in_lobby");
-        };
         let Some(lobby) = g.lobbies.get(&lid) else {
             break 'prep Err("gone");
         };
-        if lobby.host_player_id != player_id {
-            break 'prep Err("not_host");
-        }
         let n = player_count(lobby);
         if n < 2 {
             break 'prep Err("need_players");
@@ -2866,14 +2973,17 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
          * card sync, the start) keys on -- with its pad muted, and the player
          * seats shift up one session slot behind it. The relay therefore
          * needs one more forwarded slot, and the gallery starts one higher. */
-        let host_spectates = lobby.seat_of(player_id).is_some_and(is_spectator_seat);
+        /* Only a player can be in the gallery and still run the match. The
+         * server has no seat, so a server-started room never spectates. */
+        let host_spectates = initiator
+            .and_then(|p| lobby.seat_of(p))
+            .is_some_and(is_spectator_seat);
         let max_slots_for_relay = lobby.max_slots + usize::from(host_spectates);
         /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
         Ok((
-            lid,
             sid,
             n,
             spectators_n,
@@ -2887,7 +2997,6 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
     };
 
     let (
-        lid,
         sid,
         n,
         spectators_n,
@@ -2899,15 +3008,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         host_spectates,
     ) = match prepared {
         Ok(v) => v,
-        Err(code) => {
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": code, "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
+        Err(code) => return Err(code),
     };
 
     // Phase 2: open/close UDP relay outside the lobby lock.
@@ -2962,13 +3063,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             }
             Err(e) => {
                 warn!(error = %e, session_id = sid, "input relay open_session failed");
-                send_to(
-                    hub,
-                    player_id,
-                    json!({ "op": "error", "code": "relay_unavailable", "ok": false }).to_string(),
-                )
-                .await;
-                return Ok(());
+                return Err("relay_unavailable");
             }
         }
     } else {
@@ -3058,12 +3153,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             if let Some(ep_sid) = relay_endpoint.as_ref().map(|_| sid) {
                 state.input_relay.close_session(ep_sid).await;
             }
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": code, "ok": false }).to_string(),
-            )
-            .await;
+            return Err(code);
         }
         StartOut::Ok {
             msg,
@@ -3080,6 +3170,680 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         }
     }
     Ok(())
+}
+
+
+/* ===================== automatch ===================== */
+
+use crate::automatch::{self, MatchKey, Pending, Ticket};
+
+fn am_err(code: &str) -> String {
+    json!({ "op": "error", "code": code, "ok": false }).to_string()
+}
+
+/// Turn a client's ticket request into match keys, or say which gate refused.
+///
+/// Every gate here is one `join` would apply later. Refusing at queue time is
+/// the whole point: a pair that fails at seating has already spent both
+/// players' accept-gate attention.
+fn build_keys(
+    rulesets: &automatch::Rulesets,
+    titles: &[InTitle],
+) -> Result<Vec<MatchKey>, &'static str> {
+    let mut keys = Vec::new();
+    let mut first_err: Option<&'static str> = None;
+    for t in titles {
+        let game_name = t.game_name.trim();
+        if game_name.is_empty() {
+            first_err.get_or_insert("unknown_ruleset");
+            continue;
+        }
+        let Some(rs) = rulesets.resolve(game_name, t.ruleset_id.trim()) else {
+            first_err.get_or_insert("unknown_ruleset");
+            continue;
+        };
+        /* A wildcard fingerprint is fine for a human picking a room out of a
+         * list; in a queue it silently pairs a Track-01-only dump against a
+         * full multi-track cue, which is the case the fingerprint exists to
+         * catch. */
+        let disc_fp = normalize_disc_fp(Some(t.disc_fp.clone()));
+        if disc_fp.is_empty() {
+            first_err.get_or_insert("need_disc_fp");
+            continue;
+        }
+        let game_version = normalize_game_version(Some(t.game_version.clone()));
+        if !rs.game_version.is_empty() && rs.game_version != game_version {
+            first_err.get_or_insert("version_not_pooled");
+            continue;
+        }
+        if t.max_slots.unwrap_or(2) != 2 {
+            first_err.get_or_insert("slots_not_pooled");
+            continue;
+        }
+        let key = MatchKey {
+            game_name: game_name.to_string(),
+            game_version,
+            disc_fp,
+            ruleset_id: rs.id.clone(),
+            max_slots: rs.max_slots,
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(first_err.unwrap_or("unknown_ruleset"));
+    }
+    Ok(keys)
+}
+
+async fn handle_automatch_rulesets(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    let game = match msg.game_name.filter(|g| !g.is_empty()) {
+        Some(g) => g,
+        None => {
+            let g = hub.inner.lock().await;
+            g.clients.get(player_id).map(|c| c.game_name.clone()).unwrap_or_default()
+        }
+    };
+    let mut payload = automatch::rulesets_json(&state.automatch_rulesets, &game);
+    /* Here as well as on `automatch_queued`, because THIS is the message a
+     * launcher reads before it draws the queue button -- probing now means
+     * the ticket carries a measurement from its first millisecond. */
+    payload["probe"] = json!({
+        "endpoint": state.input_relay.advertise_endpoint(),
+        "magic": state.config.protocol_magic,
+        "type": automatch::PROBE_PKT_TYPE,
+    });
+    let payload = payload.to_string();
+    send_to(hub, player_id, payload).await;
+    Ok(())
+}
+
+async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    if state.automatch_rulesets.is_empty() {
+        send_to(hub, player_id, am_err("automatch_off")).await;
+        return Ok(());
+    }
+
+    /* The account, not the connection. Automatch is the one surface that
+     * requires a sign-in, because the accept gate's cost has to survive a
+     * reconnect and a `Uuid::new_v4()` per socket does not. */
+    let (account, handle, username, country, in_lobby, known_rtt) = {
+        let g = hub.inner.lock().await;
+        let Some(c) = g.clients.get(player_id) else {
+            return Ok(());
+        };
+        (
+            c.account.as_ref().map(|a| a.id.to_string()),
+            c.account.as_ref().map(|a| a.handle.clone()).unwrap_or_else(|| c.display_name.clone()),
+            c.account.as_ref().map(|a| a.discord_username.clone()).unwrap_or_default(),
+            c.country.clone(),
+            c.lobby_id.is_some(),
+            c.probe_rtt_ms,
+        )
+    };
+    let Some(account_id) = account else {
+        send_to(hub, player_id, am_err("need_account")).await;
+        return Ok(());
+    };
+    if in_lobby {
+        send_to(hub, player_id, am_err("already_in_lobby")).await;
+        return Ok(());
+    }
+    /* Per ACCOUNT, not per connection: two clients on one login must not get
+     * two rolls of the dice. */
+    if state.automatch.is_queued_account(&account_id).await {
+        send_to(hub, player_id, am_err("already_queued")).await;
+        return Ok(());
+    }
+    if msg.mods_enabled.unwrap_or(false) {
+        send_to(hub, player_id, am_err("mods_not_pooled")).await;
+        return Ok(());
+    }
+
+    let titles = msg.titles.clone().unwrap_or_default();
+    /* A client that named no titles but did name a ruleset is the
+     * single-title launcher; build the one entry it meant. */
+    let titles = if titles.is_empty() {
+        let g = hub.inner.lock().await;
+        let game = g.clients.get(player_id).map(|c| c.game_name.clone()).unwrap_or_default();
+        drop(g);
+        vec![InTitle {
+            game_name: game,
+            game_version: msg.game_version.clone().unwrap_or_default(),
+            disc_fp: msg.disc_fp.clone().unwrap_or_default(),
+            ruleset_id: msg.ruleset_id.clone().unwrap_or_default(),
+            max_slots: None,
+        }]
+    } else {
+        titles
+    };
+
+    let keys = match build_keys(&state.automatch_rulesets, &titles) {
+        Ok(k) => k,
+        Err(code) => {
+            send_to(hub, player_id, am_err(code)).await;
+            return Ok(());
+        }
+    };
+
+    let cool = automatch::cooldown_secs(
+        &state.pool,
+        &account_id,
+        &state.config.automatch_dodge_cooldowns,
+    )
+    .await;
+    if cool > 0 {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": "cooldown", "ok": false, "retry_secs": cool })
+                .to_string(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    if state.automatch.waiting().await >= state.config.automatch_queue_max {
+        send_to(hub, player_id, am_err("queue_full")).await;
+        return Ok(());
+    }
+
+    let ticket = Ticket {
+        player_id: player_id.to_string(),
+        account_id: account_id.clone(),
+        handle,
+        username,
+        country,
+        keys: keys.clone(),
+        host_bind: msg.host_bind.clone().unwrap_or_else(|| "0.0.0.0:7777".into()),
+        guest_bind: msg.guest_bind.clone().unwrap_or_else(|| "0.0.0.0:7778".into()),
+        queued_at: std::time::Instant::now(),
+        /* A value on the queue message wins over whatever the connection
+         * already had -- it is the fresher measurement. Still -1 when the
+         * client has not probed, and the pairing filter passes on unknown
+         * rather than refusing every pair over a number nobody took. */
+        rtt_ms: match msg.rtt_ms {
+            Some(v) => automatch::sanitize_rtt(v),
+            None => known_rtt,
+        },
+    };
+    state.automatch.push(ticket).await;
+
+    let mut rows = Vec::new();
+    for k in &keys {
+        rows.push(json!({
+            "game_name": k.game_name,
+            "ruleset_id": k.ruleset_id,
+            "pool": state.automatch.pool_for(k, &account_id).await,
+        }));
+    }
+    /* Where to probe, and with what. A client that has not measured yet gets
+     * the address in the same breath as being told it is queued, so the first
+     * `automatch_rtt` can arrive seconds later and still qualify the pair. */
+    send_to(
+        hub,
+        player_id,
+        json!({
+            "op": "automatch_queued", "ok": true, "titles": rows,
+            "probe": {
+                "endpoint": state.input_relay.advertise_endpoint(),
+                "magic": state.config.protocol_magic,
+                "type": automatch::PROBE_PKT_TYPE,
+            },
+        })
+        .to_string(),
+    )
+    .await;
+    info!(%player_id, keys = keys.len(), "automatch queued");
+    metrics::automatch_queued();
+    /* Pair now rather than at the next tick: with two people waiting, a
+     * one-second delay is the whole experience. */
+    run_pairing(state).await;
+    Ok(())
+}
+
+/// A client reporting what its UDP probe measured.
+///
+/// Sendable any time: before queueing (it lands on the connection and the next
+/// ticket inherits it) or while queued (it updates the waiting ticket, so a
+/// client can re-probe as conditions change).
+async fn handle_automatch_rtt(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    let rtt = automatch::sanitize_rtt(msg.rtt_ms.unwrap_or(-1));
+    {
+        let mut g = hub.inner.lock().await;
+        if let Some(c) = g.clients.get_mut(player_id) {
+            c.probe_rtt_ms = rtt;
+        }
+    }
+    state.automatch.set_rtt(player_id, rtt).await;
+    send_to(
+        hub,
+        player_id,
+        json!({ "op": "automatch_rtt_ok", "ok": true, "rtt_ms": rtt }).to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+async fn handle_automatch_cancel(state: &AppState, player_id: &str) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    /* Leaving while a pair is on offer IS a decline: the other side is
+     * sitting in front of a countdown either way. */
+    if let Some(p) = state.automatch.remove_player(player_id).await {
+        settle_declined(state, &p, player_id, "timeout").await;
+    }
+    send_to(
+        hub,
+        player_id,
+        json!({ "op": "automatch_cancelled", "ok": true, "reason": "cancelled" }).to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+async fn handle_automatch_accept(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    let accept = msg.accept.unwrap_or(false);
+    send_to(
+        hub,
+        player_id,
+        json!({ "op": "automatch_accept_ok", "ok": true, "accept": accept }).to_string(),
+    )
+    .await;
+
+    let Some(p) = state.automatch.answer(player_id, accept).await else {
+        /* Either not our offer, or the peer has not answered yet. Both are
+         * ordinary; the accept_ok above already told the client we heard. */
+        return Ok(());
+    };
+    if p.both_yes() {
+        form_match(state, p).await;
+    } else {
+        let decliner = if p.a_accept == Some(false) { &p.a } else { &p.b };
+        settle_declined(state, &p, &decliner.player_id.clone(), "decline").await;
+    }
+    Ok(())
+}
+
+/// One side said no (or vanished). Charge them, and put the other side back at
+/// the front of the queue.
+async fn settle_declined(state: &AppState, p: &Pending, loser_player_id: &str, kind: &str) {
+    let hub = &state.ws_lobby;
+    let (loser, other) = if p.a.player_id == loser_player_id {
+        (&p.a, &p.b)
+    } else {
+        (&p.b, &p.a)
+    };
+    automatch::record_strike(&state.pool, &loser.account_id, kind, &p.key.game_name).await;
+    metrics::automatch_dodge();
+    send_to(
+        hub,
+        &loser.player_id,
+        json!({
+            "op": "automatch_cancelled", "ok": true, "reason": "declined",
+            "cooldown_secs": automatch::cooldown_secs(
+                &state.pool, &loser.account_id, &state.config.automatch_dodge_cooldowns).await,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let reason = if kind == "decline" { "peer_declined" } else { "peer_timeout" };
+    /* Only requeue somebody who is still connected and still wants it. */
+    let still_here = {
+        let g = hub.inner.lock().await;
+        g.clients.contains_key(&other.player_id)
+    };
+    if still_here {
+        state.automatch.requeue_front(other.clone()).await;
+        send_to(
+            hub,
+            &other.player_id,
+            json!({ "op": "automatch_requeue", "ok": true, "reason": reason, "queued": true })
+                .to_string(),
+        )
+        .await;
+    }
+}
+
+/// Offer a formed pair to both sides.
+async fn offer_pair(state: &AppState, p: &Pending) {
+    let hub = &state.ws_lobby;
+    let rs = state
+        .automatch_rulesets
+        .resolve(&p.key.game_name, &p.key.ruleset_id);
+    let label = rs.map(|r| r.label.clone()).unwrap_or_default();
+    let est = if p.a.rtt_ms >= 0 && p.b.rtt_ms >= 0 {
+        p.a.rtt_ms + p.b.rtt_ms
+    } else {
+        -1
+    };
+    /* The caps this match will actually run, floor included. Computed here so
+     * the accept gate shows the delay the player is agreeing to rather than
+     * the ruleset's advertised one -- being told "delay 2" and then playing
+     * at 6 is the kind of surprise that reads as a bug. */
+    let (caps, floor) = match rs {
+        Some(r) => {
+            let f = automatch::delay_floor(&r.match_caps, p.a.rtt_ms, p.b.rtt_ms, r.frame_ms);
+            (Some(automatch::caps_with_floor(&r.match_caps, f)), Some(f))
+        }
+        None => (None, None),
+    };
+    automatch::record_pairing(
+        &state.pool,
+        &p.match_id,
+        &p.key,
+        &p.a.account_id,
+        &p.b.account_id,
+        est,
+    )
+    .await;
+    state.automatch.note_pairing(&p.a.account_id, &p.b.account_id).await;
+
+    for (me, them) in [(&p.a, &p.b), (&p.b, &p.a)] {
+        let mut m = json!({
+            "op": "automatch_found",
+            "ok": true,
+            "match_id": p.match_id,
+            "game_name": p.key.game_name,
+            "game_version": p.key.game_version,
+            "ruleset_id": p.key.ruleset_id,
+            "ruleset_label": label,
+            /* The opponent as the launcher draws them. The snowflake is NOT
+             * here and never is: the handle is what other players see, and
+             * the @username is only the disambiguator for two of them. */
+            "opponent": {
+                "handle": them.handle,
+                "discord_username": them.username,
+                "country": them.country,
+            },
+            "est_rtt_ms": est,
+            "accept_secs": state.config.automatch_accept_secs,
+        });
+        if let Some(f) = floor {
+            m["input_delay"] = json!(f.input_delay);
+            m["input_prediction"] = json!(f.input_prediction);
+            /* 0 means nothing was measured and the ruleset stands as written,
+             * which a launcher can say plainly instead of implying a floor it
+             * did not compute. */
+            m["frames_needed"] = json!(f.needed);
+        }
+        if let Some(c) = &caps {
+            m["match_caps"] = c.clone();
+        }
+        send_to(hub, &me.player_id, m.to_string()).await;
+    }
+    info!(
+        match_id = %p.match_id, game = %p.key.game_name,
+        rtt_a = p.a.rtt_ms, rtt_b = p.b.rtt_ms,
+        delay = floor.map(|f| f.input_delay).unwrap_or(0),
+        prediction = floor.map(|f| f.input_prediction).unwrap_or(0),
+        "automatch pair offered"
+    );
+    metrics::automatch_paired();
+}
+
+/// Both accepted. Build the room, seat them, and hand off to the start path.
+async fn form_match(state: &AppState, p: Pending) {
+    let hub = &state.ws_lobby;
+    let Some(rs) = state
+        .automatch_rulesets
+        .resolve(&p.key.game_name, &p.key.ruleset_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    let floor = automatch::delay_floor(&rs.match_caps, p.a.rtt_ms, p.b.rtt_ms, rs.frame_ms);
+    let floored_caps = automatch::caps_with_floor(&rs.match_caps, floor);
+
+    let lobby_id = Uuid::new_v4().to_string();
+    let session_id;
+    {
+        let mut g = hub.inner.lock().await;
+        if g.lobbies.len() >= MAX_LOBBIES {
+            drop(g);
+            for t in [&p.a, &p.b] {
+                send_to(
+                    hub,
+                    &t.player_id,
+                    json!({ "op": "automatch_requeue", "ok": true,
+                            "reason": "lobby_limit", "queued": false })
+                        .to_string(),
+                )
+                .await;
+            }
+            return;
+        }
+        /* Either side may have dropped between the offer and the second
+         * accept. Better to unwind here than to open a relay session for a
+         * room one player will never reach. */
+        if !g.clients.contains_key(&p.a.player_id) || !g.clients.contains_key(&p.b.player_id) {
+            drop(g);
+            let gone = {
+                let gg = hub.inner.lock().await;
+                if gg.clients.contains_key(&p.a.player_id) { p.a.player_id.clone() } else { p.b.player_id.clone() }
+            };
+            let survivor = if gone == p.a.player_id { &p.b } else { &p.a };
+            let still = {
+                let gg = hub.inner.lock().await;
+                gg.clients.contains_key(&survivor.player_id)
+            };
+            if still {
+                state.automatch.requeue_front(survivor.clone()).await;
+                send_to(
+                    hub,
+                    &survivor.player_id,
+                    json!({ "op": "automatch_requeue", "ok": true,
+                            "reason": "peer_left", "queued": true })
+                        .to_string(),
+                )
+                .await;
+            }
+            return;
+        }
+
+        session_id = g.next_session;
+        g.next_session = g.next_session.saturating_add(1);
+
+        let mut slots: Vec<Option<Slot>> = vec![None; rs.max_slots];
+        for (i, t) in [(&0usize, &p.a), (&1usize, &p.b)] {
+            let country = g
+                .clients
+                .get(&t.player_id)
+                .map(|c| c.country.clone())
+                .unwrap_or_default();
+            slots[*i] = Some(Slot {
+                player_id: t.player_id.clone(),
+                display_name: t.handle.clone(),
+                ready: true,
+                bios_offer: None,
+                mod_offer: None,
+                memcard_offer: None,
+                country,
+                ice_path: None,
+                ice_path_at: None,
+            });
+        }
+
+        let host_endpoint = rewrite_endpoint(
+            &p.a.host_bind,
+            &g.clients.get(&p.a.player_id).map(|c| c.peer_ip.clone()).unwrap_or_default(),
+        );
+        let guest_endpoint = rewrite_endpoint(
+            &p.b.guest_bind,
+            &g.clients.get(&p.b.player_id).map(|c| c.peer_ip.clone()).unwrap_or_default(),
+        );
+
+        g.lobbies.insert(
+            lobby_id.clone(),
+            Lobby {
+                lobby_id: lobby_id.clone(),
+                name: rs.label.clone(),
+                game_name: p.key.game_name.clone(),
+                game_version: p.key.game_version.clone(),
+                disc_fp: p.key.disc_fp.clone(),
+                /* THE sentinel. No connection can hold "", so `start`,
+                 * `kick`, `set_match_caps`, `close` and `move` all answer
+                 * not_host through the checks that already exist, and both
+                 * clients correctly see is_host = false. Saying "the server
+                 * is the host" by giving the role to nobody beats handing it
+                 * to a player and then trying to take pieces of it back. */
+                host_player_id: String::new(),
+                host_bind: p.a.host_bind.clone(),
+                host_endpoint,
+                lan_endpoints: Vec::new(),
+                guest_endpoint,
+                password_hash: None,
+                password_salt: None,
+                max_slots: rs.max_slots,
+                session_id,
+                slots,
+                allow_spectators: false,
+                spectators: Vec::new(),
+                /* The floor is part of the match, not advice about it: the
+                 * room stores what it will run, so `launch` carries it and a
+                 * peer applies it at boot like any other cap. */
+                match_caps: Some(floored_caps.clone()),
+                relay_session_id: None,
+                started: false,
+                automatch: true,
+            },
+        );
+        for (i, t) in [(0usize, &p.a), (1usize, &p.b)] {
+            if let Some(c) = g.clients.get_mut(&t.player_id) {
+                c.lobby_id = Some(lobby_id.clone());
+                c.pending_mod_lobby = None;
+            }
+            let _ = i;
+        }
+    }
+
+    /* Seated exactly as a human-hosted room seats, so the client's waiting
+     * room, caps application and launch path are the ones that already ship. */
+    for (i, t) in [(0usize, &p.a), (1usize, &p.b)] {
+        let (host_endpoint, guest_endpoint) = {
+            let g = hub.inner.lock().await;
+            g.lobbies
+                .get(&lobby_id)
+                .map(|l| (l.host_endpoint.clone(), l.guest_endpoint.clone()))
+                .unwrap_or_default()
+        };
+        let mut joined = json!({
+            "op": "joined",
+            "ok": true,
+            "lobby_id": lobby_id,
+            "session_id": session_id,
+            "local_slot": i,
+            "spectator": false,
+            "spectator_slot_base": SPECTATOR_SLOT_BASE,
+            "host_endpoint": host_endpoint,
+            "guest_endpoint": guest_endpoint,
+            "automatch": true,
+        });
+        joined["match_caps"] = floored_caps.clone();
+        send_to(hub, &t.player_id, joined.to_string()).await;
+    }
+    emit_lobby_update(hub, &lobby_id).await;
+    info!(
+        match_id = %p.match_id, %lobby_id,
+        delay = floor.input_delay, prediction = floor.input_prediction,
+        needed = floor.needed, "automatch match formed"
+    );
+
+    /* The settle is not cosmetic: both clients get a beat to apply caps, and
+     * a peer that drops between accept and launch has somewhere to be
+     * noticed. */
+    let delay = state.config.automatch_start_delay_secs;
+    let st = state.clone();
+    let lid = lobby_id.clone();
+    let match_id = p.match_id.clone();
+    tokio::spawn(async move {
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
+        match start_lobby(&st, &lid, None, None).await {
+            Ok(()) => automatch::mark_launched(&st.pool, &match_id).await,
+            Err(code) => {
+                warn!(lobby_id = %lid, code, "automatch start failed");
+                let note = json!({ "op": "error", "code": code, "ok": false }).to_string();
+                let members = {
+                    let g = st.ws_lobby.inner.lock().await;
+                    g.lobbies.get(&lid).map(|l| l.member_ids()).unwrap_or_default()
+                };
+                for m in members {
+                    send_to(&st.ws_lobby, &m, note.clone()).await;
+                }
+                destroy_lobby(&st, &lid).await;
+            }
+        }
+    });
+}
+
+/// Form what pairs can be formed and offer them.
+pub async fn run_pairing(state: &AppState) {
+    let offers = state
+        .automatch
+        .pair(state.config.automatch_rematch_cooldown_secs)
+        .await;
+    for p in offers {
+        offer_pair(state, &p).await;
+    }
+}
+
+/// The 1 Hz driver: lapse dead offers, pair, then tell everyone waiting where
+/// they stand.
+pub async fn automatch_tick(state: &AppState) {
+    for p in state
+        .automatch
+        .take_expired(state.config.automatch_accept_secs)
+        .await
+    {
+        /* Whoever did not answer pays. If neither did, both do -- there is no
+         * innocent party in an offer two people ignored. */
+        let a_bad = p.a_accept != Some(true);
+        let b_bad = p.b_accept != Some(true);
+        if a_bad && b_bad {
+            for t in [&p.a, &p.b] {
+                automatch::record_strike(&state.pool, &t.account_id, "timeout", &p.key.game_name)
+                    .await;
+                send_to(
+                    &state.ws_lobby,
+                    &t.player_id,
+                    json!({ "op": "automatch_cancelled", "ok": true, "reason": "timeout" })
+                        .to_string(),
+                )
+                .await;
+            }
+            metrics::automatch_dodge();
+        } else {
+            let loser = if a_bad { p.a.player_id.clone() } else { p.b.player_id.clone() };
+            settle_declined(state, &p, &loser, "timeout").await;
+        }
+    }
+
+    run_pairing(state).await;
+
+    for (player_id, waited, rtt, pools) in state.automatch.status_rows().await {
+        let rows: Vec<Value> = pools
+            .into_iter()
+            .map(|(k, n)| json!({ "game_name": k.game_name, "ruleset_id": k.ruleset_id, "pool": n }))
+            .collect();
+        send_to(
+            &state.ws_lobby,
+            &player_id,
+            json!({
+                "op": "automatch_status", "ok": true,
+                "queued_secs": waited, "est_rtt_ms": rtt, "titles": rows,
+            })
+            .to_string(),
+        )
+        .await;
+    }
 }
 
 /// A system line in the lobby chat ("X has joined."): no sender, `system`
@@ -3460,6 +4224,7 @@ mod game_scope_tests {
                 game_name: game.to_string(),
                 lobby_id: lobby.map(str::to_string),
                 pending_mod_lobby: None,
+                probe_rtt_ms: -1,
                 tx,
             },
         );
@@ -3511,6 +4276,7 @@ mod game_scope_tests {
                 match_caps: None,
                 relay_session_id: None,
                 started: false,
+                automatch: false,
             },
         );
     }
@@ -3673,6 +4439,7 @@ mod spectator_tests {
             match_caps: None,
             relay_session_id: None,
             started: false,
+            automatch: false,
         }
     }
 
