@@ -24,10 +24,21 @@ data/*
 !data/ip_country.bin
 # The chat filter word list is source (include_str! at build), not data.
 !data/chat_filter_words.txt
-# The automatch ruleset EXAMPLE is documentation, not data. A deployment's real
-# `data/automatch_rulesets.toml` stays ignored by the line above -- which is
-# right: it is that operator's queue configuration, and committing one would
-# turn automatch on for everybody who cloned this.
+# The automatch rulesets are SOURCE, not per-deployment config, and both files
+# are tracked.
+#
+# This reverses an earlier call. `automatch_rulesets.toml` was ignored on the
+# grounds that a committed one "would turn automatch on for everybody who
+# cloned this" -- true, but the thing that matters more is that a player gets
+# the SAME match on every server, and queue settings that each operator writes
+# by hand do not converge on their own. So the canonical set is maintained
+# here, ships in the release bundle, and a deployment that needs to diverge
+# points AUTOMATCH_RULESETS_PATH at its own file rather than editing this one.
+# The divergence then lives in that server's environment, where it is visible,
+# instead of in a local edit the next bundle would silently revert.
+!data/automatch_rulesets.toml
+# The example stays too: it documents the format, and carries the PSX caps
+# vocabulary that the shipping SNES entries do not show.
 !data/automatch_rulesets.example.toml
 
 # Rust

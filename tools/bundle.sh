@@ -119,18 +119,46 @@ mkdir -p "$PKG"
 
 # ---------------------------------------------------------------- stage ------
 
-# data/ip_country.bin and data/chat_filter_words.txt are include_bytes!/
-# include_str! into the binary, and migrations/ is embedded by sqlx::migrate!,
-# so none of them are runtime files. migrations/ ships anyway as a readable
+# migrations/ is embedded by sqlx::migrate! and ships anyway as a readable
 # record of the schema the binary will apply.
+#
+# data/ ships WHOLE, and deliberately so. Two of its files (ip_country.bin,
+# chat_filter_words.txt) are include_bytes!/include_str! into the binary and
+# are therefore redundant here -- 2.6 MB of the zip is ip_country.bin alone.
+# The third, automatch_rulesets.toml, is read from disk AT RUNTIME, and it is
+# the reason the folder is in the bundle at all: it is what makes every server
+# offer the same queues with the same match settings.
+#
+# Copying the directory rather than naming that one file is the point. The
+# next runtime data file ships without anyone remembering to come back and
+# edit this script -- and "the release quietly stopped carrying a file the
+# server reads" is a failure that shows up as a feature being mysteriously off
+# on one box, which is exactly the class of bug this bundle exists to prevent.
 install -m 0755 "$BIN"        "$PKG/recomp-net-server"
 install -m 0644 .env.example  "$PKG/.env.example"
 install -m 0644 README.md     "$PKG/README.md"
 install -m 0644 LICENSE       "$PKG/LICENSE"
 cp -r docs       "$PKG/docs"
 cp -r migrations "$PKG/migrations"
+cp -r data       "$PKG/data"
 
 BIN_SHA="$(sha256sum "$PKG/recomp-net-server" | cut -d' ' -f1)"
+
+# The queues this bundle will actually offer, named in the manifest so a
+# deploy can be checked against what was intended without unzipping and
+# reading TOML. Parsed loosely on purpose: this is a manifest line, and the
+# server does the real validation at load.
+if [[ -f "$PKG/data/automatch_rulesets.toml" ]]; then
+  AUTOMATCH_SUMMARY="$(awk '
+    /^[[:space:]]*#/          { next }
+    /^[[:space:]]*id[[:space:]]*=/         { gsub(/.*=[[:space:]]*"|"[[:space:]]*$/,""); id=$0 }
+    /^[[:space:]]*game_name[[:space:]]*=/  { gsub(/.*=[[:space:]]*"|"[[:space:]]*$/,""); game=$0 }
+    /^[[:space:]]*max_slots[[:space:]]*=/  { if (game != "") { printf "  %s / %s\n", game, id; game=""; id="" } }
+  ' "$PKG/data/automatch_rulesets.toml")"
+  [[ -n "$AUTOMATCH_SUMMARY" ]] || AUTOMATCH_SUMMARY="  (none -- automatch will be off)"
+else
+  AUTOMATCH_SUMMARY="  (no rulesets file -- automatch will be off)"
+fi
 
 cat > "$PKG/MANIFEST.txt" <<EOF
 recomp-net-server bundle
@@ -144,10 +172,17 @@ rustc          : $(rustc -V)
 built at       : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 sha256(binary) : $BIN_SHA
 
-Embedded in the binary (not shipped as loose files):
-  migrations/*.sql          sqlx::migrate!
-  data/ip_country.bin       include_bytes!
+Embedded in the binary (the copies under data/ and migrations/ are a
+readable record, not something the server loads):
+  migrations/*.sql           sqlx::migrate!
+  data/ip_country.bin        include_bytes!
   data/chat_filter_words.txt include_str!
+
+Read from disk at runtime:
+  data/automatch_rulesets.toml   AUTOMATCH_RULESETS_PATH; absent => automatch off
+
+Automatch queues in this bundle:
+$AUTOMATCH_SUMMARY
 EOF
 
 cat > "$PKG/DEPLOY.md" <<'EOF'
@@ -171,8 +206,20 @@ $EDITOR .env                        # BIND_ADDR at minimum
 ## What this bundle does and does not contain
 
 The schema migrations, the IP→country table, and the chat filter word list are
-compiled into the executable. There is nothing to install alongside it and no
-path to configure for them — `migrations/` ships only so the schema is readable.
+compiled into the executable. There is nothing to install alongside them and no
+path to configure — `migrations/` and their copies under `data/` ship only so
+they are readable.
+
+`data/automatch_rulesets.toml` is different: it is read **from disk at startup**
+and it is what turns automatch on. It is maintained in the repo rather than
+per-server, so that a player gets the same queues and the same match settings
+whichever server they land on — keep it where it extracted, beside the binary.
+MANIFEST.txt lists the queues this bundle carries.
+
+To run a queue set that differs from the standard one, point
+`AUTOMATCH_RULESETS_PATH` at your own file rather than editing this copy: the
+next bundle overwrites it, and a local edit is invisible to everyone debugging
+why this server behaves unlike the others.
 
 State the server creates for itself, relative to the working directory:
 

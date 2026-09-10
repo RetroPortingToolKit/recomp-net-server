@@ -1,0 +1,98 @@
+# Automatch rulesets — THE canonical set, shipped in every bundle.
+#
+# This file is tracked and maintained here, not written per deployment, so
+# that every server offers the same queues with the same match settings. A
+# player who queues on one server gets the same match they would get on
+# another; that is the whole reason this is source rather than operator
+# config. tools/bundle.sh ships it (with the rest of data/) into the release
+# ZIP, so deploying a bundle deploys these rules.
+#
+# There is no enable flag anywhere: automatch is ON for a title that has a
+# ruleset here and OFF for one that does not. A server that wants to diverge
+# — to trial a queue type, or to run a private pool — points
+# AUTOMATCH_RULESETS_PATH at its own file instead of editing this one, which
+# keeps the divergence visible in that server's environment rather than as a
+# local edit that the next bundle silently reverts.
+#
+# ---------------------------------------------------------------------------
+# ADDING A TITLE
+#
+# 1. `game_name` must equal, BYTE FOR BYTE, what that game's client announces.
+#    It is the port's own string (SNES ports build it from SNES_GAME_TITLE in
+#    their CMakeLists, or set id.game_name literally), and it is printed on
+#    the wire by the client itself:
+#        snes_lobby: hello as "…" for game "<this string>"
+#    A near-miss is not an error anywhere. The title simply has no rulesets,
+#    automatch_available answers no, and the launcher shows the button
+#    disabled — indistinguishable from automatch being off entirely.
+#
+# 2. `match_caps` is what the SERVER imposes on the room; it is not a
+#    suggestion, and the players agreed to it by queueing here. Write out
+#    EVERY key the target client reads, even where the value equals that
+#    client's default: a key left out is a decision made by whichever default
+#    happens to be compiled into the peer's build, which is the one thing an
+#    automatch room cannot afford to leave open.
+#
+# 3. The caps VOCABULARY is per-console. The SNES entries below use the keys
+#    snesrecomp/runner/src/lobby/snes_lobby_client.c parses. A PSX title uses
+#    the PSX set (bios_hle, fast_boot, turbo_loads, auto_skip_fmv, …) and
+#    ignores these; see automatch_rulesets.example.toml.
+#
+# Refused at load, loudly, with the server still starting: an empty id or
+# game_name, a duplicate (game_name, id), max_slots other than 2, match_caps
+# that is not a table or serializes over 4096 bytes, and any `mods` key at all
+# (v1 is vanilla only). See src/automatch.rs validate().
+# ---------------------------------------------------------------------------
+
+
+# ── Gundam Wing: Endless Duel (SNES) ────────────────────────────────────────
+# Verified against the running client 2026-09-10: the announced game_name was
+# read off the wire, and the caps keys and their defaults from that build's
+# match-caps parser.
+[[ruleset]]
+id        = "standard"
+label     = "Standard"
+game_name = "Gundam Wing Endless Duel"
+max_slots = 2
+
+# `game_version` is deliberately omitted here and everywhere below. The match
+# key is an equality bucket either way, so players still only ever pool with
+# their own release — but omitting the pin means a new tagged release starts
+# pooling the day it ships, with no server-side edit and no window where the
+# queue is dark because this file has not caught up.
+
+[ruleset.match_caps]
+widescreen        = false  # vanilla: the wide view is a Mods package, and v1 is vanilla only
+widescreen_hud    = false  # MUST be explicit — this key defaults to TRUE when absent,
+                           # which would anchor the HUD wide inside a 4:3 frame
+ws_extra          = 0      # margin in pixels per side; 0 is the "do not patch" signal
+ignore_aspect     = false
+rollback          = true   # the SFU path every online match runs
+input_delay       = 2      # frames; the client clamps to 2..20
+force_turn        = false  # let ICE choose; the relay is already in the path
+force_input_relay = false
+
+
+# ── Metal Warriors (SNES) ───────────────────────────────────────────────────
+# READY BUT NOT ENABLED — uncomment once you have confirmed this title's
+# netplay is shipping. The values are read from that port's own
+# FillMatchCaps (src/main.c), not guessed: it publishes widescreen with a
+# 71-pixel margin unconditionally, because there the wide view IS the shipped
+# product rather than a mod package, so a vanilla queue must carry it or every
+# match would disagree with what the game itself announces.
+#
+# [[ruleset]]
+# id        = "standard"
+# label     = "Standard"
+# game_name = "Metal Warriors"
+# max_slots = 2
+#
+# [ruleset.match_caps]
+# widescreen        = true
+# widescreen_hud    = true
+# ws_extra          = 71
+# ignore_aspect     = false
+# rollback          = true
+# input_delay       = 2
+# force_turn        = false
+# force_input_relay = false
