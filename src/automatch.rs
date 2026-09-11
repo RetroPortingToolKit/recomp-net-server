@@ -1718,6 +1718,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_flat_ladder_charges_the_same_minute_however_often_you_decline() {
+        /* The shipped default. A single-entry ladder has to stay flat as the
+         * strike count climbs -- the index clamps to the last entry, so this
+         * is really asserting that the clamp is what makes "no escalation"
+         * expressible at all. Declining repeatedly in one session is what a
+         * player testing with a friend does, and it must not compound into a
+         * lockout from a queue with two people in it. */
+        let pool = db().await;
+        record_strike(&pool, "a1", "decline", "G").await;
+        let one = cooldown_secs(&pool, "a1", &[60]).await;
+        record_strike(&pool, "a1", "decline", "G").await;
+        record_strike(&pool, "a1", "decline", "G").await;
+        let three = cooldown_secs(&pool, "a1", &[60]).await;
+        assert!(one > 0 && one <= 60, "first decline costs a minute: {one}");
+        assert_eq!(one, three, "a third decline costs no more than the first");
+    }
+
+    #[tokio::test]
     async fn an_empty_ladder_records_the_dodge_and_charges_nothing() {
         /* A deployment may want the record before it wants the penalty. */
         let pool = db().await;

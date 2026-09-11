@@ -177,7 +177,23 @@ impl Config {
                 .split(',')
                 .filter_map(|t| t.trim().parse::<u64>().ok())
                 .collect(),
-            _ => vec![60, 300, 900],
+            /* One minute, flat, however many times you have declined.
+             *
+             * This was an escalating ladder (60 / 300 / 900). Escalation is
+             * the right shape for a populated queue, where a repeat dodger
+             * costs a stream of other people their match. It is the wrong
+             * shape for the pools these servers actually have: three declines
+             * in a testing afternoon put a player on a FIFTEEN MINUTE lockout
+             * from a queue that might have two people in it, which punishes
+             * the person still trying to play far harder than it deters
+             * anything.
+             *
+             * A minute is long enough that declining is not free and short
+             * enough that it is not a ban. Raise it, or restore a ladder,
+             * with AUTOMATCH_DODGE_COOLDOWNS once a queue is busy enough for
+             * repeat dodging to be somebody else's problem rather than just
+             * the dodger's. */
+            _ => vec![60],
         };
 
         let jwt_secret_current = env::var("JWT_SECRET_CURRENT")

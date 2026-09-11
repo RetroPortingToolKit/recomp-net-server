@@ -430,8 +430,16 @@ CREATE INDEX IF NOT EXISTS idx_automatch_pairings_a ON automatch_pairings (playe
 CREATE INDEX IF NOT EXISTS idx_automatch_pairings_b ON automatch_pairings (player_b, paired_at);
 ```
 
-Ladder from `AUTOMATCH_DODGE_COOLDOWNS` (default `60,300,900` seconds),
-counting strikes in the last 24 h; a clean 24 h drops the count back to zero.
+Ladder from `AUTOMATCH_DODGE_COOLDOWNS`, counting strikes in the last 24 h; a
+clean 24 h drops the count back to zero.
+
+**The default is a flat `60`**, not a ladder. Escalation is the right shape for
+a populated queue, where a repeat dodger costs a stream of other people their
+match. It is the wrong shape for the pools these servers have today: the
+original `60,300,900` put a player who declined three times in an afternoon on
+a fifteen-minute lockout from a queue that might hold two people, which
+punishes the one still trying to play harder than it deters anything. The
+ladder mechanism is unchanged and a busier deployment should set one.
 
 Both tables are pruned on a daily sweep at `AUTOMATCH_RETENTION_DAYS` (default
 30; `0` prunes a row as soon as it stops affecting a decision). Only the last
@@ -604,7 +612,7 @@ Additive in the same way the Discord login was:
 | `AUTOMATCH_RTT_WIDEN_SECS` | `20` | Seconds between widen steps. |
 | `AUTOMATCH_RTT_MAX_MS` | `400` | Last ceiling before the filter goes unlimited. |
 | `AUTOMATCH_REMATCH_COOLDOWN_SECS` | `300` | Avoid-last-opponent window. |
-| `AUTOMATCH_DODGE_COOLDOWNS` | `60,300,900` | Cooldown ladder, seconds, by strikes in 24 h. |
+| `AUTOMATCH_DODGE_COOLDOWNS` | `60` | Cooldown ladder, seconds, by strikes in 24 h. Flat by default; see §8. |
 | `AUTOMATCH_RETENTION_DAYS` | `30` | Prune `automatch_strikes` / `automatch_pairings`. `0` = prune once a row stops mattering. |
 
 There is no `AUTOMATCH_ENABLED`. Automatch is on when rulesets load and off
