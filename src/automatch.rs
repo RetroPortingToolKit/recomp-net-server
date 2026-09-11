@@ -660,6 +660,13 @@ pub struct Ticket {
     pub queued_at: Instant,
     /// Round trip to the relay, or -1 when unmeasured. See `rtt_ok`.
     pub rtt_ms: i32,
+    /// Accounts this player has blocked, copied from the connection when the
+    /// ticket was made.
+    ///
+    /// A copy rather than a live lookup because pairing runs inside the queue
+    /// lock and has no hub, and because the list that should govern a match is
+    /// the one in force when the player asked for it.
+    pub blocks: std::collections::HashSet<String>,
 }
 
 impl Ticket {
@@ -934,6 +941,19 @@ fn find_pair_pass(
                 }
                 /* Hard: never the same account, whatever else is true. */
                 if a.account_id == b.account_id {
+                    continue;
+                }
+                /* Hard, and in BOTH passes -- unlike the avoid-last-opponent
+                 * rule below, which is a preference the second pass relaxes.
+                 * A block is not a preference about who you would rather
+                 * play; it is a statement that these two should not be put
+                 * together, and a queue that eventually pairs them anyway
+                 * because nobody else turned up has simply ignored it.
+                 *
+                 * Symmetric: either direction is enough. Letting the blocked
+                 * party be matched into the blocker would make the setting
+                 * worth very little. */
+                if a.blocks.contains(&b.account_id) || b.blocks.contains(&a.account_id) {
                     continue;
                 }
                 /* Both sides must be past the measuring window, or the
@@ -1370,6 +1390,7 @@ mod tests {
 
     fn ticket(player: &str, account: &str, keys: Vec<MatchKey>) -> Ticket {
         Ticket {
+            blocks: Default::default(),
             player_id: player.into(),
             account_id: account.into(),
             handle: player.into(),
@@ -1563,6 +1584,52 @@ mod tests {
             q.pair(300).await.len(),
             1,
             "nobody else to prefer, so the rematch is the match"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_pair_is_never_offered_in_either_direction() {
+        /* Hard, and in both passes -- unlike avoid-last-opponent, which the
+         * second pass relaxes when there is nobody else. A queue that pairs
+         * two people who blocked each other because the pool was empty has
+         * simply ignored the setting.
+         *
+         * Fresh tickets and a two-person pool, which is precisely the case
+         * the rematch preference is allowed to give way in. */
+        for (blocker, blocked) in [("a1", "a2"), ("a2", "a1")] {
+            let q = Queue::default();
+            let mut t1 = ticket("p1", "a1", vec![key("G")]);
+            let mut t2 = ticket("p2", "a2", vec![key("G")]);
+            if blocker == "a1" {
+                t1.blocks.insert(blocked.to_string());
+            } else {
+                t2.blocks.insert(blocked.to_string());
+            }
+            q.push(t1).await;
+            q.push(t2).await;
+            assert!(
+                q.pair(300).await.is_empty(),
+                "{blocker} blocked {blocked}, so they must not be paired"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_does_not_stop_either_of_them_matching_anyone_else() {
+        /* The block is about one pair, not a penalty on the blocker. */
+        let q = Queue::default();
+        let mut t1 = ticket("p1", "a1", vec![key("G")]);
+        t1.blocks.insert("a2".to_string());
+        q.push(t1).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await;
+        q.push(ticket("p3", "a3", vec![key("G")])).await;
+        let offers = q.pair(300).await;
+        assert_eq!(offers.len(), 1, "a1 or a2 should have matched a3");
+        let accounts = [offers[0].a.account_id.clone(), offers[0].b.account_id.clone()];
+        assert!(accounts.contains(&"a3".to_string()), "{accounts:?}");
+        assert!(
+            !(accounts.contains(&"a1".to_string()) && accounts.contains(&"a2".to_string())),
+            "the blocked pair was matched anyway: {accounts:?}"
         );
     }
 

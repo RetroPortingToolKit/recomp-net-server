@@ -137,6 +137,18 @@ struct ClientMeta {
     lobby_id: Option<String>,
     /// Password-ok join waiting on missing mods (not seated).
     pending_mod_lobby: Option<String>,
+    /// Accounts this client has blocked, as opaque account ids.
+    ///
+    /// Held on the CONNECTION rather than only on an automatch ticket,
+    /// because a block has to do three jobs and only one of them involves
+    /// queueing: the matchmaker must not pair the two, the blocked player must
+    /// not see the blocker's room, and they must not be able to join it. The
+    /// last two apply while nobody is queueing at all.
+    ///
+    /// The list is the client's own; the server keeps it for the life of the
+    /// connection and never persists it. It is only meaningful for a
+    /// signed-in client, since a block names an account.
+    blocks: std::collections::HashSet<String>,
     /// Round trip to the relay, as this client measured it with a UDP probe;
     /// -1 until it reports one. Kept on the CONNECTION, not the ticket, so a
     /// client that probes before it queues does not have to probe again.
@@ -565,6 +577,9 @@ struct InMsg {
      * reports. */
     #[serde(default)]
     mids: Option<Vec<String>>,
+    /// `set_blocks`: opaque account ids this client will not be matched with,
+    /// shown, or joined by.
+    accounts: Option<Vec<String>>,
     #[serde(default)]
     game: Option<String>,
     #[serde(default)]
@@ -789,6 +804,24 @@ impl Lobby {
 /// looking it up there beats copying it into five seating sites that would
 /// each have to be kept in step.
 /// The opaque account id behind a connection, or "" for a guest.
+/// Has either of these two blocked the other?
+///
+/// Symmetric on purpose. A block is not a preference about who you see, it is
+/// a statement that the two of you should not be put together -- and letting
+/// the blocked party initiate what the blocker refused would make the setting
+/// worth very little. Guests have no account and so can neither block nor be
+/// blocked, which the empty-string checks below make explicit rather than
+/// leaving to how HashSet happens to treat "".
+fn blocked_between(g: &HubInner, a_player: &str, b_player: &str) -> bool {
+    let (Some(a), Some(b)) = (g.clients.get(a_player), g.clients.get(b_player)) else {
+        return false;
+    };
+    let a_acct = a.account.as_ref().map(|x| x.id.to_string()).unwrap_or_default();
+    let b_acct = b.account.as_ref().map(|x| x.id.to_string()).unwrap_or_default();
+    (!b_acct.is_empty() && a.blocks.contains(&b_acct))
+        || (!a_acct.is_empty() && b.blocks.contains(&a_acct))
+}
+
 fn account_of(g: &HubInner, player_id: &str) -> String {
     g.clients
         .get(player_id)
@@ -1211,10 +1244,52 @@ fn lobby_list_json(hub: &HubInner) -> String {
 /// unfiltered.
 fn lobby_list_json_for(g: &HubInner, player_id: &str) -> String {
     let scope = game_scope_for(g, player_id);
-    if scope.is_empty() {
-        return lobby_list_json(g);
+    let mut v: Value = serde_json::from_str(&if scope.is_empty() {
+        lobby_list_json(g)
+    } else {
+        lobby_list_json_filtered(g, Some(&scope), None)
+    })
+    .unwrap_or_else(|_| json!({}));
+
+    /* A room hosted by somebody on either side of a block is not shown.
+     *
+     * Filtered HERE rather than in the client, because only one direction of
+     * it can be: a player can hide rooms hosted by someone THEY blocked on
+     * their own, but they cannot know they were blocked by the host -- and
+     * that is exactly the direction that has to work. Doing both here keeps
+     * one rule in one place. */
+    if let Some(rows) = v.get_mut("lobbies").and_then(|r| r.as_array_mut()) {
+        rows.retain(|row| {
+            let Some(id) = row.get("lobby_id").and_then(|x| x.as_str()) else {
+                return true;
+            };
+            let Some(l) = g.lobbies.get(id) else { return true };
+            !blocked_between(g, player_id, &l.host_player_id)
+        });
     }
-    lobby_list_json_filtered(g, Some(&scope), None)
+    /* And the players list, so a blocked player is not merely unable to join
+     * the room -- they are not shown as present either. */
+    if let Some(rows) = v.get_mut("players").and_then(|r| r.as_array_mut()) {
+        let me = g.clients.get(player_id);
+        rows.retain(|row| {
+            let Some(tag) = row.get("tag").and_then(|x| x.as_str()) else {
+                return true;
+            };
+            match me.map(|c| c.player_id.starts_with(tag)) {
+                Some(true) => return true,   /* never hide yourself */
+                _ => {}
+            }
+            let Some(other) = g
+                .clients
+                .keys()
+                .find(|k| k.starts_with(tag))
+            else {
+                return true;
+            };
+            !blocked_between(g, player_id, other)
+        });
+    }
+    v.to_string()
 }
 
 async fn broadcast_list(hub: &WsLobbyHub) {
@@ -1397,7 +1472,8 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 game_name: String::new(),
                 lobby_id: None,
                 pending_mod_lobby: None,
-                probe_rtt_ms: -1,
+                blocks: Default::default(),
+            probe_rtt_ms: -1,
                 tx: tx.clone(),
             },
         );
@@ -1620,6 +1696,7 @@ async fn handle_text(
         "mod_xfer_cancel" => handle_mod_xfer_cancel(hub, player_id).await?,
         "mod_xfer_fail" => handle_mod_xfer_fail(hub, player_id, msg).await?,
         "get_turn_credentials" => handle_get_turn_credentials(hub, player_id).await?,
+        "set_blocks" => handle_set_blocks(hub, player_id, msg).await?,
         "automatch_rulesets" => handle_automatch_rulesets(state, player_id, msg).await?,
         "automatch_queue" => handle_automatch_queue(state, player_id, msg).await?,
         "automatch_cancel" => handle_automatch_cancel(state, player_id).await?,
@@ -2103,7 +2180,20 @@ async fn handle_join(
                     lobby.disc_fp.clone(),
                 )
             };
-            if disc_fp_mismatch(&lobby_disc_fp, &join_disc_fp) {
+            /* Checked before anything else about the room: a blocked joiner
+             * must not learn the password was wrong, that the room is full,
+             * or that their disc does not match. "no_such_lobby" is the same
+             * answer they would get for a room that closed a second ago,
+             * which is the point -- a distinct code would tell them they were
+             * blocked, and by whom. */
+            let host_pid = g
+                .lobbies
+                .get(&lobby_id)
+                .map(|l| l.host_player_id.clone())
+                .unwrap_or_default();
+            if !host_pid.is_empty() && blocked_between(&g, player_id, &host_pid) {
+                SeatResult::Err("no_such_lobby")
+            } else if disc_fp_mismatch(&lobby_disc_fp, &join_disc_fp) {
                 SeatResult::Err("disc_mismatch")
             } else if let Some(ref want) = join_game_name {
                 if &game_name != want {
@@ -3848,7 +3938,16 @@ async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -
         return Ok(());
     }
 
+    /* The blocks in force when the player asked for a match. Read here rather
+     * than at pairing time: pairing runs inside the queue lock with no hub to
+     * consult, and the list that should govern a match is the one that was
+     * set when it was requested. */
+    let blocks = {
+        let g = hub.inner.lock().await;
+        g.clients.get(player_id).map(|c| c.blocks.clone()).unwrap_or_default()
+    };
     let ticket = Ticket {
+        blocks,
         player_id: player_id.to_string(),
         account_id: account_id.clone(),
         handle,
@@ -4538,6 +4637,32 @@ fn game_scope_for(g: &HubInner, player_id: &str) -> String {
 /// Per-game chat outside any room: every client browsing for the same
 /// title hears it, seated or not. Same shape and same filter as lobby
 /// chat; no history, so a newcomer sees only what is said after arriving.
+/// `set_blocks`: the accounts this client has blocked.
+///
+/// Replaces the whole set rather than adding to it, so the client's file is
+/// the single authority and an unblock does not need its own op. Capped, and
+/// silently: a client that sends more than the cap has its list truncated
+/// rather than refused, because a refused list would leave the server
+/// enforcing NOTHING, which is the worse failure for this particular feature.
+///
+/// Not persisted. This is the client's list, held for the life of the
+/// connection so the server can act on it.
+const MAX_BLOCKS: usize = 256;
+
+async fn handle_set_blocks(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let ids = msg.accounts.unwrap_or_default();
+    let mut g = hub.inner.lock().await;
+    let Some(c) = g.clients.get_mut(player_id) else {
+        return Ok(());
+    };
+    c.blocks = ids
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .take(MAX_BLOCKS)
+        .collect();
+    Ok(())
+}
+
 async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let text = msg.text.unwrap_or_default();
     let text: String = text
@@ -4764,7 +4889,8 @@ mod game_scope_tests {
                 game_name: game.to_string(),
                 lobby_id: lobby.map(str::to_string),
                 pending_mod_lobby: None,
-                probe_rtt_ms: -1,
+                blocks: Default::default(),
+            probe_rtt_ms: -1,
                 tx,
             },
         );
@@ -5176,6 +5302,64 @@ mod name_tests {
 mod list_scope_tests {
     use super::*;
 
+    fn account(id: &str) -> crate::identity::Player {
+        crate::identity::Player {
+            id: Uuid::parse_str(id).unwrap_or_else(|_| Uuid::new_v4()),
+            discord_id: String::new(),
+            discord_username: String::new(),
+            handle: String::new(),
+        }
+    }
+
+    /// A signed-in client, so a block has an account to name.
+    fn client_acct(g: &mut HubInner, id: &str, name: &str, game: &str,
+                   acct: &str, blocks: &[&str]) {
+        client(g, id, name, game);
+        let c = g.clients.get_mut(id).unwrap();
+        c.account = Some(account(acct));
+        c.blocks = blocks.iter().map(|s| s.to_string()).collect();
+    }
+
+    /// Both directions of a block, as the list and the join gate see it.
+    #[test]
+    fn a_block_hides_the_room_from_the_blocked_player_both_ways() {
+        const A: &str = "11111111-1111-4111-8111-111111111111";
+        const B: &str = "22222222-2222-4222-8222-222222222222";
+
+        /* The direction a client cannot do for itself: the HOST blocked them,
+         * and they have no way to know it. */
+        let mut g = HubInner::default();
+        client_acct(&mut g, "host", "HostGuy", "G", A, &[B]);
+        client_acct(&mut g, "them", "Nuisance", "G", B, &[]);
+        assert!(blocked_between(&g, "them", "host"));
+        assert!(blocked_between(&g, "host", "them"), "symmetric");
+
+        /* And the direction they could have done themselves. */
+        let mut g2 = HubInner::default();
+        client_acct(&mut g2, "host", "HostGuy", "G", A, &[]);
+        client_acct(&mut g2, "them", "Nuisance", "G", B, &[A]);
+        assert!(blocked_between(&g2, "them", "host"));
+
+        /* Nobody blocked anybody. */
+        let mut g3 = HubInner::default();
+        client_acct(&mut g3, "host", "HostGuy", "G", A, &[]);
+        client_acct(&mut g3, "them", "Nuisance", "G", B, &[]);
+        assert!(!blocked_between(&g3, "them", "host"));
+    }
+
+    /// A guest can neither block nor be blocked: there is no account to name,
+    /// and matching on the empty string would have every guest blocking every
+    /// other guest.
+    #[test]
+    fn a_guest_is_neither_blocker_nor_blocked() {
+        const A: &str = "33333333-3333-4333-8333-333333333333";
+        let mut g = HubInner::default();
+        client_acct(&mut g, "signed", "Host", "G", A, &[""]);
+        client(&mut g, "guest", "Guest", "G");
+        assert!(!blocked_between(&g, "guest", "signed"));
+        assert!(!blocked_between(&g, "signed", "guest"));
+    }
+
     fn client(g: &mut HubInner, id: &str, name: &str, game: &str) {
         let (tx, _rx) = broadcast::channel(8);
         g.clients.insert(
@@ -5189,7 +5373,8 @@ mod list_scope_tests {
                 game_name: game.to_string(),
                 lobby_id: None,
                 pending_mod_lobby: None,
-                probe_rtt_ms: -1,
+                blocks: Default::default(),
+            probe_rtt_ms: -1,
                 tx,
             },
         );
