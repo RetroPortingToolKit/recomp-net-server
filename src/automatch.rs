@@ -1185,6 +1185,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_declined_offer_does_not_count_as_having_played() {
+        /* The bug this pins: `note_pairing` used to be called where the OFFER
+         * was sent, so declining once put the pair under the
+         * avoid-last-opponent window and the two could not be matched again
+         * for the rest of it. Declining costs the decliner a dodge strike;
+         * it is not supposed to remove an opponent from their pool -- and in
+         * a pool of two it removed the only opponent there was.
+         *
+         * So the sequence here is the real one: pair, one side declines, both
+         * queue again. They must be offered each other immediately, with no
+         * long wait to age out a filter that should never have applied.
+         *
+         * Note there is no note_pairing call anywhere below. That absence IS
+         * the assertion -- the caller now makes it only when a match forms. */
+        let q = Queue::default();
+        q.push(ticket("p1", "a1", vec![key("G")])).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await;
+        let offers = q.pair(300).await;
+        assert_eq!(offers.len(), 1, "they were offered each other");
+
+        /* Both sides have to answer before the offer resolves, so the other
+         * one accepting is what lands the decline. */
+        assert!(q.answer("p1", false).await.is_none(), "waiting on the peer");
+        let p = q.answer("p2", true).await.expect("the offer resolves");
+        assert!(!p.both_yes(), "one side said no");
+
+        /* Both back in the queue, fresh, exactly as settle_declined does it. */
+        q.requeue_front(p.b.clone()).await;
+        q.push(ticket("p1", "a1", vec![key("G")])).await;
+
+        assert_eq!(
+            q.pair(300).await.len(),
+            1,
+            "a declined offer must not block the next one between the same two"
+        );
+    }
+
+    #[tokio::test]
     async fn the_rematch_filter_gives_way_rather_than_emptying_a_two_person_pool() {
         /* Soft, and it has to be: held hard, a pool of exactly two people
          * stops working after their first match. */

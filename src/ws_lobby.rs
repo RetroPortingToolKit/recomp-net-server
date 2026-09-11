@@ -3575,7 +3575,6 @@ async fn offer_pair(state: &AppState, p: &Pending) {
         est,
     )
     .await;
-    state.automatch.note_pairing(&p.a.account_id, &p.b.account_id).await;
 
     for (me, them) in [(&p.a, &p.b), (&p.b, &p.a)] {
         let mut m = json!({
@@ -3623,6 +3622,21 @@ async fn offer_pair(state: &AppState, p: &Pending) {
 /// Both accepted. Build the room, seat them, and hand off to the start path.
 async fn form_match(state: &AppState, p: Pending) {
     let hub = &state.ws_lobby;
+    /* Note the pairing HERE, where a match actually happens, and not where the
+     * offer was sent.
+     *
+     * It used to be recorded in offer_pair, which meant a DECLINED offer
+     * counted as "these two just played" -- so declining once put the pair
+     * under the avoid-last-opponent cooldown for five minutes and the two
+     * players could not be matched again until one of them had waited out the
+     * 100 seconds that makes the filter give up. Declining is supposed to cost
+     * the decliner a dodge strike and nothing else; it is not supposed to
+     * remove an opponent from their pool. In a pool of two it removed the only
+     * opponent there was.
+     *
+     * The filter's purpose is "you two just played, have someone else for a
+     * while", and an offer nobody accepted is not that. */
+    state.automatch.note_pairing(&p.a.account_id, &p.b.account_id).await;
     let Some(rs) = state
         .automatch_rulesets
         .resolve(&p.key.game_name, &p.key.ruleset_id)
