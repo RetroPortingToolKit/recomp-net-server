@@ -731,7 +731,33 @@ impl Queue {
 
 /// The first pairable two tickets, oldest-first, honouring each ticket's own
 /// preference order.
+/// Pick a pair, preferring a fresh opponent.
+///
+/// TWO PASSES, and the second one is the whole point. `rematch_ok` is
+/// documented as a preference -- "prefer a new opponent, but not at the cost
+/// of not matching at all" -- but a single pass that `continue`s past it makes
+/// it a hard filter: with nobody else in the bucket there is no other
+/// candidate to fall through to, so the pool simply stops producing pairs.
+///
+/// Seen on a live two-person pool: both players finished a match, both queued
+/// again about a minute later, and the server logged two tickets and no offer.
+/// The only escape was the timer inside `rematch_ok`, which yields after 100
+/// seconds of WAITING -- so the feature appeared to have broken, twice a
+/// match, for as long as anyone had the patience to sit there.
+///
+/// Preferring costs one extra scan and nothing else. Every hard rule (same
+/// account, measured, latency ceiling) is enforced in both passes; only the
+/// avoid-last-opponent preference is relaxed on the second.
 fn find_pair(g: &QueueInner, rematch_cooldown_secs: u64) -> Option<(usize, usize, MatchKey)> {
+    find_pair_pass(g, rematch_cooldown_secs, false)
+        .or_else(|| find_pair_pass(g, rematch_cooldown_secs, true))
+}
+
+fn find_pair_pass(
+    g: &QueueInner,
+    rematch_cooldown_secs: u64,
+    allow_rematch: bool,
+) -> Option<(usize, usize, MatchKey)> {
     for i in 0..g.tickets.len() {
         let a = &g.tickets[i];
         for key in &a.keys {
@@ -755,7 +781,7 @@ fn find_pair(g: &QueueInner, rematch_cooldown_secs: u64) -> Option<(usize, usize
                 if !rtt_ok(a, b) {
                     continue;
                 }
-                if !rematch_ok(g, a, b, rematch_cooldown_secs) {
+                if !allow_rematch && !rematch_ok(g, a, b, rematch_cooldown_secs) {
                     continue;
                 }
                 return Some((i, j, key.clone()));
@@ -1176,12 +1202,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_just_played_pair_is_skipped_while_the_window_holds() {
+    async fn the_journal_sequence_offers_a_second_match() {
+        /* The live trace, replayed:
+         *   02:13:38 queued f8e3  /  02:13:40 queued d15a
+         *   02:13:40 pair offered /  02:13:43 match formed
+         *   02:14:48 queued f8e3  /  02:14:49 queued d15a
+         *   ...and then nothing, where an offer should have been.
+         * Everything here is the real API in the real order. */
+        let q = Queue::default();
+        q.push(ticket("f8e3", "acct-a", vec![key("Gundam Wing Endless Duel")])).await;
+        q.push(ticket("d15a", "acct-b", vec![key("Gundam Wing Endless Duel")])).await;
+
+        let offers = q.pair(300).await;
+        assert_eq!(offers.len(), 1, "first match is offered");
+        assert!(q.answer("f8e3", true).await.is_none());
+        let p = q.answer("d15a", true).await.expect("both accepted");
+        assert!(p.both_yes());
+        /* form_match does this, and it is correct here -- they really played. */
+        q.note_pairing(&p.a.account_id, &p.b.account_id).await;
+
+        /* A minute later, both queue again. Fresh tickets: no accumulated
+         * wait, so nothing can be rescued by a timer. */
+        q.push(ticket("f8e3", "acct-a", vec![key("Gundam Wing Endless Duel")])).await;
+        q.push(ticket("d15a", "acct-b", vec![key("Gundam Wing Endless Duel")])).await;
+        assert_eq!(
+            q.pair(300).await.len(),
+            1,
+            "the second match must be offered, not withheld for 100 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_opponent_is_preferred_over_the_one_just_played() {
+        /* The preference, which only MEANS anything when there is somebody
+         * else to prefer. a1 and a2 just played; a3 is waiting; a1 must be
+         * offered a3. */
         let q = Queue::default();
         q.note_pairing("a1", "a2").await;
         q.push(ticket("p1", "a1", vec![key("G")])).await;
         q.push(ticket("p2", "a2", vec![key("G")])).await;
-        assert!(q.pair(300).await.is_empty(), "avoid the last opponent");
+        q.push(ticket("p3", "a3", vec![key("G")])).await;
+
+        let offers = q.pair(300).await;
+        assert_eq!(offers.len(), 1);
+        let accounts = [offers[0].a.account_id.clone(), offers[0].b.account_id.clone()];
+        assert!(
+            accounts.contains(&"a3".to_string()),
+            "the fresh opponent should have been picked: {accounts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_people_who_just_played_are_paired_again_rather_than_left_waiting() {
+        /* Observed live: both players finished a match, both queued again
+         * about a minute later, and the server logged two tickets and no
+         * offer. `rematch_ok` is a PREFERENCE, but a single-pass scan made it
+         * a hard filter -- with nobody else in the bucket there was nothing to
+         * fall through to, and the only escape was a 100-second timer. In a
+         * pool of two that is the whole feature, broken after every match.
+         *
+         * Fresh tickets on purpose: no waiting, no timer, paired immediately. */
+        let q = Queue::default();
+        q.note_pairing("a1", "a2").await;
+        q.push(ticket("p1", "a1", vec![key("G")])).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await;
+        assert_eq!(
+            q.pair(300).await.len(),
+            1,
+            "nobody else to prefer, so the rematch is the match"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hard_rules_still_hold_on_the_rematch_pass() {
+        /* Relaxing the preference must not relax anything else: the same
+         * account is never paired with itself, whatever the second pass is
+         * willing to overlook. */
+        let q = Queue::default();
+        q.note_pairing("a1", "a1").await;
+        q.push(ticket("p1", "a1", vec![key("G")])).await;
+        q.push(ticket("p2", "a1", vec![key("G")])).await;
+        assert!(q.pair(300).await.is_empty(), "one account, two connections");
     }
 
     #[tokio::test]
@@ -1224,8 +1325,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_rematch_filter_gives_way_rather_than_emptying_a_two_person_pool() {
-        /* Soft, and it has to be: held hard, a pool of exactly two people
-         * stops working after their first match. */
+        /* The timer inside `rematch_ok` -- now a backstop rather than the only
+         * way out, since the second pass in find_pair handles the common case
+         * without waiting. Kept because it also covers a pool where the only
+         * other candidates fail the RTT ceiling. */
         let q = Queue::default();
         q.note_pairing("a1", "a2").await;
         let old = std::time::Duration::from_secs(RTT_WIDEN_SECS * RTT_UNLIMITED_AFTER_STEPS + 1);
