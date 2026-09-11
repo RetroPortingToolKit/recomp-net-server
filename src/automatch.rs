@@ -220,6 +220,159 @@ fn summarize(caps: &Value) -> String {
 }
 
 /// The `automatch_rulesets_ok` payload for one title.
+/// Is every cosmetic exemption this ticket relies on approved by the ruleset
+/// it is queueing into?
+///
+/// # Why the server does this at all
+///
+/// A mod that only changes what a machine DRAWS may be run by one player and
+/// not the other, because it cannot desync anything. A mod that touches the
+/// simulation may not. Deciding which is which used to happen entirely on the
+/// client, which then sent a single `mods_enabled` boolean -- a VERDICT, from
+/// the one machine with an interest in the answer, about rules that machine
+/// also held. The server could not see what had been claimed, only whether the
+/// client had decided it was fine.
+///
+/// Now the ticket declares the exemptions themselves and the ruleset holds the
+/// allowlist, so the decision is here. A client cannot widen its own
+/// exemptions by shipping a different client; the worst it can do is misreport,
+/// and a misreport is a specific false statement about named bytes that is
+/// logged, rather than an invisible boolean.
+///
+/// # Matching
+///
+/// Allowlist (`match_caps.mod_cosmetic_allow`) is `;`-separated, each entry
+/// `id@version` or `id@version#sha256`. Claims are `id@version#sha256`.
+/// A pinned entry must match the digest; an unpinned one matches any digest of
+/// that id and version.
+///
+/// Pin the digests. Unpinned, the entry is keyed on a string the client picks
+/// for itself, so a mod is exempted by naming itself something approved.
+///
+/// # Failing closed
+///
+/// No allowlist approves nothing. That is the answer for every ruleset written
+/// before this existed, and it must stay the answer: a ruleset that says
+/// nothing about cosmetic mods has not blessed any, and reading its silence as
+/// permission is the whole hole. Returns the first unapproved claim.
+/// One peer's report that the two simulations diverged.
+///
+/// Facts only, from one side. See `migrations/005_desync_reports.sql` for why
+/// there is no verdict field and why there must not be one: a fork says two
+/// peers disagreed, and which of them moved is not answerable from a two-peer
+/// disagreement. Version skew and genuine emulation bugs both produce these
+/// from entirely honest players.
+#[derive(Debug, Clone, Default)]
+pub struct DesyncReport {
+    pub lobby_id: String,
+    pub game_name: String,
+    pub game_version: String,
+    pub disc_fp: String,
+    pub tick: i64,
+    pub partition: String,
+    pub digest_mine: String,
+    pub digest_theirs: String,
+    pub role: String,
+    pub mod_exempt: String,
+}
+
+/// Bound every field a client controls before it reaches storage.
+///
+/// These strings arrive from a peer that may be running anything at all, and
+/// the table is append-only with no rate limit beyond one row per session, so
+/// the cheap failure is a client writing megabytes into a log nobody reads.
+/// Truncating rather than rejecting is deliberate: a malformed report is still
+/// evidence that a session forked, and dropping it would let a peer suppress
+/// its own row by making it invalid.
+fn clamp(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// Store one report. Best effort: a diagnostic that fails a match is worse
+/// than a missing row.
+pub async fn record_desync(pool: &SqlitePool, account_id: &str, r: &DesyncReport) {
+    let res = sqlx::query(
+        "INSERT INTO desync_reports (id, player_id, lobby_id, game_name, \
+         game_version, disc_fp, tick, partition, digest_mine, digest_theirs, \
+         role, mod_exempt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(account_id)
+    .bind(clamp(&r.lobby_id, 64))
+    .bind(clamp(&r.game_name, 128))
+    .bind(clamp(&r.game_version, 64))
+    .bind(clamp(&r.disc_fp, 64))
+    .bind(r.tick.clamp(0, i64::from(u32::MAX)))
+    .bind(clamp(&r.partition, 32))
+    .bind(clamp(&r.digest_mine, 16))
+    .bind(clamp(&r.digest_theirs, 16))
+    .bind(clamp(&r.role, 8))
+    .bind(clamp(&r.mod_exempt, 512))
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        warn!(error = %e, "desync report not recorded");
+    }
+}
+
+pub fn unapproved_exemption(caps: &Value, claims: &[String]) -> Option<String> {
+    if claims.is_empty() {
+        return None;
+    }
+    let allow = caps
+        .get("mod_cosmetic_allow")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    for claim in claims {
+        let claim = claim.trim();
+        if claim.is_empty() {
+            continue;
+        }
+        // `id@version#digest`; a claim with no digest can only match an
+        // unpinned entry, which is what an older client sends.
+        let (claim_name, claim_digest) = match claim.split_once('#') {
+            Some((n, d)) => (n.trim(), d.trim()),
+            None => (claim, ""),
+        };
+        let mut ok = false;
+        for entry in allow.split(';') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (entry_name, entry_digest) = match entry.split_once('#') {
+                Some((n, d)) => (n.trim(), d.trim()),
+                None => (entry, ""),
+            };
+            if !entry_name.eq_ignore_ascii_case(claim_name) {
+                continue;
+            }
+            if entry_digest.is_empty() {
+                ok = true; // named, not pinned
+                break;
+            }
+            if !claim_digest.is_empty()
+                && entry_digest.eq_ignore_ascii_case(claim_digest)
+            {
+                ok = true;
+                break;
+            }
+            // Pinned entry, wrong or missing digest: keep looking, another
+            // entry may pin the same package at a digest that does match.
+        }
+        if !ok {
+            return Some(claim.to_string());
+        }
+    }
+    None
+}
+
 pub fn rulesets_json(rs: &Rulesets, game_name: &str) -> Value {
     let rows: Vec<Value> = rs
         .for_game(game_name)
@@ -940,11 +1093,12 @@ pub const SWEEP_INTERVAL_SECS: u64 = 24 * 60 * 60;
 pub struct Pruned {
     pub strikes: u64,
     pub pairings: u64,
+    pub desyncs: u64,
 }
 
 impl Pruned {
     pub fn total(&self) -> u64 {
-        self.strikes + self.pairings
+        self.strikes + self.pairings + self.desyncs
     }
 }
 
@@ -985,7 +1139,22 @@ pub async fn prune(
         .await?
         .rows_affected();
 
-    Ok(Pruned { strikes, pairings })
+    /* Fork reports age out on the plain retention window -- unlike strikes and
+     * pairings they have no enforcement window of their own to protect, because
+     * nothing enforces on them. They are kept only as long as everything else
+     * here, which is the right default for a table of player behaviour that has
+     * not yet been shown to be worth acting on. */
+    let desyncs = sqlx::query("DELETE FROM desync_reports WHERE created_at < datetime('now', ?)")
+        .bind(format!("-{} seconds", retention_days.saturating_mul(86_400)))
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    Ok(Pruned {
+        strikes,
+        pairings,
+        desyncs,
+    })
 }
 
 /// Run the sweep now, then daily. The immediate first pass matters: a server
@@ -1001,6 +1170,7 @@ pub fn spawn_sweep(pool: SqlitePool, retention_days: u64, rematch_cooldown_secs:
                     info!(
                         strikes = p.strikes,
                         pairings = p.pairings,
+                        desyncs = p.desyncs,
                         retention_days,
                         "automatch retention sweep"
                     );
@@ -1016,6 +1186,85 @@ pub fn spawn_sweep(pool: SqlitePool, retention_days: u64, rematch_cooldown_secs:
 
 #[cfg(test)]
 mod tests {
+    use super::unapproved_exemption as unapproved;
+
+    fn caps_with(allow: &str) -> Value {
+        if allow.is_empty() {
+            json!({ "v": 1 })
+        } else {
+            json!({ "v": 1, "mod_cosmetic_allow": allow })
+        }
+    }
+
+    const D1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const D2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn no_claims_is_always_fine() {
+        assert!(unapproved(&caps_with(""), &[]).is_none());
+    }
+
+    #[test]
+    fn a_ruleset_with_no_allowlist_approves_nothing() {
+        // The default that every ruleset written before this feature has, and
+        // the one that must never read as permission.
+        let claims = vec![format!("m@1.0.0#{D1}")];
+        assert_eq!(
+            unapproved(&caps_with(""), &claims).as_deref(),
+            Some(format!("m@1.0.0#{D1}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_pinned_entry_approves_its_own_digest() {
+        let caps = caps_with(&format!("m@1.0.0#{D1}"));
+        assert!(unapproved(&caps, &[format!("m@1.0.0#{D1}")]).is_none());
+    }
+
+    #[test]
+    fn a_pinned_entry_refuses_a_different_digest() {
+        // The impersonation case: right id, right version, other bytes. This
+        // is what makes the list a whitelist rather than a naming convention.
+        let caps = caps_with(&format!("m@1.0.0#{D1}"));
+        assert!(unapproved(&caps, &[format!("m@1.0.0#{D2}")]).is_some());
+    }
+
+    #[test]
+    fn a_pinned_entry_refuses_a_claim_with_no_digest() {
+        let caps = caps_with(&format!("m@1.0.0#{D1}"));
+        assert!(unapproved(&caps, &["m@1.0.0".to_string()]).is_some());
+    }
+
+    #[test]
+    fn a_different_version_is_a_different_package() {
+        let caps = caps_with(&format!("m@1.0.0#{D1}"));
+        assert!(unapproved(&caps, &[format!("m@2.0.0#{D1}")]).is_some());
+    }
+
+    #[test]
+    fn one_bad_claim_among_good_ones_is_reported() {
+        let caps = caps_with(&format!("good@1.0.0#{D1}"));
+        let claims = vec![format!("good@1.0.0#{D1}"), format!("evil@1.0.0#{D2}")];
+        assert_eq!(
+            unapproved(&caps, &claims).as_deref(),
+            Some(format!("evil@1.0.0#{D2}").as_str())
+        );
+    }
+
+    #[test]
+    fn several_entries_and_digest_case_do_not_matter() {
+        let caps = caps_with(&format!(" a@1.0.0#{D1} ; m@1.0.0#{} ", D2.to_uppercase()));
+        assert!(unapproved(&caps, &[format!("m@1.0.0#{D2}")]).is_none());
+    }
+
+    #[test]
+    fn an_unpinned_entry_approves_any_digest_of_that_package() {
+        // Supported so a deployment can start loose, and deliberately weak --
+        // the doc comment says to pin.
+        let caps = caps_with("m@1.0.0");
+        assert!(unapproved(&caps, &[format!("m@1.0.0#{D2}")]).is_none());
+    }
+
     use super::*;
 
 
@@ -1701,6 +1950,111 @@ mod tests {
         pool
     }
 
+    fn report(tick: i64) -> DesyncReport {
+        DesyncReport {
+            lobby_id: "L1".into(),
+            game_name: "G".into(),
+            game_version: "1.0".into(),
+            disc_fp: "fp".into(),
+            tick,
+            partition: "wram".into(),
+            digest_mine: "aabbccdd".into(),
+            digest_theirs: "11223344".into(),
+            role: "host".into(),
+            mod_exempt: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_desync_report_is_stored_with_both_digests() {
+        // Both, always: a row holding one peer's number could only ever be
+        // read as an accusation, which is exactly what this table must not be.
+        let pool = db().await;
+        record_desync(&pool, "a1", &report(500)).await;
+        let (mine, theirs): (String, String) =
+            sqlx::query_as("SELECT digest_mine, digest_theirs FROM desync_reports")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mine, "aabbccdd");
+        assert_eq!(theirs, "11223344");
+    }
+
+    #[tokio::test]
+    async fn both_peers_reporting_one_fork_is_findable_as_a_pair() {
+        // Two rows, one lobby, one tick, opposite roles: a corroborated fork.
+        // One row alone means the opponent did not report, which is its own
+        // fact and is why the pair has to be findable at all.
+        let pool = db().await;
+        /* The opponent needs an account row of its own: record_desync is
+         * best-effort and swallows a failed insert, so without this the test
+         * would quietly assert against one row and pass for the wrong
+         * reason. */
+        sqlx::query("INSERT INTO players (id, api_token_hash) VALUES ('a2','y')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        record_desync(&pool, "a1", &report(500)).await;
+        let mut other = report(500);
+        other.role = "guest".into();
+        other.digest_mine = "11223344".into();
+        other.digest_theirs = "aabbccdd".into();
+        record_desync(&pool, "a2", &other).await;
+
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM desync_reports WHERE lobby_id = 'L1' AND tick = 500",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_report_is_truncated_rather_than_dropped() {
+        // A peer may send anything. Truncating keeps the evidence that a
+        // session forked; rejecting would let a peer suppress its own row by
+        // making it malformed.
+        let pool = db().await;
+        let mut r = report(-5);
+        r.partition = "x".repeat(10_000);
+        r.mod_exempt = "y".repeat(10_000);
+        record_desync(&pool, "a1", &r).await;
+        let (tick, part, exempt): (i64, String, String) =
+            sqlx::query_as("SELECT tick, partition, mod_exempt FROM desync_reports")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tick, 0, "a negative tick is clamped, not stored");
+        assert_eq!(part.len(), 32);
+        assert_eq!(exempt.len(), 512);
+    }
+
+    #[tokio::test]
+    async fn desync_rows_age_out_with_everything_else() {
+        let pool = db().await;
+        record_desync(&pool, "a1", &report(1)).await;
+        sqlx::query("UPDATE desync_reports SET created_at = datetime('now','-40 days')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let p = prune(&pool, 30, 600).await.unwrap();
+        assert_eq!(p.desyncs, 1);
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM desync_reports")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn a_recent_desync_row_survives_the_sweep() {
+        let pool = db().await;
+        record_desync(&pool, "a1", &report(1)).await;
+        let p = prune(&pool, 30, 600).await.unwrap();
+        assert_eq!(p.desyncs, 0);
+    }
+
     #[tokio::test]
     async fn a_clean_account_has_no_cooldown() {
         let pool = db().await;
@@ -1827,7 +2181,10 @@ mod tests {
         .unwrap();
 
         let p = prune(&pool, 30, 300).await.unwrap();
-        assert_eq!(p, Pruned { strikes: 1, pairings: 1 });
+        assert_eq!(
+            p,
+            Pruned { strikes: 1, pairings: 1, desyncs: 0 }
+        );
 
         let (s,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM automatch_strikes")
             .fetch_one(&pool)

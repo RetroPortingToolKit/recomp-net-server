@@ -426,11 +426,37 @@ struct InMsg {
     /// Which queue, when the client already picked one.
     #[serde(default)]
     ruleset_id: Option<String>,
-    /// The client asserting it will boot vanilla. The server cannot check
-    /// this and does not pretend to -- it exists so a modified client is
-    /// making a false statement rather than exploiting an omission.
+    /// The client asserting it will boot vanilla -- its own verdict, kept as
+    /// a first gate. It is no longer the only thing the server has: see
+    /// `mod_exempt`, which carries the evidence the verdict was computed from
+    /// so the server can apply the allowlist itself.
     #[serde(default)]
     mods_enabled: Option<bool>,
+    /// Every cosmetic exemption the ticket relies on, as `id@version#sha256`.
+    ///
+    /// A mod that only changes what a machine draws may be run by one player
+    /// alone; one that touches the simulation may not. Which is which is the
+    /// ruleset's call, so the client declares what it is relying on and the
+    /// server checks it against `match_caps.mod_cosmetic_allow`. Absent or
+    /// empty means "none claimed", which is what every client older than this
+    /// field sends and is exactly as safe as before.
+    #[serde(default)]
+    mod_exempt: Option<Vec<String>>,
+    /* `desync_report` only. The client sends mod_exempt as a STRING here
+     * rather than the array the ticket uses, because a report is one flat row
+     * and the ';'-joined form is what goes in the column. */
+    #[serde(default)]
+    tick: Option<i64>,
+    #[serde(default)]
+    partition: Option<String>,
+    #[serde(default)]
+    mine: Option<String>,
+    #[serde(default)]
+    theirs: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    mod_exempt_text: Option<String>,
     /// Echoed on `automatch_accept` so a late answer to a lapsed offer is
     /// recognisably late rather than applied to the next one.
     #[serde(default)]
@@ -1443,6 +1469,7 @@ async fn handle_text(
         "automatch_queue" => handle_automatch_queue(state, player_id, msg).await?,
         "automatch_cancel" => handle_automatch_cancel(state, player_id).await?,
         "automatch_rtt" => handle_automatch_rtt(state, player_id, msg).await?,
+        "desync_report" => handle_desync_report(state, player_id, msg).await?,
         "automatch_accept" => handle_automatch_accept(state, player_id, msg).await?,
         other => {
             send_to(
@@ -3270,6 +3297,70 @@ fn build_keys(
     Ok(keys)
 }
 
+/// One peer reporting that the two simulations diverged.
+///
+/// Stored, never judged. A fork means two peers disagreed at a tick -- version
+/// skew produces it, and so does a genuine emulation bug, from two entirely
+/// honest players. Which side moved is not answerable from one disagreement at
+/// all; it needs many matches against many DIFFERENT opponents, which is the
+/// one thing this server can do that neither client can. So both digests are
+/// stored, both peers report independently, and nothing here decides anything.
+/// See `migrations/005_desync_reports.sql` and AUTOMATCH.md §15.
+///
+/// Requires a signed-in account for the same reason automatch does: a signal a
+/// reconnect erases is not a signal. A report from an anonymous connection is
+/// dropped silently -- it is a diagnostic, and refusing it loudly would give a
+/// client something to handle on a path that runs while a match is falling
+/// apart.
+async fn handle_desync_report(
+    state: &AppState,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    let (account, game_name) = {
+        let g = hub.inner.lock().await;
+        let Some(c) = g.clients.get(player_id) else {
+            return Ok(());
+        };
+        (
+            c.account.as_ref().map(|a| a.id.to_string()),
+            c.game_name.clone(),
+        )
+    };
+    let Some(account_id) = account else {
+        return Ok(());
+    };
+
+    let report = automatch::DesyncReport {
+        lobby_id: msg.lobby_id.clone().unwrap_or_default(),
+        game_name,
+        game_version: msg.game_version.clone().unwrap_or_default(),
+        disc_fp: msg.disc_fp.clone().unwrap_or_default(),
+        tick: msg.tick.unwrap_or(0),
+        partition: msg.partition.clone().unwrap_or_default(),
+        digest_mine: msg.mine.clone().unwrap_or_default(),
+        digest_theirs: msg.theirs.clone().unwrap_or_default(),
+        role: msg.role.clone().unwrap_or_default(),
+        mod_exempt: msg.mod_exempt_text.clone().unwrap_or_default(),
+    };
+    /* Deliberately info!, not warn!. A fork is a fact about a session, not a
+     * fault and not an accusation, and a log level that reads as an alarm is
+     * how a row like this ends up treated as proof of something. */
+    info!(
+        account = %account_id,
+        lobby = %report.lobby_id,
+        tick = report.tick,
+        partition = %report.partition,
+        mine = %report.digest_mine,
+        theirs = %report.digest_theirs,
+        role = %report.role,
+        "desync reported (two peers differed; this is not an attribution)"
+    );
+    automatch::record_desync(&state.pool, &account_id, &report).await;
+    Ok(())
+}
+
 async fn handle_automatch_rulesets(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
     let hub = &state.ws_lobby;
     let game = match msg.game_name.filter(|g| !g.is_empty()) {
@@ -3361,6 +3452,68 @@ async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -
             return Ok(());
         }
     };
+
+    /* The cosmetic-exemption gate, and the point at which the server stops
+     * taking the client's word for which of its mods are harmless.
+     *
+     * `mods_enabled` above is still the client's own verdict and still
+     * refused when true. This is the other half: the ticket declares the
+     * exemptions it is RELYING on, and each one is checked against the
+     * allowlist of the ruleset being queued into. A mod the ruleset has not
+     * approved is refused here however the client classified it, so shipping
+     * a modified client no longer widens what a player may run.
+     *
+     * Checked against EVERY ruleset in the ticket, not just the first. A
+     * ticket enters a bucket for each of its keys and may be paired under any
+     * of them, so approval by one permissive ruleset must not carry a mod
+     * into a strict pool listed beside it. Refusing the whole ticket rather
+     * than dropping the titles that disapprove is the conservative choice: a
+     * dropped title would silently queue the player for less than they asked
+     * for, and this way the message names what to turn off.
+     */
+    let exempt: Vec<String> = msg.mod_exempt.clone().unwrap_or_default();
+    if !exempt.is_empty() {
+        for t in &titles {
+            let Some(rs) = state
+                .automatch_rulesets
+                .resolve(&t.game_name, &t.ruleset_id)
+            else {
+                continue; // build_keys already refused anything unresolvable
+            };
+            if let Some(bad) = automatch::unapproved_exemption(&rs.match_caps, &exempt) {
+                warn!(
+                    account = %account_id,
+                    game = %t.game_name,
+                    ruleset = %rs.id,
+                    claim = %bad,
+                    "automatch: refused a mod exemption the ruleset does not approve"
+                );
+                send_to(
+                    hub,
+                    player_id,
+                    json!({
+                        "op": "error",
+                        "code": "mod_not_approved",
+                        "ok": false,
+                        "ruleset_id": rs.id,
+                        "mod": bad,
+                    })
+                    .to_string(),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+        /* Logged even when every claim passes. What a player was running is
+         * the first question after any dispute about a match, and a claim
+         * that was accepted is exactly the record that makes a later lie
+         * visible as a change. */
+        info!(
+            account = %account_id,
+            claims = %exempt.join(";"),
+            "automatch: accepted declared mod exemptions"
+        );
+    }
 
     let cool = automatch::cooldown_secs(
         &state.pool,

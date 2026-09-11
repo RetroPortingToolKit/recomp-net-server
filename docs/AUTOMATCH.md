@@ -88,6 +88,7 @@ each deliberate:
     }
   ],
   "mods_enabled": false,
+  "mod_exempt": [],
   "host_bind": "0.0.0.0:7777",
   "guest_bind": "0.0.0.0:7778"
 }
@@ -129,6 +130,11 @@ Errors (`{ "op": "error", "ok": false, "code": … }`):
 | `need_disc_fp` | Missing or malformed `disc_fp`. |
 | `version_not_pooled` | Ruleset pins a `game_version` and this is not it. |
 | `mods_not_pooled` | `mods_enabled` was true. |
+| `mod_not_approved` | A `mod_exempt` claim is not on the ruleset's `mod_cosmetic_allow` (§5.1). Carries `ruleset_id` and `mod`. |
+
+`desync_report` (§15) has no error reply at all: it is a diagnostic sent while
+a match is coming apart, and giving the client something to handle there would
+be worse than the missing row.
 | `slots_not_pooled` | `max_slots` != 2 in v1. |
 | `queue_full` | `AUTOMATCH_QUEUE_MAX` reached. |
 | `cooldown` | Dodge cooldown active; `retry_secs` is on the error. |
@@ -212,11 +218,64 @@ desync, not a fairness complaint. So:
 
 - the ticket asserts `mods_enabled: false`;
 - the server refuses `true` with `mods_not_pooled`;
-- **the launcher is where this is actually enforced** — the Queue button is
-  disabled, with the reason shown, while any sim-affecting mod feature is on.
-  The server cannot check this and must not pretend to: it is taking the
-  client's word, and the assertion exists so a modified client is making a
-  deliberate false statement rather than exploiting an omission.
+- the launcher also disables the Queue button, with the reason shown, while any
+  sim-affecting mod feature is on.
+
+That assertion is still only an assertion: it is computed on the client, about
+the client, and a modified client can simply send `false`. It is a first gate,
+not the boundary.
+
+### 5.1 Cosmetic exemptions, and who decides
+
+Some mods only change what a machine DRAWS — an accessibility filter that dulls
+flashing, say. Those may be run by one player and not the other, because they
+cannot desync anything, and requiring both sides to agree would make an
+accessibility feature unavailable in exactly the matches it exists for: a
+player who needs one does not choose their opponent.
+
+The question is who decides that a given mod is one of those. Originally the
+answer was "the client", which is the same machine that benefits from the
+answer being yes — so the exemption was effectively self-served.
+
+It is now the ruleset's:
+
+- a ruleset may carry **`match_caps.mod_cosmetic_allow`**, `;`-separated
+  entries of `id@version` or `id@version#sha256`;
+- the ticket carries **`mod_exempt`**, a JSON array of `id@version#sha256` for
+  every exemption the client is relying on;
+- the server checks each claim against that allowlist and refuses an
+  unapproved one with **`mod_not_approved`**, echoing `ruleset_id` and `mod`;
+- accepted claims are logged, because what a player was running is the first
+  question after any dispute, and an accepted claim is the record that makes a
+  later change visible.
+
+**No allowlist approves nothing.** Every ruleset written before this field has
+none, and that must keep meaning "no cosmetic mod is blessed here" — reading
+silence as permission is the whole hole. A client older than `mod_exempt` sends
+nothing, claims nothing, and is exactly as constrained as it was.
+
+**Pin the digests.** An unpinned `id@version` is keyed on a string the client
+picks for itself, so a mod takes the exemption by naming itself something
+approved. The digest is of the package packed by the mod runtime's
+deterministic archive, identical on every machine. Unpinned entries are
+supported so a deployment can start loose; they are deliberately weak.
+
+**Checked against every ruleset in the ticket**, not just the first. A ticket
+enters a bucket per key and may be paired under any of them, so approval by one
+permissive ruleset must not carry a mod into a strict pool listed beside it.
+
+### 5.2 What this does not do
+
+The server still cannot verify that the client's report is *true*. A patched
+binary can omit a mod from `mod_exempt` and set `mods_enabled: false`, and
+nothing here catches that; doing so needs verification of the simulation
+itself, which this protocol does not attempt.
+
+What changed is where the *rule* lives. Shipping a modified client no longer
+widens what a player may run, because the client no longer holds the
+allowlist — the worst it can do is lie about named bytes, on the record,
+instead of flipping an invisible boolean. Two players' claims are now
+comparable across matches, which is a detection surface where there was none.
 
 Identical-plan pooling (both sides carrying the same required plan) is the v2
 shape. It needs the plan digest in the match key and a way to reach the
@@ -631,3 +690,81 @@ read by nothing yet: setting one changes no behaviour until the queue lands.
 - [LOBBY.md](LOBBY.md) — HTTP `/v1` rooms API
 - [HOW_IT_WORKS.md](HOW_IT_WORKS.md) — architecture
 - [PRIVACY.md](PRIVACY.md) — what is retained; §8's two tables are new rows for it
+
+
+---
+
+## 15. Fork reports
+
+In rollback both peers digest the same simulation every tick (`snes_state_digest.h`,
+partitioned into CPU / WRAM / APU / PPU / DMA / CART). Any state divergence is
+therefore visible **by construction** — the entire class of cheating that alters
+the simulation cannot hide from it. That detection already existed and was
+written to a local log and discarded. `desync_report` is where it goes instead.
+
+```json
+{ "op": "desync_report", "v": 1,
+  "lobby_id": "…", "game_version": "…", "disc_fp": "…",
+  "tick": 4213, "partition": "wram",
+  "mine": "aabbccdd", "theirs": "11223344",
+  "role": "host", "mod_exempt": "…" }
+```
+
+Digests are hex **strings**: they are opaque 32-bit identities compared only
+for equality, and a reader that renders one as a float has destroyed the only
+thing the field is for.
+
+Stored in `desync_reports` (`005_desync_reports.sql`), keyed on the account —
+a signal a reconnect erases is not a signal. Sent once per session and
+promptly rather than at teardown, because a desync usually ends the match and
+often takes the connection with it.
+
+### 15.1 A fork is not an accusation
+
+This is the part to get right, and it is a design constraint rather than a
+caveat.
+
+**A row says two peers disagreed at a tick.** It does not say who moved, and
+that is not a limitation of the current implementation — it is not answerable
+from a two-peer disagreement at all. Version skew produces these rows. So does
+a genuine emulation bug, from two entirely honest players; this project has
+found several, and each would have filled this table.
+
+Attribution needs many matches against many **different** opponents, so that
+one account is repeatedly on the minority side of divergences that its various
+opponents are not. That is the one thing this server can do and neither client
+can, and it is the only reason the table is worth keeping.
+
+Accordingly:
+
+- both peers report independently, and both digests are stored in each row, so
+  a pair of rows for one lobby and tick is a corroborated event and a lone row
+  is a peer whose opponent did not report — itself a fact worth being able to
+  see;
+- there is deliberately **no verdict, score or flag column**. Adding one is a
+  decision to make on evidence that does not exist yet;
+- reports are logged at `info!`, not `warn!` — a level that reads as an alarm
+  is how a row like this ends up treated as proof of something;
+- **nothing is enforced on them.** No cooldown, no pool separation, no ban.
+  The current policy is to accumulate and look, because a fork rate means
+  nothing until the honest baseline is known, and a false positive on a
+  peer-to-peer deterministic sim bans a real player over someone else's bug.
+
+Rows age out on the ordinary retention window (`AUTOMATCH_RETENTION_DAYS`),
+like every other behavioural table here.
+
+### 15.2 What this covers, and what it cannot
+
+Covers: every cheat that changes the simulation — modified ROM, altered
+physics, frozen health. None of it can avoid moving a digest.
+
+Does not cover: **input reading**. A client that reads the opponent's published
+input for tick N and answers perfectly produces no divergence at all, because
+both simulations agree; the cheater simply appears to play impossibly well.
+Digests can never see it. The defence there is commitment — `input_delay >= 1`
+already means a peer's tick-N input is sent before they can have seen the
+opponent's, and enforcing and checking that ordering (or a commit–reveal hash)
+is a separate piece of work from this one.
+
+Nor does it cover presentation-layer cheats (hitbox overlays, frame data), which
+are sim-identical and undetectable by any means available here.
