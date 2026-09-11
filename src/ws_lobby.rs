@@ -662,10 +662,26 @@ impl Lobby {
     }
 }
 
-fn slot_json(i: usize, slot: &Slot) -> Value {
+/// `account` is the opaque, stable id behind the seat ("" for a guest),
+/// resolved by the caller -- every call site already holds the hub lock, and
+/// looking it up there beats copying it into five seating sites that would
+/// each have to be kept in step.
+/// The opaque account id behind a connection, or "" for a guest.
+fn account_of(g: &HubInner, player_id: &str) -> String {
+    g.clients
+        .get(player_id)
+        .and_then(|c| c.account.as_ref())
+        .map(|a| a.id.to_string())
+        .unwrap_or_default()
+}
+
+fn slot_json(i: usize, slot: &Slot, account: &str) -> Value {
     let mut row = json!({
         "slot": i,
         "player_id": slot.player_id,
+        /* Stable across the peer's reconnect and rename, unlike either name
+         * beside it -- this is what a client-side block list can key on. */
+        "account": account,
         "display_name": slot.display_name,
         "ready": slot.ready,
     });
@@ -723,6 +739,21 @@ struct OnlinePlayerRow {
     /// row (a display name is not unique across the hub) without the hub
     /// publishing whole ids to every browser.
     tag: String,
+    /// The signed-in ACCOUNT behind this connection, as an opaque id -- empty
+    /// for a guest.
+    ///
+    /// This is `players.id`, the server's own row key, and deliberately NOT
+    /// the Discord snowflake, which is never published to other players. It is
+    /// also not the handle: 002_discord_identity.sql is explicit that
+    /// netplay_handle is "never an identity, is not unique" and
+    /// discord_username is "not our key".
+    ///
+    /// It exists because a client-side ignore/block list needs something that
+    /// survives a reconnect AND a rename. Keyed on a name, such a list blocks
+    /// whoever renames into it and frees whoever renames out -- which is worse
+    /// than not having one. Opaque, stable, and useless for finding somebody
+    /// off this server, which is the whole set of properties wanted.
+    account: String,
     /// The title this client is browsing for ("" until its first `list`).
     game_name: String,
 }
@@ -845,6 +876,7 @@ fn lobby_list_json_filtered(
                 lobby_name: lobby.map(|l| l.name.clone()).unwrap_or_default(),
                 hosting: lobby.is_some_and(|l| l.host_player_id == c.player_id),
                 tag: c.player_id.chars().take(8).collect(),
+                account: c.account.as_ref().map(|a| a.id.to_string()).unwrap_or_default(),
                 game_name: c.game_name.clone(),
             }
         })
@@ -1103,13 +1135,14 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
         let mut slots = Vec::new();
         for (i, s) in l.slots.iter().enumerate() {
             if let Some(slot) = s {
-                slots.push(slot_json(i, slot));
+                slots.push(slot_json(i, slot, &account_of(&g, &slot.player_id)));
             }
         }
         let mut spectators = Vec::new();
         for (i, s) in l.spectators.iter().enumerate() {
             if let Some(slot) = s {
-                spectators.push(slot_json(spectator_seat(i), slot));
+                spectators.push(slot_json(spectator_seat(i), slot,
+                                          &account_of(&g, &slot.player_id)));
             }
         }
         /* Players only. A gallery that never presses Ready must not hold the
@@ -3133,6 +3166,16 @@ async fn start_lobby(
     // Phase 3: commit lobby state + build launch payload.
     let outcome = 'out: {
         let mut g = hub.inner.lock().await;
+        /* Snapshot the accounts BEFORE the mutable borrow below: the seat rows
+         * are serialised while `lobby` is held mutably, and the ids live on
+         * the hub's client map. One pass, no borrow argument. */
+        let acct_map: HashMap<String, String> = g
+            .clients
+            .values()
+            .filter_map(|c| {
+                c.account.as_ref().map(|a| (c.player_id.clone(), a.id.to_string()))
+            })
+            .collect();
         let Some(lobby) = g.lobbies.get_mut(&lid) else {
             break 'out StartOut::Err("gone");
         };
@@ -3156,13 +3199,16 @@ async fn start_lobby(
         let mut slots = Vec::new();
         for (i, s) in lobby.slots.iter().enumerate() {
             if let Some(slot) = s {
-                slots.push(slot_json(i, slot));
+                slots.push(slot_json(i, slot, acct_map.get(&slot.player_id)
+                                                  .map(String::as_str).unwrap_or("")));
             }
         }
         let mut spectators = Vec::new();
         for (i, s) in lobby.spectators.iter().enumerate() {
             if let Some(slot) = s {
-                spectators.push(slot_json(spectator_seat(i), slot));
+                spectators.push(slot_json(spectator_seat(i), slot,
+                                          acct_map.get(&slot.player_id)
+                                              .map(String::as_str).unwrap_or("")));
             }
         }
         /* The gallery launches with the match. It runs the same simulation
@@ -4113,10 +4159,19 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
         let Some(sender) = lobby.everyone().find(|s| s.player_id == player_id) else {
             return Ok(());
         };
+        /* The seat row carries the display name; the account comes from the
+         * connection behind it, which is where identity lives. */
+        let from_account = {
+            g.clients.get(player_id)
+                .and_then(|c| c.account.as_ref())
+                .map(|a| a.id.to_string())
+                .unwrap_or_default()
+        };
         let fwd = json!({
             "op": "chat",
             "lobby_id": lid,
             "from_player_id": player_id,
+            "from_account": from_account,
             "from": sender.display_name,
             "text": text,
         })
@@ -4256,6 +4311,11 @@ async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
             "op": "server_chat",
             "game_name": scope,
             "from_player_id": player_id,
+            /* The opaque account id, so a muted player stays muted across
+             * their reconnect and their rename. Empty for a guest, whose
+             * lines can only be muted for as long as the connection lasts. */
+            "from_account": sender.account.as_ref().map(|a| a.id.to_string())
+                                  .unwrap_or_default(),
             "from": sender.display_name,
             "country": sender.country,
             "text": text,
