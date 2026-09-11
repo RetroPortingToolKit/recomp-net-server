@@ -15,7 +15,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::moderation;
 use crate::metrics;
 use crate::AppState;
 
@@ -143,10 +144,53 @@ struct ClientMeta {
     tx: broadcast::Sender<String>,
 }
 
+/// One chat line the server relayed, kept just long enough to be reportable.
+///
+/// Chat is not persisted (see `handle_chat`), and this does not change that.
+/// These live in a bounded in-memory ring and are forgotten as they scroll
+/// off; a line reaches the database only if somebody reports it, and then only
+/// that line and a few before it.
+///
+/// The ring exists so a report can name a MESSAGE and the server can write
+/// down what it actually relayed. A report that carried its own copy of the
+/// text would let a reporter fabricate one, which is the difference between a
+/// moderation record and an accusation.
+#[derive(Clone)]
+struct ChatLine {
+    id: String,
+    /// Account of the sender. Empty for a signed-out connection, which is why
+    /// such a line cannot be reported: there is nobody to attribute it to.
+    from_account: String,
+    from_name: String,
+    text: String,
+    /// "lobby" | "server"
+    scope: String,
+    /// Empty for server chat.
+    lobby_id: String,
+    game_name: String,
+}
+
+/// How many relayed lines stay reportable.
+///
+/// Generous enough that somebody can read a line, decide, and still find it --
+/// which takes longer than people assume during an argument -- and bounded so
+/// a busy server cannot be made to hold chat indefinitely. At 240 chars a line
+/// the whole ring is a few hundred KB.
+const CHAT_RING_MAX: usize = 1000;
+
+/// Preceding lines stored with a report.
+const CHAT_CONTEXT_LINES: usize = 6;
+
 struct HubInner {
     clients: HashMap<String, ClientMeta>,
     lobbies: HashMap<String, Lobby>,
     next_session: u32,
+    /// Recently relayed chat, oldest first. See `ChatLine`.
+    chat_ring: VecDeque<ChatLine>,
+    /// Source of message ids. Process-local and never reused within a run; a
+    /// restart empties the ring, so an id from a previous process simply finds
+    /// nothing and the report is refused rather than misattributed.
+    next_chat_id: u64,
 }
 
 #[derive(Clone, Default)]
@@ -156,11 +200,64 @@ pub struct WsLobbyHub {
     geoip: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
 }
 
+impl HubInner {
+    /// Record a relayed line and hand back its id, which goes out with the
+    /// message so a client can later report exactly this one.
+    fn remember_chat(
+        &mut self,
+        from_account: &str,
+        from_name: &str,
+        text: &str,
+        scope: &str,
+        lobby_id: &str,
+        game_name: &str,
+    ) -> String {
+        let id = format!("{:x}", self.next_chat_id);
+        self.next_chat_id += 1;
+        self.chat_ring.push_back(ChatLine {
+            id: id.clone(),
+            from_account: from_account.to_string(),
+            from_name: from_name.to_string(),
+            text: text.to_string(),
+            scope: scope.to_string(),
+            lobby_id: lobby_id.to_string(),
+            game_name: game_name.to_string(),
+        });
+        while self.chat_ring.len() > CHAT_RING_MAX {
+            self.chat_ring.pop_front();
+        }
+        id
+    }
+
+    /// The reported line, plus the lines before it from the same room.
+    ///
+    /// Same room only: pulling context across rooms would put unrelated
+    /// people's chat into a moderation record about someone else, which is
+    /// both useless and a privacy cost with nothing to show for it.
+    fn chat_with_context(&self, message_id: &str) -> Option<(ChatLine, String)> {
+        let at = self.chat_ring.iter().position(|l| l.id == message_id)?;
+        let line = self.chat_ring[at].clone();
+        let start = at.saturating_sub(CHAT_CONTEXT_LINES);
+        let context = self
+            .chat_ring
+            .iter()
+            .take(at)
+            .skip(start)
+            .filter(|l| l.scope == line.scope && l.lobby_id == line.lobby_id)
+            .map(|l| format!("{}: {}", l.from_name, l.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((line, context))
+    }
+}
+
 impl Default for HubInner {
     fn default() -> Self {
         Self {
             clients: HashMap::new(),
             lobbies: HashMap::new(),
+            chat_ring: VecDeque::new(),
+            next_chat_id: 1,
             next_session: 1,
         }
     }
@@ -457,6 +554,31 @@ struct InMsg {
     role: Option<String>,
     #[serde(default)]
     mod_exempt_text: Option<String>,
+    /* `chat_report`: which line, why, and an optional sentence for a human.
+     * The TEXT is never taken from the client -- the server looks up what it
+     * relayed under this id. */
+    #[serde(default)]
+    mid: Option<String>,
+    /* Several messages at once: harassment is usually a burst, and making
+     * somebody file six reports to describe one incident produces six rows
+     * that each look minor. `mid` remains accepted so an older client still
+     * reports. */
+    #[serde(default)]
+    mids: Option<Vec<String>>,
+    #[serde(default)]
+    game: Option<String>,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    lobby: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
     /// Echoed on `automatch_accept` so a late answer to a lapsed offer is
     /// recognisably late rather than applied to the next one.
     #[serde(default)]
@@ -1503,6 +1625,7 @@ async fn handle_text(
         "automatch_cancel" => handle_automatch_cancel(state, player_id).await?,
         "automatch_rtt" => handle_automatch_rtt(state, player_id, msg).await?,
         "desync_report" => handle_desync_report(state, player_id, msg).await?,
+        "chat_report" => handle_chat_report(state, player_id, msg).await?,
         "automatch_accept" => handle_automatch_accept(state, player_id, msg).await?,
         other => {
             send_to(
@@ -3343,6 +3466,148 @@ fn build_keys(
     Ok(keys)
 }
 
+/// A player reporting somebody's chat line.
+///
+/// The client names a MESSAGE; the server writes down what it relayed under
+/// that id, from its own ring. Nothing the reporter sends becomes the evidence
+/// — they choose a category and may add a sentence, and that is all. A report
+/// carrying its own copy of the text would let anyone manufacture a message
+/// and have somebody sanctioned for it.
+///
+/// Both ends need an account. The reporter's, because an anonymous report is
+/// unanswerable and unratelimitable; the accused's, because a sanction has to
+/// attach to something a reconnect does not erase. A line from a signed-out
+/// guest is refused with `cannot_report` rather than stored against nobody.
+async fn handle_chat_report(
+    state: &AppState,
+    player_id: &str,
+    msg: InMsg,
+) -> Result<(), String> {
+    let hub = &state.ws_lobby;
+    /* `mids` is the current shape; `mid` is what an older client sends. */
+    let mut ids: Vec<String> = msg.mids.clone().unwrap_or_default();
+    if ids.is_empty() {
+        if let Some(one) = msg.mid.clone() {
+            ids.push(one);
+        }
+    }
+    ids.retain(|s| !s.is_empty());
+    ids.truncate(16);
+    if ids.is_empty() {
+        send_to(hub, player_id, am_err("bad_report")).await;
+        return Ok(());
+    }
+    let mid = ids[0].clone();
+
+    let (reporter, found, others) = {
+        let g = hub.inner.lock().await;
+        let reporter = g
+            .clients
+            .get(player_id)
+            .and_then(|c| c.account.as_ref())
+            .map(|a| a.id.to_string());
+        /* Resolve every id. Ones that have scrolled away are simply absent
+         * from the transcript rather than failing the report: a reporter who
+         * selected six lines and waited too long for one of them should still
+         * get the other five on the record. */
+        let others: Vec<(String, String)> = ids
+            .iter()
+            .filter_map(|m| g.chat_with_context(m).map(|(l, _)| (l.from_name, l.text)))
+            .collect();
+        (reporter, g.chat_with_context(&mid), others)
+    };
+
+    let Some(reporter_id) = reporter else {
+        send_to(hub, player_id, am_err("need_account")).await;
+        return Ok(());
+    };
+    /* Gone from the ring, or never in it. Says so plainly rather than
+     * pretending to file: somebody who reported a line and was told nothing
+     * has no way to know it did not happen. */
+    let Some((line, context)) = found else {
+        send_to(hub, player_id, am_err("message_expired")).await;
+        return Ok(());
+    };
+    if line.from_account.is_empty() {
+        send_to(hub, player_id, am_err("cannot_report")).await;
+        return Ok(());
+    }
+    if line.from_account == reporter_id {
+        /* Reporting yourself is not meaningful and is an easy way to put rows
+         * in the queue. Refused quietly. */
+        send_to(hub, player_id, am_err("cannot_report")).await;
+        return Ok(());
+    }
+
+    let transcript = others
+        .iter()
+        .map(|(who, what)| format!("{who}: {what}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let report = moderation::ChatReport {
+        reporter_id: reporter_id.clone(),
+        accused_id: line.from_account.clone(),
+        message_id: line.id.clone(),
+        message_text: line.text.clone(),
+        accused_name: line.from_name.clone(),
+        context,
+        transcript,
+        message_count: others.len() as i64,
+        /* Location fields prefer the SERVER's own knowledge and fall back to
+         * what the client said. The client's copy matters because a LAN or
+         * direct session has no server-side record at all -- but where the
+         * server does know, its answer is the one that cannot be edited. */
+        scope: if line.scope.is_empty() {
+            msg.scope.clone().unwrap_or_default()
+        } else {
+            line.scope.clone()
+        },
+        lobby_id: if line.lobby_id.is_empty() {
+            msg.lobby.clone().unwrap_or_default()
+        } else {
+            line.lobby_id.clone()
+        },
+        game_name: if line.game_name.is_empty() {
+            msg.game.clone().unwrap_or_default()
+        } else {
+            line.game_name.clone()
+        },
+        game_version: msg.game_version.clone().unwrap_or_default(),
+        platform: msg.platform.clone().unwrap_or_default(),
+        server: msg.server.clone().unwrap_or_default(),
+        reason: msg.reason.clone().unwrap_or_default(),
+        note: msg.note.clone().unwrap_or_default(),
+    };
+
+    let code = match moderation::record(
+        &state.pool,
+        &state.config.chat_report_dump_dir,
+        &report,
+    )
+    .await
+    {
+        /* A duplicate answers OK on purpose. The reporter did what they meant
+         * to; that a row already existed is the server's business, not a
+         * failure to hand back to somebody who just reported abuse. */
+        moderation::Submitted::Ok | moderation::Submitted::Duplicate => None,
+        moderation::Submitted::RateLimited => Some("rate_limited"),
+        moderation::Submitted::Failed => Some("report_failed"),
+    };
+    match code {
+        Some(c) => send_to(hub, player_id, am_err(c)).await,
+        None => {
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "chat_report_ok", "ok": true, "mid": mid }).to_string(),
+            )
+            .await
+        }
+    }
+    Ok(())
+}
+
 /// One peer reporting that the two simulations diverged.
 ///
 /// Stored, never judged. A fork means two peers disagreed at a tick -- version
@@ -4142,7 +4407,7 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
     let text = crate::chat_filter::apply(text);
     let text = text.as_str();
     let (fwd, targets) = {
-        let g = hub.inner.lock().await;
+        let mut g = hub.inner.lock().await;
         let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
             drop(g);
             send_to(
@@ -4167,16 +4432,26 @@ async fn handle_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<()
                 .map(|a| a.id.to_string())
                 .unwrap_or_default()
         };
+        let from_name = sender.display_name.clone();
+        let game_name = g
+            .clients
+            .get(player_id)
+            .map(|c| c.game_name.clone())
+            .unwrap_or_default();
+        let targets: Vec<String> = lobby.everyone().map(|s| s.player_id.clone()).collect();
+        /* The id goes out WITH the line, so a client reporting it names a
+         * message this server relayed rather than describing one. */
+        let mid = g.remember_chat(&from_account, &from_name, text, "lobby", &lid, &game_name);
         let fwd = json!({
             "op": "chat",
             "lobby_id": lid,
+            "mid": mid,
             "from_player_id": player_id,
             "from_account": from_account,
-            "from": sender.display_name,
+            "from": from_name,
             "text": text,
         })
         .to_string();
-        let targets: Vec<String> = lobby.everyone().map(|s| s.player_id.clone()).collect();
         (fwd, targets)
     };
     for t in targets {
@@ -4307,20 +4582,17 @@ async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
         let Some(sender) = g.clients.get(player_id) else {
             return Ok(());
         };
-        let fwd = json!({
-            "op": "server_chat",
-            "game_name": scope,
-            "from_player_id": player_id,
-            /* The opaque account id, so a muted player stays muted across
-             * their reconnect and their rename. Empty for a guest, whose
-             * lines can only be muted for as long as the connection lasts. */
-            "from_account": sender.account.as_ref().map(|a| a.id.to_string())
-                                  .unwrap_or_default(),
-            "from": sender.display_name,
-            "country": sender.country,
-            "text": text,
-        })
-        .to_string();
+        /* The opaque account id, so a muted player stays muted across their
+         * reconnect and their rename. Empty for a guest, whose lines can only
+         * be muted for as long as the connection lasts -- and, for the same
+         * reason, cannot be reported: there is nobody to attribute them to. */
+        let from_account = sender
+            .account
+            .as_ref()
+            .map(|a| a.id.to_string())
+            .unwrap_or_default();
+        let from_name = sender.display_name.clone();
+        let country = sender.country.clone();
         /* Audience: same title, any version. */
         let targets: Vec<String> = g
             .clients
@@ -4328,6 +4600,18 @@ async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
             .filter(|c| game_scope_for(&g, &c.player_id) == scope)
             .map(|c| c.player_id.clone())
             .collect();
+        let mid = g.remember_chat(&from_account, &from_name, &text, "server", "", &scope);
+        let fwd = json!({
+            "op": "server_chat",
+            "game_name": scope,
+            "mid": mid,
+            "from_player_id": player_id,
+            "from_account": from_account,
+            "from": from_name,
+            "country": country,
+            "text": text,
+        })
+        .to_string();
         (fwd, targets)
     };
     for t in targets {
@@ -4464,11 +4748,7 @@ mod game_scope_tests {
     use super::*;
 
     fn hub_inner() -> HubInner {
-        HubInner {
-            clients: HashMap::new(),
-            lobbies: HashMap::new(),
-            next_session: 1,
-        }
+        HubInner::default()
     }
 
     fn client(g: &mut HubInner, id: &str, game: &str, lobby: Option<&str>) {
@@ -4954,5 +5234,92 @@ mod list_scope_tests {
         let seen = lobby_list_json_for(&g, "p2");
         assert!(seen.contains("GundamPlayer"));
         assert!(seen.contains("Browsing"));
+    }
+}
+
+#[cfg(test)]
+mod chat_ring_tests {
+    use super::*;
+
+    fn ring() -> HubInner {
+        HubInner::default()
+    }
+
+    #[test]
+    fn a_reported_id_resolves_to_the_servers_own_text() {
+        // The point of the ring: a report names a message, and the server
+        // supplies the words. Nothing the reporter sends becomes evidence.
+        let mut g = ring();
+        let mid = g.remember_chat("acc1", "Alice", "the line", "lobby", "L1", "G");
+        let (line, _ctx) = g.chat_with_context(&mid).expect("should resolve");
+        assert_eq!(line.text, "the line");
+        assert_eq!(line.from_account, "acc1");
+        assert_eq!(line.from_name, "Alice");
+    }
+
+    #[test]
+    fn ids_are_not_reused_within_a_run() {
+        let mut g = ring();
+        let a = g.remember_chat("acc1", "A", "one", "lobby", "L1", "G");
+        let b = g.remember_chat("acc1", "A", "two", "lobby", "L1", "G");
+        assert_ne!(a, b);
+        assert_eq!(g.chat_with_context(&a).unwrap().0.text, "one");
+        assert_eq!(g.chat_with_context(&b).unwrap().0.text, "two");
+    }
+
+    #[test]
+    fn an_unknown_id_resolves_to_nothing() {
+        // What a report of a line that has scrolled away must hit: refused,
+        // never guessed at.
+        let g = ring();
+        assert!(g.chat_with_context("nope").is_none());
+    }
+
+    #[test]
+    fn context_is_the_preceding_lines_of_the_same_room() {
+        let mut g = ring();
+        g.remember_chat("a", "Alice", "first", "lobby", "L1", "G");
+        // Another room entirely: must not leak into a record about L1.
+        g.remember_chat("c", "Carol", "elsewhere", "lobby", "L2", "G");
+        g.remember_chat("b", "Bob", "second", "lobby", "L1", "G");
+        let mid = g.remember_chat("a", "Alice", "reported", "lobby", "L1", "G");
+
+        let (_line, ctx) = g.chat_with_context(&mid).unwrap();
+        assert!(ctx.contains("Alice: first"));
+        assert!(ctx.contains("Bob: second"));
+        assert!(
+            !ctx.contains("elsewhere"),
+            "another room's chat must not reach a moderation record: {ctx}"
+        );
+        assert!(
+            !ctx.contains("reported"),
+            "context is what came BEFORE, not the line itself"
+        );
+    }
+
+    #[test]
+    fn server_chat_and_lobby_chat_do_not_share_context() {
+        let mut g = ring();
+        g.remember_chat("a", "Alice", "in a room", "lobby", "L1", "G");
+        let mid = g.remember_chat("b", "Bob", "in the server channel", "server", "", "G");
+        let (_l, ctx) = g.chat_with_context(&mid).unwrap();
+        assert!(!ctx.contains("in a room"), "{ctx}");
+    }
+
+    #[test]
+    fn the_ring_is_bounded_and_old_lines_stop_being_reportable() {
+        // Chat is not persisted, and a report is the only thing that promotes
+        // a line out of memory. That has to stay true however busy a server
+        // gets, so the oldest ids must genuinely go.
+        let mut g = ring();
+        let first = g.remember_chat("a", "A", "oldest", "lobby", "L1", "G");
+        for i in 0..CHAT_RING_MAX {
+            g.remember_chat("a", "A", &format!("line {i}"), "lobby", "L1", "G");
+        }
+        assert_eq!(g.chat_ring.len(), CHAT_RING_MAX);
+        assert!(
+            g.chat_with_context(&first).is_none(),
+            "the oldest line should have aged out of the ring"
+        );
     }
 }

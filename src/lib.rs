@@ -7,6 +7,7 @@ pub mod identity;
 pub mod input_relay;
 pub mod ip_country;
 pub mod metrics;
+pub mod moderation;
 pub mod names;
 pub mod players;
 pub mod public_ip;

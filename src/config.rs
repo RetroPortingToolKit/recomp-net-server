@@ -121,6 +121,16 @@ pub struct Config {
     /// no separate enable flag: one place to look, and no state where a flag
     /// and the config disagree.
     pub automatch_rulesets_path: String,
+    /// `CHAT_REPORT_DUMP_DIR`. Where a chat report's transcript is written
+    /// alongside its database row. Empty disables the dumps; the row is still
+    /// written, so moderation keeps working without them.
+    ///
+    /// One directory for every title and every console. The files are named by
+    /// report id and date and NEVER by game or platform: one queue is read by
+    /// one person, and splitting the evidence by console would fragment a
+    /// moderation record along a line that has nothing to do with moderation.
+    /// Which game it was is inside the file, where it belongs.
+    pub chat_report_dump_dir: String,
     /// `AUTOMATCH_QUEUE_MAX`, `AUTOMATCH_ACCEPT_SECS`,
     /// `AUTOMATCH_START_DELAY_SECS`.
     pub automatch_queue_max: usize,
@@ -162,6 +172,10 @@ impl Config {
         let automatch_retention_days = parse_u64_env("AUTOMATCH_RETENTION_DAYS", 30);
         let automatch_rematch_cooldown_secs =
             parse_u64_env("AUTOMATCH_REMATCH_COOLDOWN_SECS", 300);
+        let chat_report_dump_dir = env::var("CHAT_REPORT_DUMP_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "data/reports".to_string());
         let automatch_rulesets_path = env::var("AUTOMATCH_RULESETS_PATH")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -340,6 +354,7 @@ impl Config {
             guest_can_host,
             automatch_retention_days,
             automatch_rematch_cooldown_secs,
+            chat_report_dump_dir,
             automatch_rulesets_path,
             automatch_queue_max,
             automatch_accept_secs,
