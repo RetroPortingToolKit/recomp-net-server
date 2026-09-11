@@ -537,8 +537,18 @@ impl Pending {
             None
         }
     }
+    /// Is the outcome decided?
+    ///
+    /// A DECLINE decides it on its own. Waiting for the other side to answer
+    /// a question that no longer has two possible answers left them staring at
+    /// a live countdown, deciding whether to accept a match that was already
+    /// dead -- and if they let it lapse rather than clicking, they took a
+    /// dodge strike for it. The peer who is still willing should be back in
+    /// the queue the moment the other one says no, not fifteen seconds later.
     fn answered(&self) -> bool {
-        self.a_accept.is_some() && self.b_accept.is_some()
+        self.a_accept == Some(false)
+            || self.b_accept == Some(false)
+            || (self.a_accept.is_some() && self.b_accept.is_some())
     }
     pub fn both_yes(&self) -> bool {
         self.a_accept == Some(true) && self.b_accept == Some(true)
@@ -1202,6 +1212,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_decline_settles_the_offer_without_waiting_for_the_peer() {
+        /* The peer who never answered should not be left holding a live
+         * countdown over a match that is already dead -- and letting it lapse
+         * rather than clicking would have charged THEM a dodge strike for a
+         * decision somebody else made. */
+        let q = Queue::default();
+        q.push(ticket("p1", "a1", vec![key("G")])).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await;
+        assert_eq!(q.pair(300).await.len(), 1);
+
+        let p = q
+            .answer("p1", false)
+            .await
+            .expect("a decline decides it on its own");
+        assert!(!p.both_yes());
+        /* And the caller can still tell who said no, with the other side's
+         * answer never given at all. */
+        assert_eq!(p.a_accept, Some(false));
+        assert_eq!(p.b_accept, None);
+    }
+
+    #[tokio::test]
+    async fn an_accept_still_waits_for_the_other_answer() {
+        /* The early-out is for declines only: one yes decides nothing. */
+        let q = Queue::default();
+        q.push(ticket("p1", "a1", vec![key("G")])).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await;
+        assert_eq!(q.pair(300).await.len(), 1);
+        assert!(q.answer("p1", true).await.is_none(), "still waiting on p2");
+        let p = q.answer("p2", true).await.expect("both in");
+        assert!(p.both_yes());
+    }
+
+    #[tokio::test]
     async fn the_journal_sequence_offers_a_second_match() {
         /* The live trace, replayed:
          *   02:13:38 queued f8e3  /  02:13:40 queued d15a
@@ -1306,10 +1350,9 @@ mod tests {
         let offers = q.pair(300).await;
         assert_eq!(offers.len(), 1, "they were offered each other");
 
-        /* Both sides have to answer before the offer resolves, so the other
-         * one accepting is what lands the decline. */
-        assert!(q.answer("p1", false).await.is_none(), "waiting on the peer");
-        let p = q.answer("p2", true).await.expect("the offer resolves");
+        /* A decline resolves the offer on its own -- the peer is never asked
+         * to answer a question that has already been settled. */
+        let p = q.answer("p1", false).await.expect("the offer resolves");
         assert!(!p.both_yes(), "one side said no");
 
         /* Both back in the queue, fresh, exactly as settle_declined does it. */
