@@ -125,6 +125,36 @@ ws_extra          = 43     # margin in pixels per side (256 + 2*43 = 342)
 # ruleset can only say "vanilla", and a game whose players nearly all run a
 # translation has a queue nobody can use.
 mod_set = "gwed.enhancement.widescreen@1.0.0/widescreen\ngwed.localization@1.0.0/localization language=en\n"
+
+# COSMETIC ALLOWLIST — packages this queue exempts from the set above.
+#
+# `presentation_only` in a package's own manifest is the mod ASKING. This is
+# the queue GRANTING, and the two are deliberately different things: a cheat
+# author writes manifests too, so an exemption that a package could vote
+# itself would be no exemption at all. The runtime independently refuses a
+# claim whose plugins the executable did not classify as presentation-only, or
+# whose package ships anything beyond its manifest, so this list cannot grant
+# something that was never admissible.
+#
+# gwed.accessibility.flashguard caps how far the presented picture may move in
+# one frame, which takes the end-of-fight strobe from a 68% full-screen swing
+# at 15 Hz down to about 9%, and the flashes crossing the WCAG 2.3.1 threshold
+# from nineteen to none. It filters the finished framebuffer and touches no
+# CPU, WRAM, VRAM, OAM, CGRAM, APU or save state, so a player running it
+# simulates the identical guest frames as one who is not.
+#
+# Granting it is the point rather than a courtesy. A photosensitive player does
+# not choose their opponent, and a filter that needed the other side to have it
+# too would be unavailable in exactly the matches it exists for -- the practical
+# effect of leaving this line out is telling that player to pick between the
+# filter and playing online.
+#
+# PINNED to the package digest, so the entry names bytes rather than a name the
+# client picks for itself. Read it out of any build's own log:
+#     netplay: cosmetic allowlist: <this exact string>
+# It changes when the package changes, which is the point: an edited package is
+# a different package and has to be looked at again.
+mod_cosmetic_allow = "gwed.accessibility.flashguard@1.0.0#a48b45886662ff3b869277b593d7415250105c4b4b0e2a69ca5506e5bab4dfb7"
 ignore_aspect     = false
 rollback          = true   # the SFU path every online match runs
 
