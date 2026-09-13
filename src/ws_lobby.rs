@@ -1955,30 +1955,35 @@ async fn handle_create(
     peer_ip: &str,
     msg: InMsg,
 ) -> Result<(), String> {
-    {
+    /* Decide under the lock, send after it. `send_to` takes the hub lock
+     * itself and the mutex is not reentrant, so sending from inside this
+     * block parked the task forever WITH the lock held -- and the whole hub
+     * with it: no `welcome` for any later connection, `/stats` hanging,
+     * while `/health` and sign-in (which never touch the hub) kept working.
+     * The trigger was a `create` from a connection the server still had
+     * seated somewhere. */
+    let refused = {
         let g = hub.inner.lock().await;
         if g.clients
             .get(player_id)
             .and_then(|c| c.lobby_id.as_ref())
             .is_some()
         {
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "already_in_lobby", "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
+            Some("already_in_lobby")
+        } else if g.lobbies.len() >= MAX_LOBBIES {
+            Some("lobby_limit")
+        } else {
+            None
         }
-        if g.lobbies.len() >= MAX_LOBBIES {
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "lobby_limit", "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
+    };
+    if let Some(code) = refused {
+        send_to(
+            hub,
+            player_id,
+            json!({ "op": "error", "code": code, "ok": false }).to_string(),
+        )
+        .await;
+        return Ok(());
     }
 
     let name = msg
@@ -3180,21 +3185,25 @@ async fn handle_set_ready(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Resu
 /// how the two would drift apart.
 async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(), String> {
     let hub = &state.ws_lobby;
+    /* Same rule as handle_create: never `send_to` while holding the hub
+     * lock -- it takes that lock itself and would deadlock the hub. */
     let lid = {
         let g = hub.inner.lock().await;
-        let Some(lid) = g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) else {
-            send_to(hub, player_id, am_err("not_in_lobby")).await;
-            return Ok(());
-        };
-        let Some(lobby) = g.lobbies.get(&lid) else {
-            send_to(hub, player_id, am_err("gone")).await;
-            return Ok(());
-        };
-        if lobby.host_player_id != player_id {
-            send_to(hub, player_id, am_err("not_host")).await;
+        match g.clients.get(player_id).and_then(|c| c.lobby_id.clone()) {
+            None => Err("not_in_lobby"),
+            Some(lid) => match g.lobbies.get(&lid) {
+                None => Err("gone"),
+                Some(lobby) if lobby.host_player_id != player_id => Err("not_host"),
+                Some(_) => Ok(lid),
+            },
+        }
+    };
+    let lid = match lid {
+        Ok(lid) => lid,
+        Err(code) => {
+            send_to(hub, player_id, am_err(code)).await;
             return Ok(());
         }
-        lid
     };
     if let Err(code) = start_lobby(state, &lid, msg.match_caps, Some(player_id)).await {
         send_to(hub, player_id, am_err(code)).await;
@@ -5505,6 +5514,62 @@ mod chat_ring_tests {
         assert!(
             g.chat_with_context(&first).is_none(),
             "the oldest line should have aged out of the ring"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hub_lock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `handle_create` must answer a seated client and RETURN.
+    ///
+    /// It used to call `send_to` -- which takes the hub lock -- from inside
+    /// the block that already held it. The tokio mutex is not reentrant, so
+    /// the task parked forever with the lock held and every other connection
+    /// on the server wedged behind it: a handshake and then silence, no
+    /// `welcome`, `/stats` hanging, while `/health` and sign-in kept working
+    /// because they never touch the hub. Guarded by a timeout so a
+    /// regression fails the suite instead of hanging it.
+    #[tokio::test]
+    async fn create_while_seated_answers_instead_of_wedging_the_hub() {
+        let hub = WsLobbyHub::new();
+        let (tx, mut rx) = broadcast::channel(4);
+        {
+            let mut g = hub.inner.lock().await;
+            g.clients.insert(
+                "p".to_string(),
+                ClientMeta {
+                    player_id: "p".to_string(),
+                    display_name: "p".to_string(),
+                    account: None,
+                    peer_ip: "127.0.0.1".into(),
+                    country: String::new(),
+                    game_name: "G".to_string(),
+                    lobby_id: Some("room".to_string()),
+                    pending_mod_lobby: None,
+                    blocks: Default::default(),
+                    probe_rtt_ms: -1,
+                    tx,
+                },
+            );
+        }
+        let msg: InMsg = serde_json::from_str(r#"{"op":"create","name":"x"}"#).unwrap();
+        let done = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_create(&hub, "p", "127.0.0.1", msg),
+        )
+        .await;
+        assert!(done.is_ok(), "handle_create deadlocked on its own hub lock");
+        let line = rx.try_recv().expect("the refusal reached the client");
+        assert!(line.contains("already_in_lobby"), "{line}");
+        /* And the hub is still usable by everyone else. */
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), hub.inner.lock())
+                .await
+                .is_ok(),
+            "hub lock still held after handle_create returned"
         );
     }
 }
