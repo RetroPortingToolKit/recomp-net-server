@@ -1175,12 +1175,42 @@ fn normalize_ice_path(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// Online MotK/BPE lobbies always use the lobby UDP SFU (§108).
-/// Waiting-room `path_report` / ICE P2P selection was removed — it disagreed
-/// with no-ICE builds and Force TURN semantics. Caps bits are ignored here;
-/// `force_turn` remains a client delay-floor hint only.
-fn start_use_sfu(_lobby: &Lobby, _caps: &Option<Value>) -> (bool, &'static str) {
-    (true, "always_sfu")
+/// How long a guest's waiting-room `path_report` counts (fail closed -> SFU).
+const HOST_RELAY_PATH_FRESH: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The lobby UDP SFU relays every online match (§108), with ONE exception:
+/// a host that asks to relay the match itself (`match_caps.relay = "host"`,
+/// the Retro hub's host-as-relay, WS_LOBBY.md "Host relay") gets it when
+/// every seated guest has proven, in the waiting room, that it reaches the
+/// host's advertised endpoint (`path_report` "direct", within
+/// HOST_RELAY_PATH_FRESH). Anything less -- no guest report, a stale one, a
+/// "relay" or "fail" -- falls back to the SFU, so a match always connects.
+/// Caps bits other than `relay` are ignored here; `force_turn` remains a
+/// client delay-floor hint only.
+fn start_use_sfu(lobby: &Lobby, caps: &Option<Value>) -> (bool, &'static str) {
+    let wants_host = caps
+        .as_ref()
+        .and_then(|c| c.get("relay"))
+        .and_then(|v| v.as_str())
+        == Some("host");
+    if !wants_host {
+        return (true, "always_sfu");
+    }
+    if lobby.host_endpoint.is_empty() {
+        return (true, "host_relay_no_endpoint");
+    }
+    for slot in lobby.slots.iter().flatten() {
+        if slot.player_id == lobby.host_player_id {
+            continue;
+        }
+        let fresh = slot
+            .ice_path_at
+            .is_some_and(|at| at.elapsed() <= HOST_RELAY_PATH_FRESH);
+        if slot.ice_path.as_deref() != Some("direct") || !fresh {
+            return (true, "host_relay_unproven");
+        }
+    }
+    (false, "host_relay")
 }
 
 fn player_count(lobby: &Lobby) -> usize {
@@ -2991,6 +3021,14 @@ async fn handle_set_host_endpoint(
             .await;
             return Ok(());
         }
+        /* A guest's path report proved the OLD address; a new one has to be
+         * proven again before the host may relay (start_use_sfu). */
+        if lobby.host_endpoint != endpoint {
+            for s in lobby.slots.iter_mut().flatten() {
+                s.ice_path = None;
+                s.ice_path_at = None;
+            }
+        }
         lobby.host_endpoint = endpoint;
         lobby.lan_endpoints = sanitize_lan_endpoints(msg.lan_endpoints);
         lid
@@ -3462,7 +3500,9 @@ async fn start_lobby(
              * slot 0 with its pad muted; players sit at lobby seat + 1. Every
              * peer derives its session slot from this, so it is said once. */
             "host_spectates": host_spectates,
-            "transport": if relay_endpoint.is_some() { "sfu" } else { "ice_p2p" },
+            /* Without an SFU endpoint the only launch left is the host
+             * relaying (start_use_sfu): every guest dials host_endpoint. */
+            "transport": if relay_endpoint.is_some() { "sfu" } else { "host" },
         });
         if let Some(caps) = &lobby.match_caps {
             launch["match_caps"] = caps.clone();
@@ -4953,6 +4993,52 @@ mod game_scope_tests {
                 started: false,
                 automatch: false,
             },
+        );
+    }
+
+    fn seat_path(g: &mut HubInner, lid: &str, i: usize, pid: &str, path: Option<&str>, age_s: u64) {
+        let at = Instant::now().checked_sub(std::time::Duration::from_secs(age_s));
+        g.lobbies.get_mut(lid).unwrap().slots[i] = Some(Slot {
+            player_id: pid.into(),
+            display_name: pid.into(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            memcard_offer: None,
+            country: String::new(),
+            ice_path: path.map(String::from),
+            ice_path_at: path.and(at),
+        });
+    }
+
+    #[test]
+    fn host_relay_needs_the_ask_an_endpoint_and_every_guest_direct() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Pokemon Stadium");
+        let host_caps = Some(json!({ "relay": "host" }));
+        {
+            let l = g.lobbies.get_mut("L").unwrap();
+            l.host_player_id = "h".into();
+            l.host_endpoint = "203.0.113.5:7777".into();
+        }
+        seat_path(&mut g, "L", 0, "h", None, 0);
+        seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        let l = &g.lobbies["L"];
+        assert_eq!(start_use_sfu(l, &None), (true, "always_sfu"), "no ask: the SFU");
+        assert_eq!(start_use_sfu(l, &host_caps), (false, "host_relay"), "asked and proven");
+
+        seat_path(&mut g, "L", 1, "g", Some("fail"), 1);
+        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "a failed probe: SFU");
+        seat_path(&mut g, "L", 1, "g", None, 0);
+        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "no report: SFU");
+        seat_path(&mut g, "L", 1, "g", Some("direct"), 600);
+        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "a stale report: SFU");
+        seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        g.lobbies.get_mut("L").unwrap().host_endpoint.clear();
+        assert_eq!(
+            start_use_sfu(&g.lobbies["L"], &host_caps),
+            (true, "host_relay_no_endpoint"),
+            "no endpoint: SFU"
         );
     }
 

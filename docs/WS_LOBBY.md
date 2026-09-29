@@ -427,8 +427,10 @@ seated, with no sender and `"system": true`: `"<name> has joined."`,
 ```
 
 Client → server (host only; requires seated `player_count >= 2`). Online MotK/BPE
-lobbies **always** open the lobby UDP SFU (`transport=sfu`, §108). Waiting-room
-ICE `path_report` is telemetry only and does **not** select `ice_p2p`.
+lobbies open the lobby UDP SFU (`transport=sfu`, §108) -- **amended 2026-09-29:**
+except a host-relay lobby whose guests have proven the host reachable, which
+launches `transport=host` ("Host relay" below). Waiting-room `path_report` does
+not select `ice_p2p`; in a host-relay lobby it is that proof.
 `match_caps.force_turn` is a client delay-floor hint, not a transport switch.
 Ready flags are informational only — host Play is the launch authority:
 
@@ -478,17 +480,39 @@ On success the server:
 }
 ```
 
-`transport` is `"sfu"`. `relay_endpoint` is present on every successful online
-start. Each client starts netplay with LAN transport to the relay. Guests apply
+`transport` is `"sfu"`, with `relay_endpoint`, unless the host relays
+(`"host"`, no `relay_endpoint`; below). Each client starts netplay with LAN transport to the relay. Guests apply
 `match_caps` (when present) before booting so both peers share sim-affecting
 settings. Direct IP / LAN file lobbies (no MotK WS seat) stay on local UDP and
 do not use this path.
+
+## Host relay (2026-09-29)
+
+A host may relay its own match instead of the SFU: the Retro hub runs
+recomp-net's LAN hub in the host's game process and every guest dials it
+(Retro-Launcher `docs/NETPLAY_DIRECT.md`).
+
+1. **The ask:** `match_caps.relay = "host"` (at `create`, `set_match_caps` or
+   `start`).
+2. **The address:** the host advertises its reachable UDP endpoint with
+   `set_host_endpoint` (the hub's STUN / UPnP / NAT-PMP result). Changing it
+   clears every guest's path report: the new address must be proven again.
+3. **The proof:** each guest probes the host's `host_endpoint` (from
+   `lobby_update`) while seated and sends `path_report` `direct` when the host
+   answered, `fail` when not.
+4. **The decision, at `start`:** `transport` is `"host"` only when the ask is
+   there, `host_endpoint` is set, and **every** seated guest's latest report is
+   `direct` and at most 120 s old. Otherwise the SFU relays as for any lobby,
+   so the match always connects (`start_use_sfu`; its reason is logged as
+   `host_relay`, `host_relay_unproven` or `host_relay_no_endpoint`).
+5. **`launch`** then carries `transport: "host"`, no `relay_endpoint`, and
+   `host_endpoint`: guests start LAN transport to it; the host binds its port.
 
 ## Path report (waiting-room ICE, telemetry)
 
 While seated (2 players), ICE-capable clients may still report the selected
 candidate type from the waiting-room RTT probe (delay hints / diagnostics).
-This no longer affects match transport:
+It affects transport only in a host-relay lobby (above):
 
 ```json
 { "op": "path_report", "path": "direct" }
