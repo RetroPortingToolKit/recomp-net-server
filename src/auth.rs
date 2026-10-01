@@ -70,3 +70,56 @@ pub fn verify_session_token(config: &Config, token: &str) -> Result<SessionClaim
     }
     Err(AuthError::InvalidToken)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(current: &str, previous: Option<&str>) -> Config {
+        Config {
+            jwt_secret_current: Some(current.into()),
+            jwt_secret_previous: previous.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    /* jsonwebtoken only compiles its crypto backend in by feature, and with
+     * none selected it panics at sign time. This is the test that notices. */
+    #[test]
+    fn an_issued_token_verifies_to_its_player() {
+        let cfg = config("current", None);
+        let player = Uuid::new_v4();
+        let token = issue_session_token(&cfg, &player).unwrap();
+        assert_eq!(
+            verify_session_token(&cfg, &token).unwrap().sub,
+            player.to_string()
+        );
+    }
+
+    #[test]
+    fn a_rotated_out_secret_verifies_only_while_it_is_previous() {
+        let token = issue_session_token(&config("old", None), &Uuid::new_v4()).unwrap();
+        assert!(verify_session_token(&config("new", Some("old")), &token).is_ok());
+        assert!(verify_session_token(&config("new", None), &token).is_err());
+    }
+
+    #[test]
+    fn an_expired_token_is_refused() {
+        let now = Utc::now().timestamp();
+        let claims = SessionClaims {
+            sub: Uuid::new_v4().to_string(),
+            iat: now - 7200,
+            exp: now - 3600,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"current"),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_session_token(&config("current", None), &token),
+            Err(AuthError::InvalidToken)
+        ));
+    }
+}
