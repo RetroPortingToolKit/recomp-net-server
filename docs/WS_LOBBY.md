@@ -321,10 +321,17 @@ Server → members (after join, leave, set_ready, etc.):
   "all_ready": false,
   "slots": [
     { "slot": 0, "player_id": "...", "display_name": "Host", "ready": true },
-    { "slot": 1, "player_id": "...", "display_name": "Guest", "ready": false }
+    { "slot": 1, "player_id": "...", "display_name": "Guest", "ready": false,
+      "path": "direct", "path_fresh": true }
   ]
 }
 ```
+
+A seat that has sent a `path_report` carries `path` (`direct` | `relay` |
+`fail`) and `path_fresh` (whether `start` would still trust it, see "Host
+relay"), so a host-relay room can show which guests have proven they reach
+the host before Play. Absent until the first report; cleared on join / leave
+/ kick and when the host's endpoint changes.
 
 ## Ready / start / launch
 
@@ -507,6 +514,13 @@ recomp-net's LAN hub in the host's game process and every guest dials it
    `host_relay`, `host_relay_unproven` or `host_relay_no_endpoint`).
 5. **`launch`** then carries `transport: "host"`, no `relay_endpoint`, and
    `host_endpoint`: guests start LAN transport to it; the host binds its port.
+
+Every seat's latest report is published on `lobby_update` as `path` /
+`path_fresh` (above), which is what the host's waiting room shows.
+
+Clients: recomp-net's `recomp_net/host_relay.h` is the shared implementation
+of steps 2 and 3 (UPnP IGD, NAT-PMP, STUN, the probe, the two ops), driven
+from `rnet_lobby_pump`; recomp-ui's Lobby Settings owns the ask (default on).
 
 ## Path report (waiting-room ICE, telemetry)
 

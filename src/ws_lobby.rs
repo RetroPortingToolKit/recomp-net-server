@@ -852,6 +852,15 @@ fn slot_json(i: usize, slot: &Slot, account: &str) -> Value {
     if !slot.country.is_empty() {
         row["country"] = json!(slot.country);
     }
+    // The guest's latest path_report and whether start_use_sfu would still
+    // trust it, so a host-relay room can show which guests have proven they
+    // reach the host before Play (WS_LOBBY.md "Host relay").
+    if let Some(path) = &slot.ice_path {
+        row["path"] = json!(path);
+        row["path_fresh"] = json!(slot
+            .ice_path_at
+            .is_some_and(|at| at.elapsed() <= HOST_RELAY_PATH_FRESH));
+    }
     row
 }
 
