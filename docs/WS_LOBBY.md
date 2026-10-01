@@ -509,9 +509,12 @@ recomp-net's LAN hub in the host's game process and every guest dials it
    answered, `fail` when not.
 4. **The decision, at `start`:** `transport` is `"host"` only when the ask is
    there, `host_endpoint` is set, and **every** seated guest's latest report is
-   `direct` and at most 120 s old. Otherwise the SFU relays as for any lobby,
-   so the match always connects (`start_use_sfu`; its reason is logged as
-   `host_relay`, `host_relay_unproven` or `host_relay_no_endpoint`).
+   `direct` and at most 120 s old, and **no spectator is seated** (the
+   gallery is read-only only because the SFU drops a spectator's packets;
+   a host hub forwards whatever reaches it). Otherwise the SFU relays as for
+   any lobby, so the match always connects (`start_use_sfu`; its reason is
+   logged as `host_relay`, `host_relay_unproven`, `host_relay_no_endpoint`
+   or `host_relay_spectators`).
 5. **`launch`** then carries `transport: "host"`, no `relay_endpoint`, and
    `host_endpoint`: guests start LAN transport to it; the host binds its port.
 

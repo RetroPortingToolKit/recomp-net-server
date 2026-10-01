@@ -1208,6 +1208,12 @@ fn start_use_sfu(lobby: &Lobby, caps: &Option<Value>) -> (bool, &'static str) {
     if lobby.host_endpoint.is_empty() {
         return (true, "host_relay_no_endpoint");
     }
+    // The gallery is read-only only because THIS relay drops a spectator's
+    // packets; recomp-net's host hub forwards whatever reaches it. A room
+    // with spectators therefore stays on the SFU.
+    if lobby.spectator_count() > 0 {
+        return (true, "host_relay_spectators");
+    }
     for slot in lobby.slots.iter().flatten() {
         if slot.player_id == lobby.host_player_id {
             continue;
@@ -5043,6 +5049,28 @@ mod game_scope_tests {
         seat_path(&mut g, "L", 1, "g", Some("direct"), 600);
         assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "a stale report: SFU");
         seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        {
+            // A spectator in the gallery: only the SFU can mute it.
+            let l = g.lobbies.get_mut("L").unwrap();
+            l.spectators = vec![Some(Slot {
+                player_id: "s".into(),
+                display_name: "s".into(),
+                ready: false,
+                bios_offer: None,
+                mod_offer: None,
+                memcard_offer: None,
+                country: String::new(),
+                ice_path: None,
+                ice_path_at: None,
+            })];
+        }
+        assert_eq!(
+            start_use_sfu(&g.lobbies["L"], &host_caps),
+            (true, "host_relay_spectators"),
+            "spectators seated: SFU"
+        );
+        g.lobbies.get_mut("L").unwrap().spectators.clear();
+        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, false, "gallery empty again: host");
         g.lobbies.get_mut("L").unwrap().host_endpoint.clear();
         assert_eq!(
             start_use_sfu(&g.lobbies["L"], &host_caps),
