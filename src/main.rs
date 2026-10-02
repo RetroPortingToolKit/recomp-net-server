@@ -295,7 +295,8 @@ async fn main() -> anyhow::Result<()> {
         signals: Arc::new(Mutex::new(SignalStore::default())),
         ws_lobby: recomp_net_server::ws_lobby::WsLobbyHub::with_geoip(
             config.geoip_db_path.as_deref(),
-        ),
+        )
+        .with_require_login(config.discord_required),
         input_relay,
         debug: debug_cli,
     };

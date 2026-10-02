@@ -316,6 +316,9 @@ struct PlayerCreated {
 }
 
 async fn create_player(State(state): State<AppState>) -> Result<Json<PlayerCreated>, ApiError> {
+    if state.config.discord_required {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "login_required"));
+    }
     let (player_id, api_token) = players::create_player(&state.pool)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -717,6 +720,19 @@ async fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<Uuid, Api
     players::require_player(&state.pool, &player_id, token)
         .await
         .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "invalid credentials"))?;
+
+    /* DISCORD_REQUIRED: an anonymous player row's token is not enough. */
+    if state.config.discord_required {
+        let linked: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT discord_id FROM players WHERE id = ?")
+                .bind(player_id.to_string())
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        if !matches!(linked, Some((Some(_),))) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "login_required"));
+        }
+    }
 
     Ok(player_id)
 }

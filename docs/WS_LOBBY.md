@@ -661,13 +661,20 @@ How it holds:
   the difference. Absent configuration means "as it always was", never
   "quietly stricter".
 
-### What is deliberately not gateable
+### `DISCORD_REQUIRED`: a closed server
 
-`list` and `join` are never refused for being a guest, even with
-`DISCORD_REQUIRED=1`. A server an older client cannot browse or sit down in is
-not compatible with it, whatever the flag says. Only the paths abuse actually
-travels through — chat, and hosting a room — can be closed.
+With `DISCORD_REQUIRED=1` the server admits only Discord-linked sessions.
+Startup fails unless sign-in is fully configured (`DISCORD_CLIENT_ID`,
+`DISCORD_CLIENT_SECRET`, `DISCORD_REDIRECT_URL`, `JWT_SECRET_CURRENT`).
 
-`DISCORD_REQUIRED` is the one switch that does lock out older clients by
-design. It stays off until every shipped port has caught up, and turning it on
-should be treated as a breaking deployment, not a tightening.
+- A WebSocket must send `hello` with a valid `session` within 15 seconds or it
+  is dropped. A `hello` without a valid session gets `error`
+  `{"code":"login_required"}` and the socket is closed.
+- Until signed in, only `hello` and `ping` are accepted. Any other op gets
+  `login_required` and the socket is closed. Nothing is sent to it (no
+  `lobby_list`), and it is left out of everyone else's players-online list.
+- `POST /v1/players` returns 403 `login_required`, and every `/v1` route that
+  authenticates a player also requires the player row to have a `discord_id`.
+- Default stays off. Turning it on locks out every client that cannot sign in,
+  so treat it as a breaking deployment. `GUEST_CAN_CHAT` / `GUEST_CAN_HOST` are
+  moot while it is on.

@@ -42,11 +42,9 @@ in a later diff.
 | 5 | Party sizes | **2p only.** `max_slots` 3..8 is refused. |
 | 6 | Multi-title tickets | **Wire-supported from day one**, filtered client-side. Standalone recomp-ui opts in exactly one title (the running game); Retro Launcher will opt in several. |
 
-Requiring an account (1) does not break the compatibility promise in
-WS_LOBBY.md → "What is deliberately not gateable". `list` and `join` stay open
-to guests, as promised. `automatch_queue` is an op no older client sends, so
-there is no client that could regress. It also holds independently of
-`DISCORD_REQUIRED`, which stays off.
+Requiring an account (1) holds independently of `DISCORD_REQUIRED`. Without
+it, `list` and `join` stay open to guests; with it, the whole server is closed
+to them (WS_LOBBY.md → "`DISCORD_REQUIRED`: a closed server").
 
 ## 3. The ticket, and the match key
 

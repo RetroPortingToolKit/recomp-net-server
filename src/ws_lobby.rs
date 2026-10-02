@@ -194,6 +194,9 @@ const CHAT_RING_MAX: usize = 1000;
 const CHAT_CONTEXT_LINES: usize = 6;
 
 struct HubInner {
+    /// Mirror of `WsLobbyHub::require_login`, so list builders that only see
+    /// the locked state can leave unauthenticated clients out of it.
+    require_login: bool,
     clients: HashMap<String, ClientMeta>,
     lobbies: HashMap<String, Lobby>,
     next_session: u32,
@@ -210,7 +213,18 @@ pub struct WsLobbyHub {
     inner: Arc<Mutex<HubInner>>,
     /// GeoIP country reader (None = flags off). Shared, read-only.
     geoip: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
+    /// `DISCORD_REQUIRED`: a connection with no signed-in account may do
+    /// nothing but `hello` / `ping`, is sent no lobby or player data, and is
+    /// dropped if it has not signed in within `LOGIN_GRACE`.
+    require_login: bool,
 }
+
+/// How long a fresh connection has to present a valid session when
+/// `DISCORD_REQUIRED` is on.
+const LOGIN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Returned by `handle_text` to say "end this connection", not "log a warning".
+const LOGIN_REQUIRED_CLOSE: &str = "login_required_close";
 
 impl HubInner {
     /// Record a relayed line and hand back its id, which goes out with the
@@ -266,6 +280,7 @@ impl HubInner {
 impl Default for HubInner {
     fn default() -> Self {
         Self {
+            require_login: false,
             clients: HashMap::new(),
             lobbies: HashMap::new(),
             chat_ring: VecDeque::new(),
@@ -278,6 +293,16 @@ impl Default for HubInner {
 impl WsLobbyHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Require every connection to be signed in to a Discord account.
+    pub fn with_require_login(mut self, required: bool) -> Self {
+        self.require_login = required;
+        self.inner
+            .try_lock()
+            .expect("hub is not shared yet at construction")
+            .require_login = required;
+        self
     }
 
     /// A hub that resolves each client's country from a MaxMind Country
@@ -1027,6 +1052,7 @@ fn lobby_list_json_filtered(
     let mut players: Vec<OnlinePlayerRow> = hub
         .clients
         .values()
+        .filter(|c| !hub.require_login || c.account.is_some())
         .filter(|c| match filter_game {
             Some(g) if !g.is_empty() => c.game_name == g,
             _ => true,
@@ -1346,6 +1372,9 @@ async fn broadcast_list(hub: &WsLobbyHub) {
     let mut by_scope: HashMap<String, String> = HashMap::new();
     for id in ids {
         let Some(c) = g.clients.get(&id) else { continue };
+        if hub.require_login && c.account.is_none() {
+            continue;
+        }
         let scope = game_scope_for(&g, &id);
         let payload = by_scope
             .entry(scope.clone())
@@ -1554,17 +1583,42 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 if !g.clients.contains_key(&player_tick) {
                     break;
                 }
+                if hub_tick.require_login
+                    && g.clients.get(&player_tick).is_some_and(|c| c.account.is_none())
+                {
+                    continue;
+                }
                 lobby_list_json_for(&g, &player_tick)
             };
             send_to(&hub_tick, &player_tick, payload).await;
         }
     });
 
-    while let Some(Ok(msg)) = stream.next().await {
+    let login_deadline = tokio::time::Instant::now() + LOGIN_GRACE;
+    let mut signed_in = !hub.require_login;
+    loop {
+        let next = if signed_in {
+            stream.next().await
+        } else {
+            match tokio::time::timeout_at(login_deadline, stream.next()).await {
+                Ok(n) => n,
+                Err(_) => {
+                    warn!(%player_id, %peer_ip, "ws lobby: no Discord sign-in within the grace period; dropping");
+                    break;
+                }
+            }
+        };
+        let Some(Ok(msg)) = next else { break };
         match msg {
             Message::Text(text) => {
-                if let Err(e) = handle_text(&state, &player_id, &peer_ip, &text).await {
-                    warn!(%player_id, error = %e, "ws lobby handler error");
+                match handle_text(&state, &player_id, &peer_ip, &text).await {
+                    Err(e) if e == LOGIN_REQUIRED_CLOSE => break,
+                    Err(e) => warn!(%player_id, error = %e, "ws lobby handler error"),
+                    Ok(()) => {}
+                }
+                if !signed_in {
+                    let g = hub.inner.lock().await;
+                    signed_in = g.clients.get(&player_id).is_some_and(|c| c.account.is_some());
                 }
             }
             Message::Ping(data) => {
@@ -1612,6 +1666,21 @@ async fn handle_text(
         .await;
         return Ok(());
     }
+    if hub.require_login && !matches!(msg.op.as_str(), "hello" | "ping") {
+        let authed = {
+            let g = hub.inner.lock().await;
+            g.clients.get(player_id).is_some_and(|c| c.account.is_some())
+        };
+        if !authed {
+            send_to(
+                hub,
+                player_id,
+                json!({ "op": "error", "code": "login_required", "ok": false }).to_string(),
+            )
+            .await;
+            return Err(LOGIN_REQUIRED_CLOSE.to_string());
+        }
+    }
     match msg.op.as_str() {
         "hello" => {
             /* `hello` is the identity message, not a handshake: a client
@@ -1654,10 +1723,30 @@ async fn handle_text(
                     }
                 }
             }
-            let (accepted_name, renamed_in) = {
+            let (accepted_name, renamed_in, signed_in) = {
                 let mut g = hub.inner.lock().await;
-                apply_identity(&mut g, player_id, hello_name, hello_game)
+                let (name, renamed) = apply_identity(&mut g, player_id, hello_name, hello_game);
+                let signed_in = g.clients.get(player_id).is_some_and(|c| c.account.is_some());
+                (name, renamed, signed_in)
             };
+            /* The one line that ties a connection's IP to the name it
+             * presented, so an operator can answer "who was on 1.2.3.4". The
+             * account's Discord id is deliberately not logged -- `signed_in`
+             * says only whether there is one. */
+            info!(%player_id, %peer_ip, display_name = %accepted_name, signed_in, "ws lobby hello");
+            if hub.require_login && !signed_in {
+                /* No valid session, and this server takes nobody without one.
+                 * Undo the placeholder name's visibility by never listing it
+                 * (broadcasts skip unauthenticated clients) and end the
+                 * connection. */
+                send_to(
+                    hub,
+                    player_id,
+                    json!({ "op": "error", "code": "login_required", "ok": false }).to_string(),
+                )
+                .await;
+                return Err(LOGIN_REQUIRED_CLOSE.to_string());
+            }
             send_to(
                 hub,
                 player_id,
@@ -5645,6 +5734,36 @@ mod chat_ring_tests {
 mod hub_lock_tests {
     use super::*;
     use std::time::Duration;
+
+    /// With `DISCORD_REQUIRED`, a connection that has not signed in must not
+    /// show up in anyone's players-online list.
+    #[tokio::test]
+    async fn require_login_hides_unauthenticated_clients_from_the_player_list() {
+        let hub = WsLobbyHub::new().with_require_login(true);
+        let (tx, _rx) = broadcast::channel(4);
+        let mut g = hub.inner.lock().await;
+        g.clients.insert(
+            "guest".to_string(),
+            ClientMeta {
+                player_id: "guest".to_string(),
+                display_name: "Guesty".to_string(),
+                account: None,
+                peer_ip: "127.0.0.1".into(),
+                country: String::new(),
+                game_name: "G".to_string(),
+                lobby_id: None,
+                pending_mod_lobby: None,
+                blocks: Default::default(),
+                probe_rtt_ms: -1,
+                tx,
+            },
+        );
+        let v: Value = serde_json::from_str(&lobby_list_json_filtered(&g, Some("G"), None)).unwrap();
+        assert!(v["players"].as_array().unwrap().is_empty());
+        g.require_login = false;
+        let v: Value = serde_json::from_str(&lobby_list_json_filtered(&g, Some("G"), None)).unwrap();
+        assert_eq!(v["players"].as_array().unwrap().len(), 1);
+    }
 
     /// `handle_create` must answer a seated client and RETURN.
     ///

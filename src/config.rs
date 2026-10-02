@@ -79,11 +79,12 @@ pub struct Config {
     /// `DISCORD_REDIRECT_URL` -- must match the Discord app registration byte
     /// for byte.
     pub discord_redirect_url: Option<String>,
-    /// `DISCORD_REQUIRED`. **Default false, and that default is the
-    /// compatibility promise**: a client that knows nothing about Discord
-    /// connects, seats, chats and hosts exactly as it does today. Turning this
-    /// on is a deliberate act that locks out every client older than the
-    /// integration, so it stays off until every shipped port has caught up.
+    /// `DISCORD_REQUIRED`. **Default false**, so a deployment that sets nothing
+    /// behaves as before. When on, the server is closed to anyone without a
+    /// Discord-linked session: a WebSocket must `hello` with a valid session
+    /// within a short grace period or it is dropped, may send nothing else
+    /// until it has, and is shown no lobbies or players; the anonymous `/v1`
+    /// HTTP API is refused. This locks out every client that cannot sign in.
     pub discord_required: bool,
     /// `DISCORD_GUILD_ID`. When set, a login must be a member of this guild.
     ///
@@ -250,6 +251,19 @@ impl Config {
                     "Discord login is partly configured and cannot complete a sign-in. Players will reach 'Login failed' after authorising in their browser. Set the listed variables, or unset every DISCORD_* variable to turn sign-in off cleanly."
                 );
             }
+        }
+
+        if discord_required
+            && (discord_client_id.is_none()
+                || discord_client_secret.is_none()
+                || discord_redirect_url.is_none()
+                || jwt_secret_current.is_none())
+        {
+            bail!(
+                "DISCORD_REQUIRED is set but Discord sign-in is not fully configured \
+                 (need DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URL and \
+                 JWT_SECRET_CURRENT). Nobody could connect."
+            );
         }
 
         if require_auth && jwt_secret_current.is_none() {

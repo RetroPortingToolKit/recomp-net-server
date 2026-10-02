@@ -12,7 +12,7 @@ for operators and clients.
 | Display names | Show in lobby list / slot map | In-memory for connection/lobby lifetime; HTTP player rows may persist in SQLite until deleted |
 | Lobby metadata (name, game name, slot counts, session id) | Matchmaking / room listing | In-memory while the lobby exists |
 | Lobby passwords | Restrict join | **Never stored in plaintext.** Salted SHA-256 hashes only; discarded when the lobby is destroyed |
-| Client TCP peer IP | Rewrite `0.0.0.0` / `*` bind addresses into usable LAN/WAN endpoints | Ephemeral (in-memory with the WebSocket client); not written to long-term logs by default |
+| Client TCP peer IP | Rewrite `0.0.0.0` / `*` bind addresses into usable LAN/WAN endpoints | In-memory with the WebSocket client; also written to the `info` log on connect and `hello` (see Logging), so it lives as long as the operator's log retention |
 | Connection duration / presence | Heartbeats, idle room eviction, list updates | Ephemeral |
 | Optional JWT / player ids (HTTP `/v1`) | Auth and room membership | Per [SECURITY.md](SECURITY.md) and SQLite migrations |
 | ICE signal envelopes (`text` / SDP-like payloads) | Relay only | Not persisted; forwarded then discarded |
@@ -67,6 +67,12 @@ server process for fan-out only and are not persisted.
 ## Logging
 
 - Default: structured `tracing` at `info` (connect/disconnect, startup).
+- At `info`, `ws lobby client connected` records `player_id` and `peer_ip`, and
+  `ws lobby hello` records `player_id`, `peer_ip`, the accepted `display_name`
+  and whether the connection is `signed_in`. Together they let an operator map
+  an IP to a name, including for guests. The Discord id is never logged. The
+  server does not rotate or expire logs; retention is the operator's
+  (journald / Docker / redirect) setting.
 - `--debug` / `RUST_LOG`: more verbose request and lobby diagnostics. Operators
   should treat debug logs as potentially containing display names and IPs and
   configure log retention accordingly.
