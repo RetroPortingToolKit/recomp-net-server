@@ -662,12 +662,15 @@ With `DISCORD_REQUIRED=1` the server admits only Discord-linked sessions.
 Startup fails unless sign-in is fully configured (`DISCORD_CLIENT_ID`,
 `DISCORD_CLIENT_SECRET`, `DISCORD_REDIRECT_URL`, `JWT_SECRET_CURRENT`).
 
-- A WebSocket must send `hello` with a valid `session` within 15 seconds or it
-  is dropped. A `hello` without a valid session gets `error`
-  `{"code":"login_required"}` and the socket is closed.
-- Until signed in, only `hello` and `ping` are accepted. Any other op gets
-  `login_required` and the socket is closed. Nothing is sent to it (no
-  `lobby_list`), and it is left out of everyone else's players-online list.
+- A WebSocket must send `hello` with a valid `session` within 15 seconds of
+  connecting, or it is closed. A `hello` without a valid session gets `error`
+  `{"code":"login_required"}`; the socket stays open until that grace period
+  ends, so a later `hello` that does carry a session still signs it in.
+- Until signed in, only `hello` and `ping` are acted on. Any other op is
+  silently ignored, not fatal: clients queue `list` / `server_chat` before the
+  WebSocket handshake completes and send them ahead of their `hello`. Nothing
+  is sent to an unauthenticated socket (no `lobby_list`), and it is left out of
+  everyone else's players-online list.
 - `POST /v1/players` returns 403 `login_required`, and every `/v1` route that
   authenticates a player also requires the player row to have a `discord_id`.
 - Default stays off. Turning it on locks out every client that cannot sign in,

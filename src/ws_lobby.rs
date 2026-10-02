@@ -226,9 +226,6 @@ pub struct WsLobbyHub {
 /// `DISCORD_REQUIRED` is on.
 const LOGIN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Returned by `handle_text` to say "end this connection", not "log a warning".
-const LOGIN_REQUIRED_CLOSE: &str = "login_required_close";
-
 impl HubInner {
     /// Record a relayed line and hand back its id, which goes out with the
     /// message so a client can later report exactly this one.
@@ -1645,10 +1642,8 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
         let Some(Ok(msg)) = next else { break };
         match msg {
             Message::Text(text) => {
-                match handle_text(&state, &player_id, &peer_ip, &text).await {
-                    Err(e) if e == LOGIN_REQUIRED_CLOSE => break,
-                    Err(e) => warn!(%player_id, error = %e, "ws lobby handler error"),
-                    Ok(()) => {}
+                if let Err(e) = handle_text(&state, &player_id, &peer_ip, &text).await {
+                    warn!(%player_id, error = %e, "ws lobby handler error");
                 }
                 if !signed_in {
                     let g = hub.inner.lock().await;
@@ -1706,13 +1701,14 @@ async fn handle_text(
             g.clients.get(player_id).is_some_and(|c| c.account.is_some())
         };
         if !authed {
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "login_required", "ok": false }).to_string(),
-            )
-            .await;
-            return Err(LOGIN_REQUIRED_CLOSE.to_string());
+            /* Ignored, not fatal. A client queues `list`, `server_chat` and
+             * the like before the WebSocket handshake completes and sends them
+             * the moment it does, which is AHEAD of its `hello` (that waits for
+             * `welcome`). Closing here would drop a signed-in client before
+             * its session was ever read. It stays unauthenticated, and is
+             * dropped by the login grace period if `hello` never signs it in. */
+            debug!(%player_id, %peer_ip, op = %msg.op, "DISCORD_REQUIRED: ignoring an op sent before sign-in");
+            return Ok(());
         }
     }
     match msg.op.as_str() {
@@ -1769,17 +1765,20 @@ async fn handle_text(
              * says only whether there is one. */
             info!(%player_id, %peer_ip, display_name = %accepted_name, signed_in, "ws lobby hello");
             if hub.require_login && !signed_in {
+                warn!(%player_id, %peer_ip, had_session = msg.session.as_deref().is_some_and(|t| !t.is_empty()),
+                    "DISCORD_REQUIRED: hello without a valid Discord session; closing after the login grace period unless it signs in");
                 /* No valid session, and this server takes nobody without one.
-                 * Undo the placeholder name's visibility by never listing it
-                 * (broadcasts skip unauthenticated clients) and end the
-                 * connection. */
+                 * The connection is never listed (broadcasts skip
+                 * unauthenticated clients) and is dropped when the login
+                 * grace period ends; it may still send a `hello` that does
+                 * carry a session before then. */
                 send_to(
                     hub,
                     player_id,
                     json!({ "op": "error", "code": "login_required", "ok": false }).to_string(),
                 )
                 .await;
-                return Err(LOGIN_REQUIRED_CLOSE.to_string());
+                return Ok(());
             }
             send_to(
                 hub,
