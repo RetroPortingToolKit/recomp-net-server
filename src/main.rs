@@ -53,8 +53,6 @@ async fn refresh_gauges(state: &AppState) -> LiveCounts {
     let http_rooms_by_game = rooms.counts_by_game();
     let http_rooms_running_by_game = rooms.running_counts_by_game();
     drop(rooms);
-    let (input_relay_sessions, input_relay_sessions_active) =
-        state.input_relay.session_counts().await;
     metrics::set_gauges(
         ws_clients,
         ws_lobbies,
@@ -66,8 +64,6 @@ async fn refresh_gauges(state: &AppState) -> LiveCounts {
      * set as recomp_match_starts_total. */
     metrics::set_matches_by_game(metrics::SURFACE_WS, &ws_matches_by_game);
     metrics::set_matches_by_game(metrics::SURFACE_HTTP, &http_rooms_running_by_game);
-    metrics::set_input_relay_sessions(input_relay_sessions);
-    metrics::set_input_relay_sessions_active(input_relay_sessions_active);
     LiveCounts {
         ws_clients,
         ws_lobbies,
@@ -78,8 +74,6 @@ async fn refresh_gauges(state: &AppState) -> LiveCounts {
         http_rooms_running,
         http_rooms_by_game,
         http_rooms_running_by_game,
-        input_relay_sessions,
-        input_relay_sessions_active,
     }
 }
 
@@ -93,8 +87,6 @@ struct LiveCounts {
     http_rooms_running: usize,
     http_rooms_by_game: BTreeMap<String, usize>,
     http_rooms_running_by_game: BTreeMap<String, usize>,
-    input_relay_sessions: usize,
-    input_relay_sessions_active: usize,
 }
 
 async fn stats_handler(
@@ -114,8 +106,6 @@ async fn stats_handler(
         http_rooms_running_by_game: live.http_rooms_running_by_game,
         ws_match_starts_by_game: metrics::match_starts_by_game(metrics::SURFACE_WS),
         http_match_starts_by_game: metrics::match_starts_by_game(metrics::SURFACE_HTTP),
-        input_relay_sessions: live.input_relay_sessions,
-        input_relay_sessions_active: live.input_relay_sessions_active,
         totals: metrics::totals(),
     })
 }
@@ -190,8 +180,7 @@ const STATS_UI_HTML: &str = r#"<!DOCTYPE html>
           card('WS waiting', s.ws_lobbies_waiting ?? Math.max(0, (s.ws_lobbies||0) - (s.ws_matches||0))) +
           card('WS matches', s.ws_matches ?? 0) +
           card('HTTP rooms', s.http_rooms) +
-          card('HTTP running', s.http_rooms_running ?? 0) +
-          card('SFU live', s.input_relay_sessions_active ?? 0);
+          card('HTTP running', s.http_rooms_running ?? 0);
         const g = rows('ws', s.ws_lobbies_by_game) +
           rows('ws-match', s.ws_matches_by_game) +
           rows('http', s.http_rooms_by_game) +
@@ -241,10 +230,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let mut config = Config::from_env().context("invalid configuration")?;
-    config
-        .resolve_input_relay_advertise()
-        .context("input relay advertise host")?;
+    let config = Config::from_env().context("invalid configuration")?;
     let db_url = config.effective_database_url();
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -262,10 +248,6 @@ async fn main() -> anyhow::Result<()> {
         .run(&pool)
         .await
         .context("migrations run")?;
-
-    let input_relay = recomp_net_server::input_relay::InputRelay::start(&config)
-        .await
-        .context("input relay")?;
 
     recomp_net_server::chat_filter::init(
         config.chat_filter_enabled,
@@ -297,7 +279,6 @@ async fn main() -> anyhow::Result<()> {
             config.geoip_db_path.as_deref(),
         )
         .with_require_login(config.discord_required),
-        input_relay,
         debug: debug_cli,
     };
 
@@ -352,23 +333,6 @@ async fn main() -> anyhow::Result<()> {
         database = %db_url,
         turn_configured,
         automatch = automatch_on,
-        input_relay = config.input_relay_enabled,
-        input_relay_bind = %config.input_relay_bind,
-        input_relay_advertise = %format!(
-            "{}:{}",
-            config.input_relay_advertise_host, config.input_relay_advertise_port
-        ),
-        input_relay_lan = %if config.input_relay_lan_host.is_empty() {
-            "(unset)".to_string()
-        } else {
-            format!(
-                "{}:{}",
-                config.input_relay_lan_host, config.input_relay_advertise_port
-            )
-        },
-        input_relay_lan_gateway = %config
-            .effective_input_relay_lan_gateway()
-            .unwrap_or_else(|| "(unset)".to_string()),
         allowlist_len = config.game_allowlist.len(),
         debug = debug_cli,
         "starting recomp-net-server"

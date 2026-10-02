@@ -14,11 +14,35 @@ That is the point of the feature, not a side condition — see
 
 ## 1. What automatch is, mechanically
 
-Online matches **always** run through the UDP SFU (`transport=sfu`, WS_LOBBY
-§start; a start with the relay unconfigured fails `relay_unavailable`). So
-"host" is not a network position — it is slot 0, which is sim authority and,
-today, the owner of `match_caps`. Nothing about hosting requires a
-reachable peer.
+The server relays nothing, so an automatch match runs through one of the two
+players' own hub (`transport=host`, WS_LOBBY "Host relay"). Which one is
+**negotiated during matchmaking**:
+
+1. **The offer.** `automatch_queue` may carry `host_endpoint`: the UDP
+   endpoint at which this client can run a relay hub (its STUN / UPnP /
+   NAT-PMP result). A client that cannot, sends none.
+2. **The pairing rule.** Two tickets pair only if at least one offered, since
+   a pair that can reach nobody cannot start. Two offerless tickets wait.
+3. **The choice.** Exactly one offered: that one relays. Both: the lower
+   client-reported `rtt_ms` relays; unmeasured or tied goes to the older
+   ticket (slot 0).
+4. **The announcement.** `automatch_found` carries `relay_role`: `"host"` (you
+   bind and run the hub) or `"guest"` (you dial the other's). It arrives
+   before the accept so the chosen client can open its port during the
+   countdown. `joined` and `launch` carry `relay_host_slot`.
+5. **The proof.** The room is created with `host_endpoint` = the chosen
+   player's offer and `match_caps.relay = "host"`. The guest probes that
+   endpoint and sends `path_report` `direct`. The room starts only once that
+   report is fresh (retried for 20 s after the settle delay).
+6. **The fallback.** If the proof never arrives, both players get
+   `automatch_requeue` with `reason: "host_unreachable"` and return to the
+   front of the queue; nobody takes a dodge strike, and the
+   avoid-last-opponent preference keeps them from being offered each other
+   first.
+
+"Host" in the sense of `host_player_id` is still nobody (the room's sentinel),
+so slot 0 stays sim authority and owner of `match_caps`; the relay seat is a
+separate `relay_host_slot`.
 
 That makes automatch a small feature rather than a second netplay stack:
 
@@ -300,7 +324,7 @@ already-small pool:
 
 | Filter | Start | Widens |
 |--------|-------|--------|
-| Combined RTT to relay | `AUTOMATCH_RTT_START_MS` (120) | +`AUTOMATCH_RTT_STEP_MS` (60) every `AUTOMATCH_RTT_WIDEN_SECS` (20), to `AUTOMATCH_RTT_MAX_MS` (400), then unlimited |
+| Combined client-reported RTT | `AUTOMATCH_RTT_START_MS` (120) | +`AUTOMATCH_RTT_STEP_MS` (60) every `AUTOMATCH_RTT_WIDEN_SECS` (20), to `AUTOMATCH_RTT_MAX_MS` (400), then unlimited |
 | Avoid last opponent | on | off after `AUTOMATCH_REMATCH_COOLDOWN_SECS` (300) or once RTT is unlimited |
 
 ### The floor under D and P
@@ -308,9 +332,10 @@ already-small pool:
 The measurement is not only a filter. `recomp-net/docs/architecture.md`
 ("Delay-sync admission") stores local input at wire tick `T + D` and admits
 tick `T` only when every remote slot has its row for `T + D` — so the input has
-exactly `D` frames of wall time to make a **one-way** trip. Online is always
-peer → relay → peer, and each `rtt_ms` is a peer's own round trip to the relay,
-so:
+exactly `D` frames of wall time to make a **one-way** trip. Each
+`rtt_ms` is the client's own report (no server endpoint is probed any more).
+With the host relay the true path is guest ↔ relay host, which is unknown at
+pairing time, so the sum below is an **estimate** and conservative:
 
 ```text
   one_way(A→B) = rtt_a/2 + rtt_b/2 = (rtt_a + rtt_b) / 2
@@ -343,40 +368,27 @@ player is agreeing to rather than the ruleset's advertised one — being told
 caps, so `launch` carries them and a peer applies them at boot like any other
 cap.
 
-**Slot 0 goes to the older ticket.** Under the SFU it carries no mechanical
-advantage, but the rule is deterministic and it shows up in the log, which
+**Slot 0 goes to the older ticket.** It carries no mechanical advantage (the
+relay seat is chosen separately), but the rule is deterministic and it shows up in the log, which
 "whichever the map iterated first" does not. Revisit if slot 0 ever turns out
 to matter.
 
-### Latency: the shortcut this architecture hands you
+### Latency
 
-Because every online match goes through one relay, the only latency that
-matters is **each peer → relay**, not peer ↔ peer. Match quality is therefore
-predictable from each ticket on its own, before any pairing, with no pairwise
-probing at all — `rtt_a + rtt_b` is the estimate.
-
-**Measured, as of this version, by a UDP probe against the relay itself.**
-The relay answers packet type `200` with type `201` — the same 14 bytes back,
-nonce included — before any session lookup, precisely so a client can measure
-the path while it is sitting in a queue with no session to belong to. Same size
-in and out, so it is not an amplifier; it is still a reflector, so the length is
-exact rather than a maximum and replies are capped at 8 per source per second.
-
-The client times the round trip and reports it (`automatch_rtt`, or `rtt_ms` on
-`automatch_queue`). Where to probe is published on both `automatch_rulesets_ok`
-and `automatch_queued` as `probe: { endpoint, magic, type }`.
+The server runs no probe endpoint. A client measures however it can (a WS
+round trip, or a probe of its own relay) and reports it (`automatch_rtt`, or
+`rtt_ms` on `automatch_queue`). It is used to choose between two relay offers
+and as a pairing filter and delay floor, nothing more.
 
 `rtt_ms` is **client-reported** and belongs in LOBBY.md's trust table as such.
 It is clamped to `MAX_REPORTED_RTT_MS` (2000). The grief case is reporting HIGH
 to force delay on an opponent; reporting low only stalls the liar's own sim,
 which is its own answer.
 
-A ticket that has not measured yet is held out of pairing for
-`PROBE_GRACE_SECS` (3). A client that probes *before* queueing never waits at
-all; this is for one that queues first and measures second, where pairing
-immediately would qualify the match on a number that was one second away. The
-grace is a delay, not a requirement: a client that never probes still matches
-once it lapses, and the filter passes on unknown.
+A ticket that has not reported yet is held out of pairing for
+`PROBE_GRACE_SECS` (3). A client that reports *before* queueing never waits;
+a client that never reports still matches once the grace lapses, and the
+filter passes on unknown.
 
 With one VPS in one region a cross-globe pair is bad no matter what the
 algorithm does. Show the estimate in the accept modal and let the widening
@@ -540,7 +552,7 @@ Implementation notes, so this does not grow a parallel copy of the start path:
 - **Factor `start_lobby(state, lobby_id) -> Result<…>` out of
   [`handle_start`](../src/ws_lobby.rs).** The `host_player_id != player_id`
   check and the `not_in_lobby` lookup stay in the handler; everything from
-  `need_players` onward — the SFU decision, the LAN-advertise heuristic, the
+  `need_players` onward — the host-relay decision, the
   fresh `session_id`, clearing ready, the `launch` broadcast — is shared. Two
   copies of the transport decision is how the two paths start behaving
   differently.
@@ -652,7 +664,7 @@ Additive in the same way the Discord login was:
 - Party sizes above 2. Group-fill changes pairing and makes the accept gate
   N-way.
 - Modded pools.
-- Cross-region relay selection. One relay, one estimate.
+- Server-side relaying as a fallback. A pair whose relay is unreachable is requeued, not relayed.
 - Penalizing early disconnects (§8).
 - Spectators in an automatch room.
 

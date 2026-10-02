@@ -73,7 +73,7 @@ struct Slot {
     ice_path_at: Option<Instant>,
 }
 
-/// Path reports older than this are ignored (fail closed → SFU).
+/// Path reports older than this are ignored (fail closed: no match).
 #[derive(Clone)]
 struct Lobby {
     lobby_id: String,
@@ -104,8 +104,10 @@ struct Lobby {
     spectators: Vec<Option<Slot>>,
     /* Host-authoritative sim-affecting settings (opaque JSON object). */
     match_caps: Option<Value>,
-    /// Active UDP input-relay session (closed on destroy / rematch).
-    relay_session_id: Option<u32>,
+    /// The seat that runs the match's relay hub when that is NOT the host:
+    /// an automatch room has no host, so the server records which matched
+    /// player offered and was chosen to relay. Empty = the host relays.
+    relay_host_player_id: String,
     /// True after a successful `start` until the lobby is destroyed.
     started: bool,
     /// Built by the server for a matched pair. Its host is a sentinel nobody
@@ -149,9 +151,10 @@ struct ClientMeta {
     /// connection and never persists it. It is only meaningful for a
     /// signed-in client, since a block names an account.
     blocks: std::collections::HashSet<String>,
-    /// Round trip to the relay, as this client measured it with a UDP probe;
-    /// -1 until it reports one. Kept on the CONNECTION, not the ticket, so a
-    /// client that probes before it queues does not have to probe again.
+    /// Round trip as this client measured it and reported it; -1 until it
+    /// does. The server runs no probe endpoint any more, so this is purely
+    /// client-reported. Kept on the CONNECTION, not the ticket, so a client
+    /// that measures before it queues does not have to measure again.
     probe_rtt_ms: i32,
     tx: broadcast::Sender<String>,
 }
@@ -623,8 +626,8 @@ struct InMsg {
     /// recognisably late rather than applied to the next one.
     #[serde(default)]
     match_id: Option<String>,
-    /// Round trip to the relay in milliseconds, measured by the client with a
-    /// UDP probe. Accepted on `automatch_rtt` and on `automatch_queue`.
+    /// Round trip in milliseconds, measured and reported by the client.
+    /// Accepted on `automatch_rtt` and on `automatch_queue`.
     #[serde(default)]
     rtt_ms: Option<i64>,
 }
@@ -764,6 +767,16 @@ fn sanitize_mod_offer(offer: Option<Value>) -> Option<Value> {
 }
 
 impl Lobby {
+    /// The player id whose process runs the relay hub: the host, unless an
+    /// automatch room recorded a chosen relay seat.
+    fn relay_host(&self) -> &str {
+        if self.relay_host_player_id.is_empty() {
+            &self.host_player_id
+        } else {
+            &self.relay_host_player_id
+        }
+    }
+
     /// The seat array a seat index addresses, and the index within it.
     fn seat_parts(&self, seat: usize) -> Option<(&Vec<Option<Slot>>, usize)> {
         if is_spectator_seat(seat) {
@@ -877,7 +890,7 @@ fn slot_json(i: usize, slot: &Slot, account: &str) -> Value {
     if !slot.country.is_empty() {
         row["country"] = json!(slot.country);
     }
-    // The guest's latest path_report and whether start_use_sfu would still
+    // The guest's latest path_report and whether host_relay_decision would still
     // trust it, so a host-relay room can show which guests have proven they
     // reach the host before Play (WS_LOBBY.md "Host relay").
     if let Some(path) = &slot.ice_path {
@@ -1102,6 +1115,18 @@ fn rewrite_endpoint(bind: &str, peer_ip: &str) -> String {
     format!("{use_host}:{port}")
 }
 
+/// `rewrite_endpoint`, except that an explicit host the client does not own
+/// (`endpoint_is_clients_own`) is replaced by the client's own address, so a
+/// bind string cannot smuggle a third party's address into a peer's launch.
+fn own_endpoint(bind: &str, peer_ip: &str) -> String {
+    let ep = rewrite_endpoint(bind, peer_ip);
+    if endpoint_is_clients_own(&ep, peer_ip) {
+        return ep;
+    }
+    let port = bind.rsplit_once(':').map(|(_, p)| p).unwrap_or("0");
+    rewrite_endpoint(&format!("0.0.0.0:{port}"), peer_ip)
+}
+
 /// Validate a host-advertised UDP endpoint for list / waiting-room RTT.
 fn parse_advertise_endpoint(raw: &str) -> Option<String> {
     let ep = raw.trim();
@@ -1124,6 +1149,44 @@ fn parse_advertise_endpoint(raw: &str) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+/// May this client advertise `endpoint` as where the match's relay hub is?
+///
+/// The endpoint is handed to the OTHER player, whose client probes it and then
+/// dials it. Accepting any address would let a client aim its opponent's UDP
+/// at a third party. So the host must be an IP literal (never a name, which
+/// can resolve anywhere) and, for a client the server sees on a public
+/// address, must be that same address: a STUN / UPnP result for a client
+/// that is really reachable there is its own WebSocket address. A client the
+/// server sees on a private or loopback address (LAN, or a NAT hairpin to
+/// this host) is local already and may advertise any IP literal, because the
+/// address its peers need is typically its public one.
+fn endpoint_is_clients_own(endpoint: &str, peer_ip: &str) -> bool {
+    let Some((host, _)) = endpoint.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(ep_ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let peer = peer_ip.trim();
+    let peer = peer.strip_prefix("::ffff:").unwrap_or(peer);
+    let Ok(peer_addr) = peer.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let peer_is_local = match peer_addr {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    };
+    if peer_is_local {
+        return true;
+    }
+    let ep_ip = match ep_ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ep_ip),
+        v4 => v4,
+    };
+    ep_ip == peer_addr
+}
+
 fn is_rfc1918_host(host: &str) -> bool {
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() != 4 {
@@ -1139,34 +1202,6 @@ fn is_rfc1918_host(host: &str) -> bool {
         return false;
     }
     a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
-}
-
-fn normalize_ws_peer_v4(ip: &str) -> &str {
-    let h = ip.trim();
-    h.strip_prefix("::ffff:").unwrap_or(h)
-}
-
-/// True when the WebSocket TCP peer is on-LAN (or loopback to this host).
-fn is_local_ws_peer_ip(ip: &str) -> bool {
-    let h = ip.trim();
-    if h.is_empty() {
-        return false;
-    }
-    if h == "::1" || h.eq_ignore_ascii_case("localhost") || h.starts_with("127.") {
-        return true;
-    }
-    is_rfc1918_host(normalize_ws_peer_v4(h))
-}
-
-/// Direct LAN / loopback peer — excludes the LAN gateway (NAT hairpin source).
-fn is_direct_lan_ws_peer(ip: &str, gateway: Option<&str>) -> bool {
-    if !is_local_ws_peer_ip(ip) {
-        return false;
-    }
-    let Some(gw) = gateway.map(str::trim).filter(|g| !g.is_empty()) else {
-        return true;
-    };
-    normalize_ws_peer_v4(ip) != gw
 }
 
 /// Cap and validate LAN advertise list (RFC1918 only, no loopback).
@@ -1210,48 +1245,50 @@ fn normalize_ice_path(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// How long a guest's waiting-room `path_report` counts (fail closed -> SFU).
+/// How long a guest's waiting-room `path_report` counts (fail closed).
 const HOST_RELAY_PATH_FRESH: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The lobby UDP SFU relays every online match (§108), with ONE exception:
-/// a host that asks to relay the match itself (`match_caps.relay = "host"`,
-/// the Retro hub's host-as-relay, WS_LOBBY.md "Host relay") gets it when
-/// every seated guest has proven, in the waiting room, that it reaches the
-/// host's advertised endpoint (`path_report` "direct", within
-/// HOST_RELAY_PATH_FRESH). Anything less -- no guest report, a stale one, a
-/// "relay" or "fail" -- falls back to the SFU, so a match always connects.
-/// Caps bits other than `relay` are ignored here; `force_turn` remains a
-/// client delay-floor hint only.
-fn start_use_sfu(lobby: &Lobby, caps: &Option<Value>) -> (bool, &'static str) {
+/// Whether a match may start. The server relays nothing, so a match runs
+/// through the relay host's own hub (`match_caps.relay = "host"`, WS_LOBBY.md
+/// "Host relay") or it does not start:
+///
+/// - the ask must be there, and the relay host must have advertised an
+///   endpoint;
+/// - every OTHER seated player must have proven, in the waiting room, that it
+///   reaches that endpoint (`path_report` "direct", within
+///   `HOST_RELAY_PATH_FRESH`);
+/// - no spectator is seated, because a host hub forwards whatever reaches it
+///   and nothing here would stop a spectator's packets.
+///
+/// `Err` carries the reason, for the log. Caps bits other than `relay` are
+/// ignored; `force_turn` remains a client delay-floor hint only.
+fn host_relay_decision(lobby: &Lobby, caps: &Option<Value>) -> Result<&'static str, &'static str> {
     let wants_host = caps
         .as_ref()
         .and_then(|c| c.get("relay"))
         .and_then(|v| v.as_str())
         == Some("host");
     if !wants_host {
-        return (true, "always_sfu");
+        return Err("no_host_relay_ask");
     }
     if lobby.host_endpoint.is_empty() {
-        return (true, "host_relay_no_endpoint");
+        return Err("host_relay_no_endpoint");
     }
-    // The gallery is read-only only because THIS relay drops a spectator's
-    // packets; recomp-net's host hub forwards whatever reaches it. A room
-    // with spectators therefore stays on the SFU.
     if lobby.spectator_count() > 0 {
-        return (true, "host_relay_spectators");
+        return Err("host_relay_spectators");
     }
     for slot in lobby.slots.iter().flatten() {
-        if slot.player_id == lobby.host_player_id {
+        if slot.player_id == lobby.relay_host() {
             continue;
         }
         let fresh = slot
             .ice_path_at
             .is_some_and(|at| at.elapsed() <= HOST_RELAY_PATH_FRESH);
         if slot.ice_path.as_deref() != Some("direct") || !fresh {
-            return (true, "host_relay_unproven");
+            return Err("host_relay_unproven");
         }
     }
-    (false, "host_relay")
+    Ok("host_relay")
 }
 
 fn player_count(lobby: &Lobby) -> usize {
@@ -1453,7 +1490,7 @@ async fn emit_lobby_update(hub: &WsLobbyHub, lobby_id: &str) {
 
 async fn destroy_lobby(state: &AppState, lobby_id: &str) {
     let hub = &state.ws_lobby;
-    let (members, relay_sid) = {
+    let members = {
         let mut g = hub.inner.lock().await;
         let Some(l) = g.lobbies.remove(lobby_id) else {
             return;
@@ -1465,11 +1502,8 @@ async fn destroy_lobby(state: &AppState, lobby_id: &str) {
                 c.lobby_id = None;
             }
         }
-        (members, l.relay_session_id)
+        members
     };
-    if let Some(sid) = relay_sid {
-        state.input_relay.close_session(sid).await;
-    }
     let note = json!({ "op": "lobby_closed", "lobby_id": lobby_id, "ok": true }).to_string();
     for m in members {
         send_to(hub, &m, note.clone()).await;
@@ -1790,7 +1824,7 @@ async fn handle_text(
         "chat" => handle_chat(hub, player_id, msg).await?,
         "server_chat" => handle_server_chat(hub, player_id, msg).await?,
         "set_match_caps" => handle_set_match_caps(hub, player_id, msg).await?,
-        "set_host_endpoint" => handle_set_host_endpoint(hub, player_id, msg).await?,
+        "set_host_endpoint" => handle_set_host_endpoint(hub, player_id, peer_ip, msg).await?,
         "path_report" => handle_path_report(hub, player_id, msg).await?,
         "start" => handle_start(state, player_id, msg).await?,
         "leave" => {
@@ -2156,7 +2190,7 @@ async fn handle_create(
         let lobby_id = Uuid::new_v4().to_string();
         let session_id = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
-        let host_endpoint = rewrite_endpoint(&host_bind, peer_ip);
+        let host_endpoint = own_endpoint(&host_bind, peer_ip);
 
         let mut password_hash = None;
         let mut password_salt = None;
@@ -2209,7 +2243,7 @@ async fn handle_create(
                 allow_spectators,
                 spectators: vec![None; if allow_spectators { MAX_SPECTATORS } else { 0 }],
                 match_caps: match_caps.clone(),
-                relay_session_id: None,
+                relay_host_player_id: String::new(),
                 started: false,
                 automatch: false,
             },
@@ -2610,7 +2644,7 @@ fn seat_joiner_locked(
         }
         /* Membership change invalidates prior ICE path pairs. */
         clear_lobby_ice_paths(lobby);
-        lobby.guest_endpoint = rewrite_endpoint(guest_bind, peer_ip);
+        lobby.guest_endpoint = own_endpoint(guest_bind, peer_ip);
         (
             seat,
             lobby.session_id,
@@ -3062,6 +3096,7 @@ async fn handle_seat_swap_answer(
 async fn handle_set_host_endpoint(
     hub: &WsLobbyHub,
     player_id: &str,
+    peer_ip: &str,
     msg: InMsg,
 ) -> Result<(), String> {
     let Some(raw) = msg.host_endpoint.filter(|s| !s.trim().is_empty()) else {
@@ -3073,7 +3108,9 @@ async fn handle_set_host_endpoint(
         .await;
         return Ok(());
     };
-    let Some(endpoint) = parse_advertise_endpoint(&raw) else {
+    let Some(endpoint) =
+        parse_advertise_endpoint(&raw).filter(|e| endpoint_is_clients_own(e, peer_ip))
+    else {
         send_to(
             hub,
             player_id,
@@ -3110,17 +3147,6 @@ async fn handle_set_host_endpoint(
                 hub,
                 player_id,
                 json!({ "op": "error", "code": "not_host", "ok": false }).to_string(),
-            )
-            .await;
-            return Ok(());
-        }
-        /* Launch already rewrote endpoints to the input relay — leave them. */
-        if lobby.relay_session_id.is_some() {
-            drop(g);
-            send_to(
-                hub,
-                player_id,
-                json!({ "op": "error", "code": "relay_locked", "ok": false }).to_string(),
             )
             .await;
             return Ok(());
@@ -3388,143 +3414,40 @@ async fn start_lobby(
             break 'prep Err("need_players");
         }
         let caps_for_relay = fresh_caps.as_ref().or(lobby.match_caps.as_ref()).cloned();
-        /* §108: online lobbies always open lobby UDP SFU (no ice_p2p). */
-        let (use_relay, path_why) = start_use_sfu(lobby, &caps_for_relay);
+        /* The server relays nothing. A match runs through the host's own hub
+         * (`host_relay_decision`) or it does not start. */
+        let path_why = match host_relay_decision(lobby, &caps_for_relay) {
+            Ok(why) => why,
+            Err(why) => {
+                info!(lobby_id = %lid, seated = n, reason = why, "lobby start refused");
+                break 'prep Err("relay_unavailable");
+            }
+        };
         info!(
             lobby_id = %lid,
             seated = n,
-            use_sfu = use_relay,
             reason = path_why,
             "lobby start transport decision"
         );
-        if use_relay && !state.input_relay.enabled() {
-            break 'prep Err("relay_unavailable");
-        }
-        /* Same-LAN / split-horizon: every seated peer's WS TCP source is a
-         * direct private/loopback address (not the hairpin gateway) → prefer
-         * INPUT_RELAY_LAN_HOST. Guests that dial the WAN name and NAT-hairpin
-         * often appear as the router (.1) — that must not force LAN advertise. */
-        let mut peer_ips = Vec::new();
-        /* Everyone seated, gallery included: the relay endpoint advertised
-         * here is the one SPECTATORS dial too, so a remote spectator has to
-         * be able to veto the LAN address exactly as a remote player does. */
-        for slot in lobby.everyone() {
-            if let Some(c) = g.clients.get(&slot.player_id) {
-                peer_ips.push(c.peer_ip.clone());
-            }
-        }
-        let lan_host = state.config.input_relay_lan_host.trim();
-        let gateway = state.config.effective_input_relay_lan_gateway();
-        let prefer_lan = !lan_host.is_empty()
-            && !peer_ips.is_empty()
-            && peer_ips.len() == n + lobby.spectator_count()
-            && peer_ips
-                .iter()
-                .all(|ip| is_direct_lan_ws_peer(ip, gateway.as_deref()));
-        let old_relay = lobby.relay_session_id;
-        /* Read off `lobby` before the borrow ends: `g.next_session` below
-         * needs `g` mutably. */
-        let spectators_n = lobby.spectator_count();
         /* The host may watch from the gallery and still run the match. It
          * keeps session slot 0 -- the seat every host-only path (save states,
          * card sync, the start) keys on -- with its pad muted, and the player
-         * seats shift up one session slot behind it. The relay therefore
-         * needs one more forwarded slot, and the gallery starts one higher. */
-        /* Only a player can be in the gallery and still run the match. The
-         * server has no seat, so a server-started room never spectates. */
+         * seats shift up one session slot behind it. Only a player can be in
+         * the gallery and still run the match, so a server-started room never
+         * spectates. */
         let host_spectates = initiator
             .and_then(|p| lobby.seat_of(p))
             .is_some_and(is_spectator_seat);
-        let max_slots_for_relay = lobby.max_slots + usize::from(host_spectates);
-        /* Fresh session_id per match so rematch UDP HELLO/BYE cannot be
+        /* Fresh session_id per match so a rematch's UDP HELLO/BYE cannot be
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
-        Ok((
-            sid,
-            n,
-            spectators_n,
-            max_slots_for_relay,
-            use_relay,
-            old_relay,
-            prefer_lan,
-            peer_ips,
-            host_spectates,
-        ))
+        Ok((sid, n, host_spectates))
     };
 
-    let (
-        sid,
-        n,
-        spectators_n,
-        max_slots_for_relay,
-        use_relay,
-        old_relay,
-        prefer_lan,
-        peer_ips,
-        host_spectates,
-    ) = match prepared {
+    let (sid, n, host_spectates) = match prepared {
         Ok(v) => v,
         Err(code) => return Err(code),
-    };
-
-    // Phase 2: open/close UDP relay outside the lobby lock.
-    if let Some(prev) = old_relay {
-        state.input_relay.close_session(prev).await;
-    }
-    let relay_endpoint = if use_relay {
-        /* The relay is sized by the seat CEILING, not by how many seats are
-         * filled.
-         *
-         * A player's packet carries its lobby seat index, and the relay rejects
-         * any index at or beyond the session's player_slots. In a sparse room
-         * -- seats 0 and 3 occupied after a move, so n == 2 -- passing `n`
-         * rejects the player in seat 3 outright. Passing max_slots leaves every
-         * player seat addressable and puts the gallery immediately above it, so
-         * a spectator's relay slot is max_slots + its gallery index and can
-         * never be confused with a player's.
-         *
-         * n stays the PLAYER count in the launch message, where it belongs:
-         * that is what sizes the peers' rollback, and the peers already carry
-         * occupied_mask for the holes. */
-        match state
-            .input_relay
-            .open_session(sid, max_slots_for_relay as u8, spectators_n as u8)
-            .await
-        {
-            Ok(()) => {
-                let ep = state.input_relay.pick_advertise_endpoint(prefer_lan);
-                let gateway = state.config.effective_input_relay_lan_gateway();
-                if prefer_lan {
-                    info!(
-                        session_id = sid,
-                        advertise = %ep,
-                        ?peer_ips,
-                        ?gateway,
-                        "input relay advertise = LAN (all WS peers direct LAN)"
-                    );
-                } else if peer_ips.iter().any(|ip| {
-                    gateway
-                        .as_deref()
-                        .is_some_and(|gw| normalize_ws_peer_v4(ip) == gw)
-                }) {
-                    info!(
-                        session_id = sid,
-                        advertise = %ep,
-                        ?peer_ips,
-                        ?gateway,
-                        "input relay advertise = public (WS peer via LAN gateway / hairpin)"
-                    );
-                }
-                Some(ep)
-            }
-            Err(e) => {
-                warn!(error = %e, session_id = sid, "input relay open_session failed");
-                return Err("relay_unavailable");
-            }
-        }
-    } else {
-        None
     };
 
     // Phase 3: commit lobby state + build launch payload.
@@ -3548,13 +3471,6 @@ async fn start_lobby(
         }
         lobby.session_id = sid;
         lobby.started = true;
-        if let Some(ref ep) = relay_endpoint {
-            lobby.host_endpoint = ep.clone();
-            lobby.guest_endpoint = ep.clone();
-            lobby.relay_session_id = Some(sid);
-        } else {
-            lobby.relay_session_id = None;
-        }
         /* Match start clears ready so a return-to-lobby rematch must re-confirm. */
         for s in lobby.slots.iter_mut().flatten() {
             s.ready = false;
@@ -3604,15 +3520,19 @@ async fn start_lobby(
              * slot 0 with its pad muted; players sit at lobby seat + 1. Every
              * peer derives its session slot from this, so it is said once. */
             "host_spectates": host_spectates,
-            /* Without an SFU endpoint the only launch left is the host
-             * relaying (start_use_sfu): every guest dials host_endpoint. */
-            "transport": if relay_endpoint.is_some() { "sfu" } else { "host" },
+            /* The host relays: every other seat dials host_endpoint. This is
+             * the only transport the server launches. */
+            "transport": "host",
+            /* Which lobby seat runs the relay hub. In a hosted room that is
+             * the host's seat; in an automatch room nobody is host, so this
+             * is how a client learns whether IT binds the port. */
+            "relay_host_slot": lobby
+                .slots
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|x| x.player_id == lobby.relay_host())),
         });
         if let Some(caps) = &lobby.match_caps {
             launch["match_caps"] = caps.clone();
-        }
-        if let Some(ep) = &relay_endpoint {
-            launch["relay_endpoint"] = json!(ep);
         }
         StartOut::Ok {
             msg: launch.to_string(),
@@ -3621,12 +3541,7 @@ async fn start_lobby(
         }
     };
     match outcome {
-        StartOut::Err(code) => {
-            if let Some(ep_sid) = relay_endpoint.as_ref().map(|_| sid) {
-                state.input_relay.close_session(ep_sid).await;
-            }
-            return Err(code);
-        }
+        StartOut::Err(code) => return Err(code),
         StartOut::Ok {
             msg,
             members,
@@ -3924,15 +3839,7 @@ async fn handle_automatch_rulesets(state: &AppState, player_id: &str, msg: InMsg
             g.clients.get(player_id).map(|c| c.game_name.clone()).unwrap_or_default()
         }
     };
-    let mut payload = automatch::rulesets_json(&state.automatch_rulesets, &game);
-    /* Here as well as on `automatch_queued`, because THIS is the message a
-     * launcher reads before it draws the queue button -- probing now means
-     * the ticket carries a measurement from its first millisecond. */
-    payload["probe"] = json!({
-        "endpoint": state.input_relay.advertise_endpoint(),
-        "magic": state.config.protocol_magic,
-        "type": automatch::PROBE_PKT_TYPE,
-    });
+    let payload = automatch::rulesets_json(&state.automatch_rulesets, &game);
     let payload = payload.to_string();
     send_to(hub, player_id, payload).await;
     Ok(())
@@ -4099,8 +4006,27 @@ async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -
         let g = hub.inner.lock().await;
         g.clients.get(player_id).map(|c| c.blocks.clone()).unwrap_or_default()
     };
+    /* The negotiation starts here: a client that can run a relay hub says
+     * where, and a client that cannot says nothing. The server relays
+     * nothing itself, so a pair needs at least one of these. */
+    let my_ip = {
+        let g = hub.inner.lock().await;
+        g.clients.get(player_id).map(|c| c.peer_ip.clone()).unwrap_or_default()
+    };
+    let relay_endpoint = match msg.host_endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(raw) => match parse_advertise_endpoint(raw) {
+            Some(ep) if endpoint_is_clients_own(&ep, &my_ip) => Some(ep),
+            _ => {
+                send_to(hub, player_id, am_err("bad_host_endpoint")).await;
+                return Ok(());
+            }
+        },
+    };
     let ticket = Ticket {
         blocks,
+        relay_endpoint: relay_endpoint.clone(),
         player_id: player_id.to_string(),
         account_id: account_id.clone(),
         handle,
@@ -4129,19 +4055,14 @@ async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -
             "pool": state.automatch.pool_for(k, &account_id).await,
         }));
     }
-    /* Where to probe, and with what. A client that has not measured yet gets
-     * the address in the same breath as being told it is queued, so the first
-     * `automatch_rtt` can arrive seconds later and still qualify the pair. */
     send_to(
         hub,
         player_id,
         json!({
             "op": "automatch_queued", "ok": true, "titles": rows,
-            "probe": {
-                "endpoint": state.input_relay.advertise_endpoint(),
-                "magic": state.config.protocol_magic,
-                "type": automatch::PROBE_PKT_TYPE,
-            },
+            /* Echoed so the client can see what it is offering: `null` means
+             * "I cannot relay", and a pair then needs the other side to. */
+            "relay_endpoint": relay_endpoint,
         })
         .to_string(),
     )
@@ -4311,6 +4232,14 @@ async fn offer_pair(state: &AppState, p: &Pending) {
             },
             "est_rtt_ms": est,
             "accept_secs": state.config.automatch_accept_secs,
+            /* The negotiated relay choice, told BEFORE the accept so the
+             * chosen client can open its port and start its hub while the
+             * countdown runs. `host`: you run the relay. `guest`: you dial
+             * the opponent's. The server relays nothing. */
+            "relay_role": match p.relay_host_is_a() {
+                Some(a_hosts) if a_hosts == (me.player_id == p.a.player_id) => "host",
+                _ => "guest",
+            },
         });
         if let Some(f) = floor {
             m["input_delay"] = json!(f.input_delay);
@@ -4362,7 +4291,19 @@ async fn form_match(state: &AppState, p: Pending) {
     };
 
     let floor = automatch::delay_floor(&rs.match_caps, p.a.rtt_ms, p.b.rtt_ms, rs.frame_ms);
-    let floored_caps = automatch::caps_with_floor(&rs.match_caps, floor);
+    let mut floored_caps = automatch::caps_with_floor(&rs.match_caps, floor);
+    /* The negotiated relay: the chosen player's hub carries the match, and the
+     * room says so in the same caps every host-relay room does. Pairing
+     * guarantees somebody offered, so a `None` here is a bug, not a state. */
+    let Some(a_hosts) = p.relay_host_is_a() else {
+        warn!(match_id = %p.match_id, "automatch pair with no relay offer; dropping");
+        return;
+    };
+    let relay_ticket = if a_hosts { &p.a } else { &p.b };
+    let relay_endpoint = relay_ticket.relay_endpoint.clone().unwrap_or_default();
+    if let Some(o) = floored_caps.as_object_mut() {
+        o.insert("relay".into(), json!("host"));
+    }
 
     let lobby_id = Uuid::new_v4().to_string();
     let session_id;
@@ -4433,11 +4374,11 @@ async fn form_match(state: &AppState, p: Pending) {
             });
         }
 
-        let host_endpoint = rewrite_endpoint(
-            &p.a.host_bind,
-            &g.clients.get(&p.a.player_id).map(|c| c.peer_ip.clone()).unwrap_or_default(),
-        );
-        let guest_endpoint = rewrite_endpoint(
+        /* Where the guests dial: the chosen relay's own advertised endpoint,
+         * which the other side proves it can reach (`path_report`) before the
+         * match may start. */
+        let host_endpoint = relay_endpoint.clone();
+        let guest_endpoint = own_endpoint(
             &p.b.guest_bind,
             &g.clients.get(&p.b.player_id).map(|c| c.peer_ip.clone()).unwrap_or_default(),
         );
@@ -4457,6 +4398,7 @@ async fn form_match(state: &AppState, p: Pending) {
                  * is the host" by giving the role to nobody beats handing it
                  * to a player and then trying to take pieces of it back. */
                 host_player_id: String::new(),
+                relay_host_player_id: relay_ticket.player_id.clone(),
                 host_bind: p.a.host_bind.clone(),
                 host_endpoint,
                 lan_endpoints: Vec::new(),
@@ -4472,7 +4414,6 @@ async fn form_match(state: &AppState, p: Pending) {
                  * room stores what it will run, so `launch` carries it and a
                  * peer applies it at boot like any other cap. */
                 match_caps: Some(floored_caps.clone()),
-                relay_session_id: None,
                 started: false,
                 automatch: true,
             },
@@ -4507,6 +4448,10 @@ async fn form_match(state: &AppState, p: Pending) {
             "host_endpoint": host_endpoint,
             "guest_endpoint": guest_endpoint,
             "automatch": true,
+            /* The seat that runs the relay hub. The room has no host, so this
+             * is how a client learns whether it binds the port or probes and
+             * dials the other's. */
+            "relay_host_slot": usize::from(!a_hosts),
         });
         joined["match_caps"] = floored_caps.clone();
         send_to(hub, &t.player_id, joined.to_string()).await;
@@ -4525,12 +4470,52 @@ async fn form_match(state: &AppState, p: Pending) {
     let st = state.clone();
     let lid = lobby_id.clone();
     let match_id = p.match_id.clone();
+    let tickets = [p.a.clone(), p.b.clone()];
     tokio::spawn(async move {
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         }
-        match start_lobby(&st, &lid, None, None).await {
+        /* The match starts only once the non-relay side has proven, in this
+         * waiting room, that it reaches the relay's endpoint (`path_report`
+         * "direct"). That proof arrives on the clients' schedule, so retry
+         * until it does or the window closes. A refusal for any other reason
+         * is final. */
+        let deadline = tokio::time::Instant::now() + AUTOMATCH_PROOF_WAIT;
+        let result = loop {
+            match start_lobby(&st, &lid, None, None).await {
+                Err("relay_unavailable") if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                other => break other,
+            }
+        };
+        match result {
             Ok(()) => automatch::mark_launched(&st.pool, &match_id).await,
+            Err("relay_unavailable") => {
+                warn!(lobby_id = %lid, "automatch: the relay was not reachable; requeueing both");
+                destroy_lobby(&st, &lid).await;
+                /* Nobody dodged: the network did not allow this pair. Both go
+                 * back to the front of the queue, and the avoid-last-opponent
+                 * preference stops them being offered each other first. */
+                for t in tickets {
+                    let still_here = {
+                        let g = st.ws_lobby.inner.lock().await;
+                        g.clients.contains_key(&t.player_id)
+                    };
+                    if !still_here {
+                        continue;
+                    }
+                    st.automatch.requeue_front(t.clone()).await;
+                    send_to(
+                        &st.ws_lobby,
+                        &t.player_id,
+                        json!({ "op": "automatch_requeue", "ok": true,
+                                "reason": "host_unreachable", "queued": true })
+                        .to_string(),
+                    )
+                    .await;
+                }
+            }
             Err(code) => {
                 warn!(lobby_id = %lid, code, "automatch start failed");
                 let note = json!({ "op": "error", "code": code, "ok": false }).to_string();
@@ -4546,6 +4531,11 @@ async fn form_match(state: &AppState, p: Pending) {
         }
     });
 }
+
+/// How long an automatch room waits for the non-relay player's proof that it
+/// reaches the relay, after the settle delay, before sending both players back
+/// to the queue.
+const AUTOMATCH_PROOF_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Form what pairs can be formed and offer them.
 pub async fn run_pairing(state: &AppState) {
@@ -5093,7 +5083,7 @@ mod game_scope_tests {
                 allow_spectators: false,
                 spectators: Vec::new(),
                 match_caps: None,
-                relay_session_id: None,
+                relay_host_player_id: String::new(),
                 started: false,
                 automatch: false,
             },
@@ -5116,7 +5106,7 @@ mod game_scope_tests {
     }
 
     #[test]
-    fn host_relay_needs_the_ask_an_endpoint_and_every_guest_direct() {
+    fn a_match_needs_the_ask_an_endpoint_and_every_guest_direct() {
         let mut g = hub_inner();
         lobby(&mut g, "L", "Pokemon Stadium");
         let host_caps = Some(json!({ "relay": "host" }));
@@ -5128,18 +5118,22 @@ mod game_scope_tests {
         seat_path(&mut g, "L", 0, "h", None, 0);
         seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
         let l = &g.lobbies["L"];
-        assert_eq!(start_use_sfu(l, &None), (true, "always_sfu"), "no ask: the SFU");
-        assert_eq!(start_use_sfu(l, &host_caps), (false, "host_relay"), "asked and proven");
+        assert_eq!(host_relay_decision(l, &None), Err("no_host_relay_ask"), "no ask: no match");
+        assert_eq!(host_relay_decision(l, &host_caps), Ok("host_relay"), "asked and proven");
 
         seat_path(&mut g, "L", 1, "g", Some("fail"), 1);
-        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "a failed probe: SFU");
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Err("host_relay_unproven"));
         seat_path(&mut g, "L", 1, "g", None, 0);
-        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "no report: SFU");
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Err("host_relay_unproven"));
         seat_path(&mut g, "L", 1, "g", Some("direct"), 600);
-        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, true, "a stale report: SFU");
+        assert_eq!(
+            host_relay_decision(&g.lobbies["L"], &host_caps),
+            Err("host_relay_unproven"),
+            "a stale report"
+        );
         seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
         {
-            // A spectator in the gallery: only the SFU can mute it.
+            // A spectator in the gallery: nothing here can mute it.
             let l = g.lobbies.get_mut("L").unwrap();
             l.spectators = vec![Some(Slot {
                 player_id: "s".into(),
@@ -5153,19 +5147,56 @@ mod game_scope_tests {
                 ice_path_at: None,
             })];
         }
-        assert_eq!(
-            start_use_sfu(&g.lobbies["L"], &host_caps),
-            (true, "host_relay_spectators"),
-            "spectators seated: SFU"
-        );
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Err("host_relay_spectators"));
         g.lobbies.get_mut("L").unwrap().spectators.clear();
-        assert_eq!(start_use_sfu(&g.lobbies["L"], &host_caps).0, false, "gallery empty again: host");
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Ok("host_relay"));
         g.lobbies.get_mut("L").unwrap().host_endpoint.clear();
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Err("host_relay_no_endpoint"));
+    }
+
+    /// An automatch room has no host, so the chosen relay seat is the one that
+    /// needs no proof and the OTHER seat is the one that must have it.
+    #[test]
+    fn a_client_may_only_advertise_its_own_address() {
+        // A public client: only its own address, as an IP literal.
+        assert!(endpoint_is_clients_own("198.51.100.7:7777", "198.51.100.7"));
+        assert!(endpoint_is_clients_own("198.51.100.7:7777", "::ffff:198.51.100.7"));
+        assert!(!endpoint_is_clients_own("203.0.113.9:7777", "198.51.100.7"), "a third party");
+        assert!(!endpoint_is_clients_own("victim.example:7777", "198.51.100.7"), "a name");
+        assert!(!endpoint_is_clients_own("198.51.100.7:7777", ""), "no known peer");
+        // A client the server sees on the LAN is local already.
+        assert!(endpoint_is_clients_own("203.0.113.9:7777", "192.168.66.20"));
+        assert!(endpoint_is_clients_own("203.0.113.9:7777", "127.0.0.1"));
+        assert!(!endpoint_is_clients_own("victim.example:7777", "192.168.66.20"), "still no names");
+    }
+
+    #[test]
+    fn a_bind_string_cannot_smuggle_a_third_partys_address() {
+        assert_eq!(own_endpoint("0.0.0.0:7777", "198.51.100.7"), "198.51.100.7:7777");
+        assert_eq!(own_endpoint("203.0.113.9:7777", "198.51.100.7"), "198.51.100.7:7777");
+        assert_eq!(own_endpoint("198.51.100.7:7777", "198.51.100.7"), "198.51.100.7:7777");
+    }
+
+    #[test]
+    fn an_automatch_relay_seat_is_exempt_and_the_other_must_prove() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Pokemon Stadium");
+        let caps = Some(json!({ "relay": "host" }));
+        {
+            let l = g.lobbies.get_mut("L").unwrap();
+            l.host_player_id = String::new();
+            l.relay_host_player_id = "r".into();
+            l.host_endpoint = "203.0.113.5:7777".into();
+        }
+        seat_path(&mut g, "L", 0, "g", None, 0);
+        seat_path(&mut g, "L", 1, "r", None, 0);
         assert_eq!(
-            start_use_sfu(&g.lobbies["L"], &host_caps),
-            (true, "host_relay_no_endpoint"),
-            "no endpoint: SFU"
+            host_relay_decision(&g.lobbies["L"], &caps),
+            Err("host_relay_unproven"),
+            "the guest has not proven it reaches the relay"
         );
+        seat_path(&mut g, "L", 0, "g", Some("direct"), 1);
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &caps), Ok("host_relay"));
     }
 
     #[test]
@@ -5324,7 +5355,7 @@ mod spectator_tests {
             allow_spectators: spectators > 0,
             spectators: vec![None; spectators],
             match_caps: None,
-            relay_session_id: None,
+            relay_host_player_id: String::new(),
             started: false,
             automatch: false,
         }

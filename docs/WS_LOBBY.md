@@ -433,12 +433,12 @@ seated, with no sender and `"system": true`: `"<name> has joined."`,
   "system": true, "text": "Marisa has joined." }
 ```
 
-Client → server (host only; requires seated `player_count >= 2`). Online MotK/BPE
-lobbies open the lobby UDP SFU (`transport=sfu`, §108) -- **amended 2026-09-29:**
-except a host-relay lobby whose guests have proven the host reachable, which
-launches `transport=host` ("Host relay" below). Waiting-room `path_report` does
-not select `ice_p2p`; in a host-relay lobby it is that proof.
-`match_caps.force_turn` is a client delay-floor hint, not a transport switch.
+Client → server (host only; requires seated `player_count >= 2`). **The server
+relays nothing** (amended 2026-10-02: the UDP SFU and `transport=sfu` are
+removed). A match launches `transport=host` ("Host relay" below) or it does not
+start. Waiting-room `path_report` is the proof that every guest reaches the
+relay. `match_caps.force_turn` is a client delay-floor hint, not a transport
+switch.
 Ready flags are informational only — host Play is the launch authority:
 
 ```json
@@ -447,26 +447,15 @@ Ready flags are informational only — host Play is the launch authority:
 
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
-`need_players`, `relay_unavailable` (SFU required but relay not configured).
+`need_players`, `relay_unavailable` (no host-relay ask, no advertised
+endpoint, a spectator seated, or a guest without a fresh `direct` report).
 
 On success the server:
 
 1. Allocates a **new** `session_id` (monotonic) for this match — rematch after
    return-to-lobby must not reuse the previous UDP session id (stale HELLO/BYE).
-2. **SFU:** opens a UDP SFU session and sets `host_endpoint` /
-   `guest_endpoint` / `relay_endpoint` to the advertised relay address
-   (`INPUT_RELAY_ADVERTISE_HOST`:`INPUT_RELAY_ADVERTISE_PORT`). The host
-   defaults from `PUBLIC_HOST` / `LOBBY_PUBLIC_HOST`, otherwise startup
-   STUN-discovers this machine’s public IPv4 (never `127.0.0.1` unless
-   `INPUT_RELAY_ALLOW_LOOPBACK=1`). When **every** seated member’s WebSocket
-   TCP peer IP is a *direct* RFC1918/loopback address (not the LAN gateway /
-   hairpin source) and `INPUT_RELAY_LAN_HOST` is set, launch uses that LAN
-   host instead. Peers that dial the public DNS and NAT-hairpin often appear
-   as the router (`.1`); those keep the public advertise. Override the
-   gateway with `INPUT_RELAY_LAN_GATEWAY` if it is not `<LAN>/24` → `.1`.
-   MotK clients may also rewrite the relay host to a private WebSocket peer.
-   On Linux the SFU uses `IP_PKTINFO` so forwarded datagrams are sourced from
-   the local address each peer dialed (avoids dual-NIC wrong-source drops).
+2. Keeps `host_endpoint` / `guest_endpoint` as advertised; nothing is opened on
+   the server.
 3. Clears every slot’s `ready` (clients auto-ready again for rematch).
 4. Broadcasts to **all** members:
 
@@ -478,8 +467,8 @@ On success the server:
   "session_id": 2,
   "host_endpoint": "…",
   "guest_endpoint": "…",
-  "relay_endpoint": "public.example:8777",
-  "transport": "sfu",
+  "transport": "host",
+  "relay_host_slot": 0,
   "player_count": 2,
   "max_slots": 2,
   "slots": [ … ],
@@ -487,35 +476,41 @@ On success the server:
 }
 ```
 
-`transport` is `"sfu"`, with `relay_endpoint`, unless the host relays
-(`"host"`, no `relay_endpoint`; below). Each client starts netplay with LAN transport to the relay. Guests apply
-`match_caps` (when present) before booting so both peers share sim-affecting
-settings. Direct IP / LAN file lobbies (no MotK WS seat) stay on local UDP and
-do not use this path.
+`transport` is always `"host"`. `relay_host_slot` is the lobby seat that runs
+the relay hub: the host's seat in a hosted room, the negotiated seat in an
+automatch room (which has no host). Every other seat starts LAN transport to
+`host_endpoint`. Guests apply `match_caps` (when present) before booting so
+both peers share sim-affecting settings. Direct IP / LAN file lobbies (no MotK
+WS seat) stay on local UDP and do not use this path.
 
-## Host relay (2026-09-29)
+## Host relay (2026-09-29; the only transport since 2026-10-02)
 
-A host may relay its own match instead of the SFU: the Retro hub runs
+A host relays its own match: the Retro hub runs
 recomp-net's LAN hub in the host's game process and every guest dials it
 (Retro-Launcher `docs/NETPLAY_DIRECT.md`).
 
 1. **The ask:** `match_caps.relay = "host"` (at `create`, `set_match_caps` or
    `start`).
-2. **The address:** the host advertises its reachable UDP endpoint with
+2. **The address:** (since 2026-10-02 it must be the client's own: an IP
+   literal, equal to the address the server sees for its WebSocket unless
+   that address is private/loopback; otherwise `bad_host_endpoint`. The same
+   rule applies to the automatch `host_endpoint` offer, and an explicit host
+   in `host_bind` / `guest_bind` that is not the client's own is replaced by
+   its address.) The host advertises its reachable UDP endpoint with
    `set_host_endpoint` (the hub's STUN / UPnP / NAT-PMP result). Changing it
    clears every guest's path report: the new address must be proven again.
 3. **The proof:** each guest probes the host's `host_endpoint` (from
    `lobby_update`) while seated and sends `path_report` `direct` when the host
    answered, `fail` when not.
-4. **The decision, at `start`:** `transport` is `"host"` only when the ask is
-   there, `host_endpoint` is set, and **every** seated guest's latest report is
-   `direct` and at most 120 s old, and **no spectator is seated** (the
-   gallery is read-only only because the SFU drops a spectator's packets;
-   a host hub forwards whatever reaches it). Otherwise the SFU relays as for
-   any lobby, so the match always connects (`start_use_sfu`; its reason is
-   logged as `host_relay`, `host_relay_unproven`, `host_relay_no_endpoint`
-   or `host_relay_spectators`).
-5. **`launch`** then carries `transport: "host"`, no `relay_endpoint`, and
+4. **The decision, at `start`:** the match starts only when the ask is there,
+   `host_endpoint` is set, **every** seated non-relay player's latest report
+   is `direct` and at most 120 s old, and **no spectator is seated** (a host
+   hub forwards whatever reaches it, so nothing can mute a gallery). Otherwise
+   `start` fails `relay_unavailable`; the reason is logged as `host_relay`,
+   `no_host_relay_ask`, `host_relay_unproven`, `host_relay_no_endpoint` or
+   `host_relay_spectators` (`host_relay_decision`). There is no server
+   fallback.
+5. **`launch`** then carries `transport: "host"`, `relay_host_slot` and
    `host_endpoint`: guests start LAN transport to it; the host binds its port.
 
 Every seat's latest report is published on `lobby_update` as `path` /

@@ -425,7 +425,7 @@ pub const MAX_PREDICTION: u32 = 16;
 /// slot's row for `T + D`. The peer produced that row `D` frames earlier, so
 /// the input has exactly `D` frames of wall time to make a ONE-WAY trip.
 ///
-/// Online always runs through the SFU, so that trip is peer → relay → peer.
+/// Online runs through the relay host's hub, so the trip is guest → relay → peer.
 /// Each `rtt_ms` is a client's own round trip to the relay, i.e. twice its
 /// one-way distance, so:
 ///
@@ -605,10 +605,6 @@ pub fn sanitize_rtt(raw: i64) -> i32 {
 /// number is kept only so the pairing filter can say "no" with it.
 pub const MAX_REPORTED_RTT_MS: u32 = 2000;
 
-/// The relay packet type a client probes with, published to clients so the
-/// number lives in one place rather than in two that can disagree.
-pub const PROBE_PKT_TYPE: u16 = 200;
-
 /// How long a freshly queued ticket is held back to let its probe land.
 ///
 /// The documented path is to probe BEFORE queueing and put `rtt_ms` on the
@@ -657,8 +653,14 @@ pub struct Ticket {
     pub keys: Vec<MatchKey>,
     pub host_bind: String,
     pub guest_bind: String,
+    /// The UDP endpoint this player offers to relay the match at (its hub's
+    /// STUN / UPnP / NAT-PMP address), or `None` when it cannot. The server
+    /// relays nothing, so a pair needs at least one of these
+    /// (`relay_possible`); see `relay_host`.
+    pub relay_endpoint: Option<String>,
     pub queued_at: Instant,
-    /// Round trip to the relay, or -1 when unmeasured. See `rtt_ok`.
+    /// Client-reported round trip (to the server, or to whatever the client
+    /// measured), or -1 when unmeasured. A hint only: see `rtt_ok`.
     pub rtt_ms: i32,
     /// Accounts this player has blocked, copied from the connection when the
     /// ticket was made.
@@ -688,6 +690,25 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// Which of the pair relays the match: `true` = `a`.
+    ///
+    /// The choice the two tickets negotiate. Exactly one offered: that one.
+    /// Both offered: the lower reported round trip wins (a better link makes
+    /// the better hub), and an unmeasured or tied pair goes to `a`, the older
+    /// ticket, so the outcome is deterministic. Neither offered: `None`, which
+    /// pairing never allows.
+    pub fn relay_host_is_a(&self) -> Option<bool> {
+        match (&self.a.relay_endpoint, &self.b.relay_endpoint) {
+            (Some(_), None) => Some(true),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                let (ra, rb) = (self.a.rtt_ms, self.b.rtt_ms);
+                Some(!(ra >= 0 && rb >= 0 && rb < ra))
+            }
+        }
+    }
+
     fn side(&self, player_id: &str) -> Option<bool> {
         if self.a.player_id == player_id {
             Some(true)
@@ -956,6 +977,13 @@ fn find_pair_pass(
                 if a.blocks.contains(&b.account_id) || b.blocks.contains(&a.account_id) {
                     continue;
                 }
+                /* Hard: somebody has to be able to relay, because the server
+                 * will not. Two players neither of whom can host a hub have
+                 * no path between them, and pairing them would only spend
+                 * both accept gates on a match that cannot launch. */
+                if !relay_possible(a, b) {
+                    continue;
+                }
                 /* Both sides must be past the measuring window, or the
                  * pair is qualified on a number that was about to arrive. */
                 if !measurable(a) || !measurable(b) {
@@ -972,6 +1000,11 @@ fn find_pair_pass(
         }
     }
     None
+}
+
+/// Can at least one of the two relay the match?
+fn relay_possible(a: &Ticket, b: &Ticket) -> bool {
+    a.relay_endpoint.is_some() || b.relay_endpoint.is_some()
 }
 
 /// Has this ticket either measured, or had its chance to?
@@ -1399,12 +1432,64 @@ mod tests {
             keys,
             host_bind: "0.0.0.0:7777".into(),
             guest_bind: "0.0.0.0:7778".into(),
+            /* Offers to relay, so ordinary pairing tests pair. A test about
+             * the choice or its absence sets this and says so. */
+            relay_endpoint: Some("203.0.113.9:7777".into()),
             queued_at: Instant::now(),
-            /* Measured, because that is the path a real client takes: probe
-             * the relay, then queue carrying the number. A test that wants
-             * the unmeasured case sets this to -1 and says so. */
+            /* Measured, because that is the path a real client takes: it
+             * queues carrying the number. A test that wants the unmeasured
+             * case sets this to -1 and says so. */
             rtt_ms: 20,
         }
+    }
+
+    #[tokio::test]
+    async fn two_players_who_cannot_relay_never_pair() {
+        let q = Queue::default();
+        for (p, acct) in [("p1", "a1"), ("p2", "a2")] {
+            let mut t = ticket(p, acct, vec![key("G")]);
+            t.relay_endpoint = None;
+            q.push(t).await;
+        }
+        assert!(q.pair(0).await.is_empty(), "no path between them without a relay");
+    }
+
+    #[tokio::test]
+    async fn one_player_who_can_relay_is_enough_and_is_chosen() {
+        let q = Queue::default();
+        let mut a = ticket("p1", "a1", vec![key("G")]);
+        a.relay_endpoint = None;
+        q.push(a).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await;
+        let offers = q.pair(0).await;
+        assert_eq!(offers.len(), 1);
+        let p = &offers[0];
+        let host = if p.relay_host_is_a().unwrap() { &p.a } else { &p.b };
+        assert_eq!(host.player_id, "p2", "only p2 offered");
+    }
+
+    #[tokio::test]
+    async fn when_both_offer_the_better_link_relays() {
+        let mut a = ticket("p1", "a1", vec![key("G")]);
+        let mut b = ticket("p2", "a2", vec![key("G")]);
+        a.rtt_ms = 80;
+        b.rtt_ms = 20;
+        let p = Pending {
+            match_id: "m".into(),
+            key: key("G"),
+            a: a.clone(),
+            b: b.clone(),
+            a_accept: None,
+            b_accept: None,
+            offered_at: Instant::now(),
+        };
+        assert_eq!(p.relay_host_is_a(), Some(false), "b has the lower rtt");
+        let mut tied = p.clone();
+        tied.b.rtt_ms = 80;
+        assert_eq!(tied.relay_host_is_a(), Some(true), "a tie goes to the older ticket");
+        let mut unmeasured = p.clone();
+        unmeasured.b.rtt_ms = -1;
+        assert_eq!(unmeasured.relay_host_is_a(), Some(true), "unknown never beats known");
     }
 
     #[tokio::test]

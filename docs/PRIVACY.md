@@ -18,7 +18,7 @@ for operators and clients.
 | ICE signal envelopes (`text` / SDP-like payloads) | Relay only | Not persisted; forwarded then discarded |
 | Discord account link (`discord_id`, cached `@username` / display name / avatar hash, `netplay_handle`) | Identity for naming, reports and bans | Persisted in SQLite indefinitely; names refreshed on every sign-in. No deletion endpoint yet |
 | Per-device netplay secrets | Browserless sign-in on handhelds / consoles | **Never stored in plaintext.** SHA-256 hashes only, plus a player-set label and timestamps; revoked rows are kept, marked, not deleted |
-| Automatch queue tickets (opted-in titles, `game_version`, disc fingerprint, UDP binds, relay RTT estimate) | Pair two players into a match | In-memory for the ticket's life; discarded on pair, cancel or disconnect |
+| Automatch queue tickets (opted-in titles, `game_version`, disc fingerprint, UDP binds, the player's offered relay endpoint, client-reported RTT) | Pair two players into a match | In-memory for the ticket's life; discarded on pair, cancel or disconnect |
 | Automatch accept-gate strikes | Dodge cooldown | Persisted, keyed on the account; only the last 24 h affects a cooldown; pruned per `AUTOMATCH_RETENTION_DAYS` |
 | Automatch pairings (who was paired with whom, when, RTT estimate, whether it launched) | Avoid-last-opponent filter; operator support questions | Persisted; only the last `AUTOMATCH_REMATCH_COOLDOWN_SECS` affects matching; pruned per `AUTOMATCH_RETENTION_DAYS` |
 
@@ -51,8 +51,8 @@ accounts existed. Automatch is the one surface that requires an account
 
 ## What we do **not** process
 
-- Interpreted pad / sim state (relay forwards opaque `recomp-net` datagrams
-  when input relay is enabled; bytes are not decoded or stored)
+- Pad / sim state. Match traffic never reaches this server: it runs
+  peer-to-peer or through a player's own relay hub
 - Disc / ROM contents
 - Screenshots, audio, or video from the guest
 - Long-term plaintext lobby passwords
@@ -61,8 +61,8 @@ accounts existed. Automatch is the one surface that requires an account
 - Match results, scores, or ratings. The sim runs on the clients; the server
   does not observe who won and records nothing that claims to
 
-When input relay is active, ephemeral UDP datagrams for a match traverse the
-server process for fan-out only and are not persisted.
+The server has no match relay: no UDP datagram of a match traverses this
+process.
 
 ## Logging
 
@@ -98,9 +98,7 @@ What metrics include:
 - Automatch queue depth, pairs formed, accepts / declines / timeouts, and
   time-to-pair, labelled by **game** and **ruleset** — never by player
 - Gauges for currently connected WS clients, open WS lobbies, **WS matches**
-  (lobbies that have `start`ed), open HTTP rooms, **HTTP rooms running**,
-  allocated input-relay sessions, and **SFU-active** sessions (recent UDP from
-  at least two seats)
+  (lobbies that have `start`ed), open HTTP rooms, **HTTP rooms running**
 
 What metrics intentionally omit:
 

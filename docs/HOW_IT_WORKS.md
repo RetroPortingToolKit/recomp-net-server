@@ -11,15 +11,14 @@ repo) and does not ship inside that library crate/tree.
 | HTTP `/v1` rooms + ICE signal relay | Guest console simulation |
 | WebSocket JSON lobby for MotK / psxrecomp | Interpreting pad bits / sim state |
 | Slot / `session_id` / endpoint handoff | Rollback or prediction |
-| UDP input SFU (star fan-out, online default) | Storing gameplay pad streams |
+| Host-relay negotiation (who relays, proof it is reachable) | Relaying or storing gameplay pad streams |
 | Optional TURN credential minting | |
 
-After WebSocket `start`, online peers dial this server’s **UDP SFU star** —
-one advertise endpoint, opaque fan-out (magic + `session_id` checked; pad
-bytes are never interpreted). There is no guest↔guest mesh and no
-game-host fan-out on the online path. Sim authority remains pad **slot 0**
-(session host); guests may rearrange among seats 1..N−1. LAN/direct lobbies
-(no WS start) may still use client host-as-relay / P2P.
+After WebSocket `start`, the other seats dial **one player's own relay hub**
+(`transport=host`): the server decides whether that is allowed (the ask, an
+advertised endpoint, every guest's `path_report`) and tells everyone where it
+is, but no match datagram ever touches this process. Sim authority remains pad
+**slot 0** (session host); guests may rearrange among seats 1..N−1.
 
 ## Two surfaces, one process
 
@@ -31,20 +30,28 @@ game-host fan-out on the online path. Sim authority remains pad **slot 0**
   SNES / HTTP       │  HTTP /v1/*                 │  players, rooms,
   clients ─────────►│  (docs/LOBBY.md)            │  heartbeat, signals
                     ├─────────────────────────────┤
-                    │  UDP input relay (optional) │  fan-out delay-sync
+                    │  (no match relay)           │  see note below
                     │  SQLite (players / auth)    │
                     └─────────────────────────────┘
                               │
                               ▼ handoff
                     host_endpoint / guest_endpoint
-                    (+ relay_endpoint when relaying)
+                    (+ relay_host_slot)
                     session_id / slots
                               │
                      ┌────────┴────────┐
                      ▼                 ▼
-              peer ↔ peer      peers → relay → peers
-            (LAN / ICE)         (star UDP)
+              peer ↔ peer      peers → host's hub
+            (LAN / ICE)         (host relay)
 ```
+
+> **The server relays nothing.** There is no UDP input relay (SFU): the code
+> is gone and `INPUT_RELAY_ENABLED` is refused at startup. A match starts only
+> as a host relay (`transport: "host"`): one player's own hub carries it, and
+> every other seat has proven in the waiting room that it reaches that
+> endpoint. Automatch negotiates which player relays (AUTOMATCH.md §1). TURN
+> credentials are unaffected: TURN is a separate coturn deployment, not this
+> process.
 
 Both surfaces share `BIND_ADDR` (default `0.0.0.0:8765` for MotK local dev).
 
@@ -56,16 +63,11 @@ Both surfaces share `BIND_ADDR` (default `0.0.0.0:8765` for MotK local dev).
 4. Server rewrites bind addresses (`0.0.0.0` → peer TCP IP) into
    `host_endpoint` / `guest_endpoint`.
 5. Both sides receive slot map + endpoints (`created` / `joined` /
-   `lobby_update`). On `start`, online lobbies open the UDP SFU and set
-   `relay_endpoint` (and both pad endpoints) to the advertise address
-   (`PUBLIC_HOST` / `INPUT_RELAY_ADVERTISE_*`, or STUN public IPv4; port
-   usually `8777` — never loopback by default). If every seated WS peer is a
-   direct private/loopback address (not the LAN gateway / hairpin source),
-   the server prefers `INPUT_RELAY_LAN_HOST` when set.
-6. Clients start `recomp-net` LAN sessions with peer = relay. MotK/psx
-   clients may rewrite the relay host to the connected WebSocket peer IP.
-   The WebSocket stays up for list / ICE `signal`; pad fan-out uses UDP
-   `8777`.
+   `lobby_update`). On `start`, the server checks the host-relay proof and
+   launches `transport=host`; `host_endpoint` is the relay player's own
+   advertised address.
+6. Clients start `recomp-net` LAN sessions with peer = that hub. The
+   WebSocket stays up for list / ICE `signal`.
 
 ## HTTP `/v1` flow
 
@@ -84,7 +86,7 @@ must stay in lockstep is `COTURN_STATIC_AUTH_SECRET` ↔ `static-auth-secret`.
 
 | Endpoint | Use |
 |----------|-----|
-| `GET /stats` | JSON: live WS/HTTP lobby counts, in-match vs waiting, SFU-active sessions, by-game breakdown, process totals |
+| `GET /stats` | JSON: live WS/HTTP lobby counts, in-match vs waiting, by-game breakdown, process totals |
 | `GET /stats/ui` | Small HTML dashboard that polls `/stats` |
 | `GET /metrics` | Prometheus (`recomp_*` counters/gauges + HTTP request metrics) |
 

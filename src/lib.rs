@@ -4,19 +4,16 @@ pub mod chat_filter;
 pub mod config;
 pub mod discord_auth;
 pub mod identity;
-pub mod input_relay;
 pub mod ip_country;
 pub mod metrics;
 pub mod moderation;
 pub mod names;
 pub mod players;
-pub mod public_ip;
 pub mod rooms;
 pub mod secrets;
 pub mod routes;
 pub mod signal;
 pub mod turn_credentials;
-pub mod udp_pktinfo;
 pub mod ws_lobby;
 
 use sqlx::SqlitePool;
@@ -39,8 +36,6 @@ pub struct AppState {
     pub signals: Arc<Mutex<signal::SignalStore>>,
     /// WebSocket lobby hub (MotK / psxrecomp JSON protocol).
     pub ws_lobby: ws_lobby::WsLobbyHub,
-    /// UDP star-topology delay-sync input relay.
-    pub input_relay: input_relay::InputRelay,
     /// Discord logins in flight, keyed by the pairing code the launcher polls.
     pub discord_logins: discord_auth::LoginStore,
     /// One-shot nonces for device challenge-response.

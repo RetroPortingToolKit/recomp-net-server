@@ -6,7 +6,6 @@
 //! `LOBBY_GAME_ALLOWLIST` (or past `METRICS_GAME_LABEL_LIMIT` when no allowlist
 //! is set) into `other` — a scrape can never blow up the series count.
 //! Waiting vs in-match is split: `recomp_ws_matches` / `recomp_http_rooms_running`
-//! plus `recomp_input_relay_sessions_active` (SFU pads actually flowing).
 
 use metrics::{counter, describe_counter, describe_gauge, gauge};
 use serde::Serialize;
@@ -42,10 +41,6 @@ static HTTP_ROOM_JOINS: AtomicU64 = AtomicU64::new(0);
 static HTTP_ROOM_JOIN_FAILURES: AtomicU64 = AtomicU64::new(0);
 static HTTP_ROOM_STARTS: AtomicU64 = AtomicU64::new(0);
 static HTTP_TURN_CREDENTIALS: AtomicU64 = AtomicU64::new(0);
-static INPUT_RELAY_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
-static INPUT_RELAY_SESSIONS_CLOSED: AtomicU64 = AtomicU64::new(0);
-static INPUT_RELAY_FORWARDS: AtomicU64 = AtomicU64::new(0);
-static INPUT_RELAY_DROPS: AtomicU64 = AtomicU64::new(0);
 
 struct GameLabels {
     /// True when `LOBBY_GAME_ALLOWLIST` is set: only seeded names get a label.
@@ -284,30 +279,6 @@ pub fn describe() {
     describe_gauge!("recomp_http_rooms", "Currently open HTTP /v1 rooms");
     describe_gauge!("recomp_http_rooms_running", "HTTP /v1 rooms marked running");
     describe_counter!(
-        "recomp_input_relay_sessions_opened_total",
-        "Input-relay sessions allocated at match start"
-    );
-    describe_counter!(
-        "recomp_input_relay_sessions_closed_total",
-        "Input-relay sessions closed (lobby destroy / rematch)"
-    );
-    describe_counter!(
-        "recomp_input_relay_forwards_total",
-        "Datagrams successfully fan-out to peer seats"
-    );
-    describe_counter!(
-        "recomp_input_relay_drops_total",
-        "Datagrams dropped by the input relay"
-    );
-    describe_gauge!(
-        "recomp_input_relay_sessions",
-        "Live input-relay sessions (allocated at launch)"
-    );
-    describe_gauge!(
-        "recomp_input_relay_sessions_active",
-        "Input-relay sessions with recent UDP from at least two seats"
-    );
-    describe_counter!(
         "recomp_match_starts_total",
         "Matches started, by surface and bounded game label"
     );
@@ -414,37 +385,6 @@ pub fn http_turn_credentials_issued() {
     counter!("recomp_http_turn_credentials_total").increment(1);
 }
 
-pub fn input_relay_session_opened() {
-    bump(&INPUT_RELAY_SESSIONS_OPENED);
-    counter!("recomp_input_relay_sessions_opened_total").increment(1);
-}
-
-pub fn input_relay_session_closed() {
-    bump(&INPUT_RELAY_SESSIONS_CLOSED);
-    counter!("recomp_input_relay_sessions_closed_total").increment(1);
-}
-
-pub fn input_relay_forwarded(n: u64) {
-    if n == 0 {
-        return;
-    }
-    INPUT_RELAY_FORWARDS.fetch_add(n, Ordering::Relaxed);
-    counter!("recomp_input_relay_forwards_total").increment(n);
-}
-
-pub fn input_relay_drop(reason: &'static str) {
-    bump(&INPUT_RELAY_DROPS);
-    counter!("recomp_input_relay_drops_total", "reason" => reason).increment(1);
-}
-
-pub fn set_input_relay_sessions(n: usize) {
-    gauge!("recomp_input_relay_sessions").set(n as f64);
-}
-
-pub fn set_input_relay_sessions_active(n: usize) {
-    gauge!("recomp_input_relay_sessions_active").set(n as f64);
-}
-
 pub fn set_gauges(
     ws_clients: usize,
     ws_lobbies: usize,
@@ -475,10 +415,6 @@ pub struct Totals {
     pub http_room_join_failures: u64,
     pub http_room_starts: u64,
     pub http_turn_credentials: u64,
-    pub input_relay_sessions_opened: u64,
-    pub input_relay_sessions_closed: u64,
-    pub input_relay_forwards: u64,
-    pub input_relay_drops: u64,
 }
 
 pub fn totals() -> Totals {
@@ -497,10 +433,6 @@ pub fn totals() -> Totals {
         http_room_join_failures: HTTP_ROOM_JOIN_FAILURES.load(Ordering::Relaxed),
         http_room_starts: HTTP_ROOM_STARTS.load(Ordering::Relaxed),
         http_turn_credentials: HTTP_TURN_CREDENTIALS.load(Ordering::Relaxed),
-        input_relay_sessions_opened: INPUT_RELAY_SESSIONS_OPENED.load(Ordering::Relaxed),
-        input_relay_sessions_closed: INPUT_RELAY_SESSIONS_CLOSED.load(Ordering::Relaxed),
-        input_relay_forwards: INPUT_RELAY_FORWARDS.load(Ordering::Relaxed),
-        input_relay_drops: INPUT_RELAY_DROPS.load(Ordering::Relaxed),
     }
 }
 
@@ -519,8 +451,6 @@ pub struct StatsSnapshot {
     /// Lifetime match starts per bounded game label (mirrors Prometheus).
     pub ws_match_starts_by_game: BTreeMap<String, MatchTotals>,
     pub http_match_starts_by_game: BTreeMap<String, MatchTotals>,
-    pub input_relay_sessions: usize,
-    pub input_relay_sessions_active: usize,
     pub totals: Totals,
 }
 
