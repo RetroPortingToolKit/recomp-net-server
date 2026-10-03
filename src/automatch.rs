@@ -1487,6 +1487,65 @@ mod tests {
         assert_eq!(host.player_id, "p2", "only p2 offered");
     }
 
+    fn ice_ticket(player: &str, account: &str) -> Ticket {
+        let mut t = ticket(player, account, vec![key("G")]);
+        t.relay_endpoint = None;
+        t.ice_relay = true;
+        t
+    }
+
+    #[tokio::test]
+    async fn two_ice_only_players_pair_in_ice_mode() {
+        let q = Queue::default();
+        q.push(ice_ticket("p1", "a1")).await;
+        q.push(ice_ticket("p2", "a2")).await;
+        let offers = q.pair(0).await;
+        assert_eq!(offers.len(), 1);
+        let p = &offers[0];
+        assert!(p.is_ice());
+        assert!(p.relay_host_is_a().is_some(), "RTT picks a host with no endpoints");
+    }
+
+    #[tokio::test]
+    async fn ice_pair_picks_the_lower_rtt_host() {
+        let mut a = ice_ticket("p1", "a1");
+        let mut b = ice_ticket("p2", "a2");
+        a.rtt_ms = 90;
+        b.rtt_ms = 30;
+        let p = Pending {
+            match_id: "m".into(),
+            key: key("G"),
+            a,
+            b,
+            a_accept: None,
+            b_accept: None,
+            offered_at: Instant::now(),
+        };
+        assert_eq!(p.relay_host_is_a(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_mixed_pair_keeps_legacy_mode_and_the_endpoint_offerer_relays() {
+        let q = Queue::default();
+        q.push(ice_ticket("p1", "a1")).await;
+        q.push(ticket("p2", "a2", vec![key("G")])).await; // legacy, offers an endpoint
+        let offers = q.pair(0).await;
+        assert_eq!(offers.len(), 1);
+        let p = &offers[0];
+        assert!(!p.is_ice());
+        assert_eq!(p.relay_host_is_a(), Some(false), "p2 holds the endpoint");
+    }
+
+    #[tokio::test]
+    async fn one_ice_only_and_one_incapable_never_pair() {
+        let q = Queue::default();
+        q.push(ice_ticket("p1", "a1")).await;
+        let mut t = ticket("p2", "a2", vec![key("G")]);
+        t.relay_endpoint = None; // neither endpoint nor ICE
+        q.push(t).await;
+        assert!(q.pair(0).await.is_empty());
+    }
+
     #[tokio::test]
     async fn when_both_offer_the_better_link_relays() {
         let mut a = ticket("p1", "a1", vec![key("G")]);

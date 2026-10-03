@@ -5347,6 +5347,72 @@ mod game_scope_tests {
         assert_eq!(host_relay_decision(&g.lobbies["L"], &caps), Ok("host_relay"));
     }
 
+    fn ice_caps() -> Option<Value> {
+        Some(json!({ "relay": "host", "relay_via": "ice" }))
+    }
+
+    #[test]
+    fn ice_mode_needs_no_endpoint_but_every_guest_direct() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "G");
+        g.lobbies.get_mut("L").unwrap().host_player_id = "h".into();
+        seat_path(&mut g, "L", 0, "h", None, 0);
+        seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        assert!(g.lobbies["L"].host_endpoint.is_empty());
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &ice_caps()), Ok("host_relay"));
+        // Legacy caps with the same empty endpoint keep today's refusal.
+        assert_eq!(
+            host_relay_decision(&g.lobbies["L"], &Some(json!({ "relay": "host" }))),
+            Err("host_relay_no_endpoint")
+        );
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &None), Err("no_host_relay_ask"));
+        // relay_via alone is not an ask.
+        assert_eq!(
+            host_relay_decision(&g.lobbies["L"], &Some(json!({ "relay_via": "ice" }))),
+            Err("no_host_relay_ask")
+        );
+    }
+
+    #[test]
+    fn ice_mode_still_refuses_unproven_guests_and_spectators() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "G");
+        g.lobbies.get_mut("L").unwrap().host_player_id = "h".into();
+        seat_path(&mut g, "L", 0, "h", None, 0);
+        for (path, age) in [(Some("fail"), 1), (Some("relay"), 1), (None, 0), (Some("direct"), 600)] {
+            seat_path(&mut g, "L", 1, "g", path, age);
+            assert_eq!(
+                host_relay_decision(&g.lobbies["L"], &ice_caps()),
+                Err("host_relay_unproven"),
+                "{path:?} age {age}"
+            );
+        }
+        seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        g.lobbies.get_mut("L").unwrap().spectators = vec![Some(Slot {
+            player_id: "s".into(),
+            display_name: "s".into(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            memcard_offer: None,
+            country: String::new(),
+            ice_path: None,
+            ice_path_at: None,
+        })];
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &ice_caps()), Err("host_relay_spectators"));
+    }
+
+    #[test]
+    fn the_signal_bucket_allows_a_burst_then_refills() {
+        let mut b = SignalBucket::default();
+        let t0 = Instant::now();
+        for i in 0..60 {
+            assert!(b.allow(t0), "burst {i}");
+        }
+        assert!(!b.allow(t0), "burst spent");
+        assert!(b.allow(t0 + std::time::Duration::from_millis(100)), "refilled ~6");
+    }
+
     #[test]
     fn the_recorded_title_is_the_scope() {
         let mut g = hub_inner();
@@ -5995,5 +6061,189 @@ mod hub_lock_tests {
                 .is_ok(),
             "hub lock still held after handle_create returned"
         );
+    }
+
+    fn seat_for_signal(g: &mut HubInner, lid: &str, pid: &str, seat: usize) -> broadcast::Receiver<String> {
+        let (tx, rx) = broadcast::channel(256);
+        g.clients.insert(
+            pid.to_string(),
+            ClientMeta {
+                player_id: pid.to_string(),
+                display_name: pid.to_string(),
+                account: None,
+                peer_ip: "127.0.0.1".into(),
+                country: String::new(),
+                game_name: "G".to_string(),
+                lobby_id: Some(lid.to_string()),
+                pending_mod_lobby: None,
+                blocks: Default::default(),
+                probe_rtt_ms: -1,
+                signal_bucket: SignalBucket::default(),
+                tx,
+            },
+        );
+        let slot = Slot {
+            player_id: pid.into(),
+            display_name: pid.into(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            memcard_offer: None,
+            country: String::new(),
+            ice_path: None,
+            ice_path_at: None,
+        };
+        // A seat outside the table leaves the client unseated.
+        if let Some(cell) = g.lobbies.get_mut(lid).unwrap().seat_mut(seat) {
+            *cell = Some(slot);
+        }
+        rx
+    }
+
+    /// A hub with room "L": seated a (0) and b (1), spectator s, and an
+    /// unseated bystander x that claims the lobby.
+    async fn signal_hub() -> (WsLobbyHub, Vec<broadcast::Receiver<String>>) {
+        let hub = WsLobbyHub::new();
+        let mut rxs = Vec::new();
+        {
+            let mut g = hub.inner.lock().await;
+            g.lobbies.insert(
+                "L".into(),
+                Lobby {
+                    lobby_id: "L".into(),
+                    name: "L".into(),
+                    game_name: "G".into(),
+                    game_version: "1".into(),
+                    disc_fp: String::new(),
+                    host_player_id: "a".into(),
+                    host_bind: String::new(),
+                    host_endpoint: String::new(),
+                    lan_endpoints: Vec::new(),
+                    guest_endpoint: String::new(),
+                    password_hash: None,
+                    password_salt: None,
+                    max_slots: 2,
+                    session_id: 1,
+                    slots: vec![None; 2],
+                    allow_spectators: true,
+                    spectators: vec![None; 4],
+                    match_caps: None,
+                    relay_host_player_id: String::new(),
+                    started: false,
+                    automatch: false,
+                },
+            );
+            rxs.push(seat_for_signal(&mut g, "L", "a", 0));
+            rxs.push(seat_for_signal(&mut g, "L", "b", 1));
+            rxs.push(seat_for_signal(&mut g, "L", "s", spectator_seat(0)));
+            rxs.push(seat_for_signal(&mut g, "L", "x", 3));
+        }
+        (hub, rxs)
+    }
+
+    fn sig(from_type: i32, text: &str, to: Option<&str>) -> InMsg {
+        let mut v = json!({ "op": "signal", "type": from_type, "text": text });
+        if let Some(t) = to {
+            v["to_player_id"] = json!(t);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn drained(rx: &mut broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(l) = rx.try_recv() {
+            out.push(serde_json::from_str(&l).unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn signal_from_an_unseated_member_is_dropped() {
+        let (hub, mut rxs) = signal_hub().await;
+        handle_signal(&hub, "x", sig(131, "hi", None)).await.unwrap();
+        for rx in rxs.iter_mut() {
+            assert!(drained(rx).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn seated_signal_forwards_stamped_and_filters_by_target() {
+        let (hub, mut rxs) = signal_hub().await;
+        handle_signal(&hub, "a", sig(131, "cand", Some("b"))).await.unwrap();
+        let got = drained(&mut rxs[1]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["from_player_id"], "a");
+        assert_eq!(got[0]["text"], "cand");
+        assert_eq!(got[0]["type"], 131);
+        assert!(drained(&mut rxs[0]).is_empty(), "never echoed to the sender");
+        assert!(drained(&mut rxs[2]).is_empty(), "targeted: spectator gets nothing");
+        // Untargeted reaches everyone else in the room (not the sender).
+        handle_signal(&hub, "a", sig(131, "all", None)).await.unwrap();
+        assert_eq!(drained(&mut rxs[1]).len(), 1);
+        assert_eq!(drained(&mut rxs[2]).len(), 1);
+        assert!(drained(&mut rxs[0]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_spectator_may_not_send_ice_types_but_other_types_pass() {
+        let (hub, mut rxs) = signal_hub().await;
+        for ty in [130, 136] {
+            handle_signal(&hub, "s", sig(ty, "x", None)).await.unwrap();
+        }
+        assert!(drained(&mut rxs[0]).is_empty());
+        handle_signal(&hub, "s", sig(129, "x", None)).await.unwrap();
+        handle_signal(&hub, "s", sig(137, "x", None)).await.unwrap();
+        assert_eq!(drained(&mut rxs[0]).len(), 2, "outside 130..=136 unchanged");
+    }
+
+    #[tokio::test]
+    async fn signal_text_is_capped_at_4096_bytes() {
+        let (hub, mut rxs) = signal_hub().await;
+        handle_signal(&hub, "a", sig(131, &"x".repeat(4097), None)).await.unwrap();
+        assert!(drained(&mut rxs[1]).is_empty());
+        handle_signal(&hub, "a", sig(131, &"x".repeat(4096), None)).await.unwrap();
+        assert_eq!(drained(&mut rxs[1]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn signals_are_rate_limited_per_sender() {
+        let (hub, mut rxs) = signal_hub().await;
+        for _ in 0..200 {
+            handle_signal(&hub, "a", sig(131, "c", Some("b"))).await.unwrap();
+        }
+        let n = drained(&mut rxs[1]).len();
+        assert!((60..=70).contains(&n), "burst of ~60 then dropped, got {n}");
+        // Another sender has its own bucket.
+        handle_signal(&hub, "b", sig(131, "c", Some("a"))).await.unwrap();
+        assert_eq!(drained(&mut rxs[0]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_host_endpoint_keeps_guest_proofs_in_ice_mode_only() {
+        for (ice, kept) in [(true, true), (false, false)] {
+            let (hub, _rxs) = signal_hub().await;
+            {
+                let mut g = hub.inner.lock().await;
+                let l = g.lobbies.get_mut("L").unwrap();
+                l.host_endpoint = "203.0.113.5:7777".into();
+                l.match_caps = if ice {
+                    Some(json!({ "relay": "host", "relay_via": "ice" }))
+                } else {
+                    Some(json!({ "relay": "host" }))
+                };
+                let b = l.slots[1].as_mut().unwrap();
+                b.ice_path = Some("direct".into());
+                b.ice_path_at = Some(Instant::now());
+            }
+            let msg: InMsg = serde_json::from_str(
+                r#"{"op":"set_host_endpoint","host_endpoint":"203.0.113.9:7777"}"#,
+            )
+            .unwrap();
+            handle_set_host_endpoint(&hub, "a", "127.0.0.1", msg).await.unwrap();
+            let g = hub.inner.lock().await;
+            let l = &g.lobbies["L"];
+            assert_eq!(l.host_endpoint, "203.0.113.9:7777", "accepted");
+            assert_eq!(l.slots[1].as_ref().unwrap().ice_path.is_some(), kept, "ice={ice}");
+        }
     }
 }
