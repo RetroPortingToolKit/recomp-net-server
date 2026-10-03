@@ -65,7 +65,9 @@ Both surfaces share `BIND_ADDR` (default `0.0.0.0:8765` for MotK local dev).
 5. Both sides receive slot map + endpoints (`created` / `joined` /
    `lobby_update`). On `start`, the server checks the host-relay proof and
    launches `transport=host`; `host_endpoint` is the relay player's own
-   advertised address.
+   advertised address (empty when the room asked for `relay_via: "ice"`,
+   where guests reach the host over ICE signalled via `signal` and no
+   endpoint is required).
 6. Clients start `recomp-net` LAN sessions with peer = that hub. The
    WebSocket stays up for list / ICE `signal`.
 

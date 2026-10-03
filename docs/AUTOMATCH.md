@@ -21,8 +21,16 @@ players' own hub (`transport=host`, WS_LOBBY "Host relay"). Which one is
 1. **The offer.** `automatch_queue` may carry `host_endpoint`: the UDP
    endpoint at which this client can run a relay hub (its STUN / UPnP /
    NAT-PMP result). A client that cannot, sends none.
-2. **The pairing rule.** Two tickets pair only if at least one offered, since
-   a pair that can reach nobody cannot start. Two offerless tickets wait.
+2. **The pairing rule.** Two tickets pair only if at least one offered an
+   endpoint, or both set `"ice_relay": true` on `automatch_queue` (they can
+   run host-as-relay over ICE and need no endpoint). A pair that can reach
+   nobody cannot start; such tickets wait.
+   **ICE pairs:** when both tickets are `ice_relay`, the room runs
+   `match_caps.relay = "host"` + `relay_via = "ice"` (`automatch_found` and
+   `joined` carry them in `match_caps`), `host_endpoint` is empty in `joined`,
+   and the lower `rtt_ms` hosts. A mixed pair (one legacy endpoint-offerer,
+   one ICE-only) stays on the legacy endpoint mode and the endpoint-offerer
+   relays.
 3. **The choice.** Exactly one offered: that one relays. Both: the lower
    client-reported `rtt_ms` relays; unmeasured or tied goes to the older
    ticket (slot 0).
@@ -33,7 +41,8 @@ players' own hub (`transport=host`, WS_LOBBY "Host relay"). Which one is
 5. **The proof.** The room is created with `host_endpoint` = the chosen
    player's offer and `match_caps.relay = "host"`. The guest probes that
    endpoint and sends `path_report` `direct`. The room starts only once that
-   report is fresh (retried for 20 s after the settle delay).
+   report is fresh (retried for 20 s after the settle delay, 30 s for an ICE
+   pair). The requeue log line carries the refusal `reason`.
 6. **The fallback.** If the proof never arrives, both players get
    `automatch_requeue` with `reason: "host_unreachable"` and return to the
    front of the queue; nobody takes a dodge strike, and the
@@ -112,7 +121,8 @@ each deliberate:
   "mods_enabled": false,
   "mod_exempt": [],
   "host_bind": "0.0.0.0:7777",
-  "guest_bind": "0.0.0.0:7778"
+  "guest_bind": "0.0.0.0:7778",
+  "ice_relay": true
 }
 ```
 

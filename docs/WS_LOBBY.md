@@ -448,9 +448,11 @@ Ready flags are informational only — host Play is the launch authority:
 Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
 `need_players`, `relay_unavailable` (no host-relay ask, no advertised
-endpoint, a spectator seated, or a guest without a fresh `direct` report).
+endpoint (legacy mode only), a spectator seated, or a guest without a fresh
+`direct` report).
 The error also carries `reason` (`no_host_relay_ask`, `host_relay_no_endpoint`,
-`host_relay_spectators` or `host_relay_unproven`); `code` stays
+`host_relay_spectators` or `host_relay_unproven`; `host_relay_no_endpoint` is
+never produced when the room asks for `relay_via: "ice"`); `code` stays
 `relay_unavailable`.
 
 On success the server:
@@ -516,6 +518,28 @@ recomp-net's LAN hub in the host's game process and every guest dials it
 5. **`launch`** then carries `transport: "host"`, `relay_host_slot` and
    `host_endpoint`: guests start LAN transport to it; the host binds its port.
 
+### Host relay over ICE (`relay_via: "ice"`)
+
+A room opts in with `match_caps = {"relay": "host", "relay_via": "ice"}`.
+`relay: "host"` without `relay_via` is the legacy mode above, unchanged. In ICE
+mode the guests reach the relay host through an ICE connection negotiated over
+`signal` (types 130..136) instead of dialing an advertised UDP endpoint, so:
+
+- `host_relay_decision` does **not** require a `host_endpoint`. It still
+  requires the ask, **no spectator seated**, and every non-relay-host seat's
+  latest `path_report` to be `direct` and at most 120 s old. Refusal reasons
+  are unchanged (`no_host_relay_ask`, `host_relay_spectators`,
+  `host_relay_unproven`); `host_relay_no_endpoint` is not produced.
+- `set_host_endpoint` is accepted but does **not** clear guests' path proofs
+  (the endpoint is informational; the proof is the ICE path).
+- `launch` keeps `transport: "host"` and the `host_endpoint` key (an empty
+  string when none was advertised), adds `"relay_via": "ice"` (echoed from the
+  caps), and still carries `relay_host_slot` and `match_caps`. The same
+  `relay_via` appears in the automatch `joined` through `match_caps`.
+- `path_report` may carry an optional `ice` string (`host` | `srflx` | `prflx`
+  | `relay`), the candidate type in use. It is logged only; absent or unknown
+  values are fine.
+
 Every seat's latest report is published on `lobby_update` as `path` /
 `path_fresh` (above), which is what the host's waiting room shows.
 
@@ -533,7 +557,8 @@ It affects transport only in a host-relay lobby (above):
 { "op": "path_report", "path": "direct" }
 ```
 
-`path` is `direct` | `relay` | `fail` (aliases: `host`/`srflx`/`prflx` →
+`path` is `direct` | `relay` | `fail` (an optional `ice` string names the
+candidate type, logged only; aliases: `host`/`srflx`/`prflx` →
 `direct`, `failed`/`none` → `fail`). Success: `{ "op": "path_report_ok",
 "ok": true, "path": "direct" }`. Join/leave/kick clears stored paths.
 
@@ -582,8 +607,18 @@ with `lobby_closed`.
 }
 ```
 
-Server forwards to the other member(s). Used for ICE (`RNetSignal`);
-LAN delay-sync does not require it.
+Server forwards to the other member(s) with `from_player_id` stamped. Used for
+ICE (`RNetSignal`); LAN delay-sync does not require it. The server drops (no
+reply) and counts (`recomp_ws_signals_dropped_total{reason}`) a signal when:
+
+- the sender holds no seat in the lobby (`not_seated`); a spectator may not
+  send the ICE types 130..136 (inclusive) either;
+- `text` is longer than 4096 bytes (`too_big`);
+- the sender exceeds its rate cap (`rate`): a token bucket of 60 signals,
+  refilled at 60 per second, per connection.
+
+`to_player_id`, when set, narrows delivery to that member. `mod_signal` is a
+separate op and is not affected.
 
 ## TURN credentials (ICE)
 
