@@ -1288,6 +1288,42 @@ fn host_relay_decision(lobby: &Lobby, caps: &Option<Value>) -> Result<&'static s
     Ok("host_relay")
 }
 
+/// How a match that may start is carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTransport {
+    /// The relay host's own hub (`host_relay_decision` passed).
+    Host,
+    /// Peer-to-peer ICE between the two players, signalled over this socket
+    /// (`op: signal`) with STUN and the Coturn TURN credentials this server
+    /// mints (`get_turn_credentials`). Nobody needs a reachable port.
+    Ice,
+}
+
+/// The transport a match starts on, or the reason it cannot start.
+///
+/// The host relay is preferred. When it is not available -- no ask, no
+/// advertised endpoint, or a guest that has not proven it reaches it -- and
+/// `allow_ice` is set, two players with nobody in the gallery fall back to
+/// ICE. ICE carries exactly one peer pair and cannot mute a spectator, so a
+/// room with spectators or more than two players still needs the host relay.
+fn start_transport(
+    lobby: &Lobby,
+    caps: &Option<Value>,
+    allow_ice: bool,
+) -> Result<(StartTransport, &'static str), &'static str> {
+    let why = match host_relay_decision(lobby, caps) {
+        Ok(why) => return Ok((StartTransport::Host, why)),
+        Err(why) => why,
+    };
+    if !allow_ice || lobby.spectator_count() > 0 {
+        return Err(why);
+    }
+    if player_count(lobby) != 2 {
+        return Err("ice_needs_two_players");
+    }
+    Ok((StartTransport::Ice, why))
+}
+
 fn player_count(lobby: &Lobby) -> usize {
     lobby.slots.iter().filter(|s| s.is_some()).count()
 }
@@ -3373,7 +3409,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
         }
     };
     let sent_caps = msg.match_caps.clone();
-    if let Err(code) = start_lobby(state, &lid, msg.match_caps, Some(player_id)).await {
+    if let Err(code) = start_lobby(state, &lid, msg.match_caps, Some(player_id), true).await {
         if code == "relay_unavailable" {
             /* Say which gate refused, so the host can act on it. The code
              * stays `relay_unavailable` (clients and automatch key on it);
@@ -3385,7 +3421,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
                 g.lobbies.get(&lid).and_then(|lobby| {
                     let caps = sanitize_match_caps(sent_caps)
                         .or_else(|| lobby.match_caps.clone());
-                    host_relay_decision(lobby, &caps).err()
+                    start_transport(lobby, &caps, true).err()
                 })
             };
             if let Some(reason) = reason {
@@ -3404,7 +3440,8 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
     Ok(())
 }
 
-/// Open the relay and launch a lobby.
+/// Launch a lobby on the host relay, or on ICE when `allow_ice` and the
+/// host relay is not available (`start_transport`).
 ///
 /// `initiator` is the host that pressed Play, or None when the server is the
 /// host. Errors are RETURNED rather than sent: a server-started match has no
@@ -3415,6 +3452,7 @@ async fn start_lobby(
     lid: &str,
     raw_caps: Option<Value>,
     initiator: Option<&str>,
+    allow_ice: bool,
 ) -> Result<(), &'static str> {
     enum StartOut {
         Err(&'static str),
@@ -3440,9 +3478,9 @@ async fn start_lobby(
         }
         let caps_for_relay = fresh_caps.as_ref().or(lobby.match_caps.as_ref()).cloned();
         /* The server relays nothing. A match runs through the host's own hub
-         * (`host_relay_decision`) or it does not start. */
-        let path_why = match host_relay_decision(lobby, &caps_for_relay) {
-            Ok(why) => why,
+         * when it can, else peer-to-peer ICE (`start_transport`). */
+        let (transport, path_why) = match start_transport(lobby, &caps_for_relay, allow_ice) {
+            Ok(v) => v,
             Err(why) => {
                 info!(lobby_id = %lid, seated = n, reason = why, "lobby start refused");
                 break 'prep Err("relay_unavailable");
@@ -3452,6 +3490,7 @@ async fn start_lobby(
             lobby_id = %lid,
             seated = n,
             reason = path_why,
+            transport = ?transport,
             "lobby start transport decision"
         );
         /* The host may watch from the gallery and still run the match. It
@@ -3467,10 +3506,10 @@ async fn start_lobby(
          * confused with packets from the previous delay-sync session. */
         let sid = g.next_session;
         g.next_session = g.next_session.saturating_add(1);
-        Ok((sid, n, host_spectates))
+        Ok((sid, n, host_spectates, transport))
     };
 
-    let (sid, n, host_spectates) = match prepared {
+    let (sid, n, host_spectates, transport) = match prepared {
         Ok(v) => v,
         Err(code) => return Err(code),
     };
@@ -3545,17 +3584,23 @@ async fn start_lobby(
              * slot 0 with its pad muted; players sit at lobby seat + 1. Every
              * peer derives its session slot from this, so it is said once. */
             "host_spectates": host_spectates,
-            /* The host relays: every other seat dials host_endpoint. This is
-             * the only transport the server launches. */
-            "transport": "host",
+            /* "host": the host relays and every other seat dials
+             * host_endpoint. "ice": the two players connect peer-to-peer with
+             * ICE (STUN, then TURN), signalled over this socket. */
+            "transport": match transport {
+                StartTransport::Host => "host",
+                StartTransport::Ice => "ice",
+            },
+        });
+        if transport == StartTransport::Host {
             /* Which lobby seat runs the relay hub. In a hosted room that is
              * the host's seat; in an automatch room nobody is host, so this
              * is how a client learns whether IT binds the port. */
-            "relay_host_slot": lobby
+            launch["relay_host_slot"] = json!(lobby
                 .slots
                 .iter()
-                .position(|s| s.as_ref().is_some_and(|x| x.player_id == lobby.relay_host())),
-        });
+                .position(|s| s.as_ref().is_some_and(|x| x.player_id == lobby.relay_host())));
+        }
         if let Some(caps) = &lobby.match_caps {
             launch["match_caps"] = caps.clone();
         }
@@ -4500,17 +4545,18 @@ async fn form_match(state: &AppState, p: Pending) {
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         }
-        /* The match starts only once the non-relay side has proven, in this
-         * waiting room, that it reaches the relay's endpoint (`path_report`
-         * "direct"). That proof arrives on the clients' schedule, so retry
-         * until it does or the window closes. A refusal for any other reason
-         * is final. */
+        /* The host relay is preferred: wait for the non-relay side to prove,
+         * in this waiting room, that it reaches the relay's endpoint
+         * (`path_report` "direct"). That proof arrives on the clients'
+         * schedule, so retry until it does or the window closes, then fall
+         * back to ICE once. A refusal for any other reason is final. */
         let deadline = tokio::time::Instant::now() + AUTOMATCH_PROOF_WAIT;
         let result = loop {
-            match start_lobby(&st, &lid, None, None).await {
+            match start_lobby(&st, &lid, None, None, false).await {
                 Err("relay_unavailable") if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
+                Err("relay_unavailable") => break start_lobby(&st, &lid, None, None, true).await,
                 other => break other,
             }
         };
@@ -5177,6 +5223,77 @@ mod game_scope_tests {
         assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Ok("host_relay"));
         g.lobbies.get_mut("L").unwrap().host_endpoint.clear();
         assert_eq!(host_relay_decision(&g.lobbies["L"], &host_caps), Err("host_relay_no_endpoint"));
+    }
+
+    #[test]
+    fn two_players_the_host_relay_cannot_carry_fall_back_to_ice() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "Pokemon Stadium");
+        let host_caps = Some(json!({ "relay": "host" }));
+        {
+            let l = g.lobbies.get_mut("L").unwrap();
+            l.host_player_id = "h".into();
+            l.host_endpoint = "203.0.113.5:7777".into();
+        }
+        seat_path(&mut g, "L", 0, "h", None, 0);
+        seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &host_caps, true),
+            Ok((StartTransport::Host, "host_relay")),
+            "the host relay is preferred when the guest reaches it"
+        );
+
+        seat_path(&mut g, "L", 1, "g", Some("fail"), 1);
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &host_caps, true),
+            Ok((StartTransport::Ice, "host_relay_unproven")),
+            "a guest that cannot reach the host uses ICE"
+        );
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &host_caps, false),
+            Err("host_relay_unproven"),
+            "without allow_ice the refusal stands"
+        );
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &None, true),
+            Ok((StartTransport::Ice, "no_host_relay_ask")),
+            "a room that never asked for the host relay uses ICE"
+        );
+        g.lobbies.get_mut("L").unwrap().host_endpoint.clear();
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &host_caps, true),
+            Ok((StartTransport::Ice, "host_relay_no_endpoint")),
+            "no public endpoint found uses ICE"
+        );
+
+        // ICE carries one pair and cannot mute a gallery.
+        g.lobbies.get_mut("L").unwrap().host_endpoint = "203.0.113.5:7777".into();
+        g.lobbies.get_mut("L").unwrap().spectators = vec![Some(Slot {
+            player_id: "s".into(),
+            display_name: "s".into(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            memcard_offer: None,
+            country: String::new(),
+            ice_path: None,
+            ice_path_at: None,
+        })];
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &host_caps, true),
+            Err("host_relay_spectators")
+        );
+        g.lobbies.get_mut("L").unwrap().spectators.clear();
+        {
+            let l = g.lobbies.get_mut("L").unwrap();
+            l.max_slots = 3;
+            l.slots.push(None);
+        }
+        seat_path(&mut g, "L", 2, "g2", Some("fail"), 1);
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &host_caps, true),
+            Err("ice_needs_two_players")
+        );
     }
 
     /// An automatch room has no host, so the chosen relay seat is the one that
