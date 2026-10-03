@@ -486,7 +486,7 @@ automatch room (which has no host). Every other seat starts LAN transport to
 both peers share sim-affecting settings. Direct IP / LAN file lobbies (no MotK
 WS seat) stay on local UDP and do not use this path.
 
-## Host relay (2026-09-29; the only transport since 2026-10-02)
+## Host relay (2026-09-29; ICE fallback since 2026-10-03)
 
 A host relays its own match: the Retro hub runs
 recomp-net's LAN hub in the host's game process and every guest dials it
@@ -505,16 +505,20 @@ recomp-net's LAN hub in the host's game process and every guest dials it
 3. **The proof:** each guest probes the host's `host_endpoint` (from
    `lobby_update`) while seated and sends `path_report` `direct` when the host
    answered, `fail` when not.
-4. **The decision, at `start`:** the match starts only when the ask is there,
-   `host_endpoint` is set, **every** seated non-relay player's latest report
-   is `direct` and at most 120 s old, and **no spectator is seated** (a host
-   hub forwards whatever reaches it, so nothing can mute a gallery). Otherwise
-   `start` fails `relay_unavailable`; the reason is logged as `host_relay`,
-   `no_host_relay_ask`, `host_relay_unproven`, `host_relay_no_endpoint` or
-   `host_relay_spectators` (`host_relay_decision`). There is no server
-   fallback.
-5. **`launch`** then carries `transport: "host"`, `relay_host_slot` and
-   `host_endpoint`: guests start LAN transport to it; the host binds its port.
+4. **The decision, at `start`** (`start_transport`): the match uses the host
+   relay when the ask is there, `host_endpoint` is set, **every** seated
+   non-relay player's latest report is `direct` and at most 120 s old, and **no
+   spectator is seated** (`host_relay_decision`). Otherwise a room of exactly
+   two players with nobody in the gallery starts on **ICE**: the players
+   connect peer-to-peer with STUN and the TURN credentials from
+   `get_turn_credentials`, signalled with `op: signal`, so no port has to be
+   reachable. Anything else fails `relay_unavailable` with a `reason`:
+   `host_relay_spectators`, `ice_needs_two_players`, or (automatch, before its
+   proof window closes) the host-relay gate. Automatch waits for the proof
+   first and falls back to ICE once the window closes.
+5. **`launch`** carries `transport: "host"` with `relay_host_slot` and
+   `host_endpoint` (guests start LAN transport to it; the host binds its port),
+   or `transport: "ice"` with no `relay_host_slot` (both players start ICE).
 
 Every seat's latest report is published on `lobby_update` as `path` /
 `path_fresh` (above), which is what the host's waiting room shows.
