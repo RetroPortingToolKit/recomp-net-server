@@ -3372,7 +3372,33 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
             return Ok(());
         }
     };
+    let sent_caps = msg.match_caps.clone();
     if let Err(code) = start_lobby(state, &lid, msg.match_caps, Some(player_id)).await {
+        if code == "relay_unavailable" {
+            /* Say which gate refused, so the host can act on it. The code
+             * stays `relay_unavailable` (clients and automatch key on it);
+             * `reason` is additive. Re-evaluated here because start_lobby
+             * returns only the code; the lobby can only have moved toward
+             * the same refusal in the interim. */
+            let reason = {
+                let g = hub.inner.lock().await;
+                g.lobbies.get(&lid).and_then(|lobby| {
+                    let caps = sanitize_match_caps(sent_caps)
+                        .or_else(|| lobby.match_caps.clone());
+                    host_relay_decision(lobby, &caps).err()
+                })
+            };
+            if let Some(reason) = reason {
+                send_to(
+                    hub,
+                    player_id,
+                    json!({ "op": "error", "code": code, "ok": false, "reason": reason })
+                        .to_string(),
+                )
+                .await;
+                return Ok(());
+            }
+        }
         send_to(hub, player_id, am_err(code)).await;
     }
     Ok(())

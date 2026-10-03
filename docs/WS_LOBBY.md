@@ -449,6 +449,9 @@ Optional `match_caps` on `start` overwrites the lobby’s stored blob so launch
 freezes the host’s latest settings. Errors: `not_in_lobby`, `not_host`,
 `need_players`, `relay_unavailable` (no host-relay ask, no advertised
 endpoint, a spectator seated, or a guest without a fresh `direct` report).
+The error also carries `reason` (`no_host_relay_ask`, `host_relay_no_endpoint`,
+`host_relay_spectators` or `host_relay_unproven`); `code` stays
+`relay_unavailable`.
 
 On success the server:
 
