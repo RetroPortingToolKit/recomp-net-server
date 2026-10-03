@@ -658,6 +658,9 @@ pub struct Ticket {
     /// relays nothing, so a pair needs at least one of these
     /// (`relay_possible`); see `relay_host`.
     pub relay_endpoint: Option<String>,
+    /// This client can run host-as-relay over ICE (`relay_via: "ice"`), with
+    /// no advertised endpoint. Two ICE-capable tickets pair in ICE mode.
+    pub ice_relay: bool,
     pub queued_at: Instant,
     /// Client-reported round trip (to the server, or to whatever the client
     /// measured), or -1 when unmeasured. A hint only: see `rtt_ok`.
@@ -698,15 +701,29 @@ impl Pending {
     /// ticket, so the outcome is deterministic. Neither offered: `None`, which
     /// pairing never allows.
     pub fn relay_host_is_a(&self) -> Option<bool> {
+        let rtt_pick = || {
+            let (ra, rb) = (self.a.rtt_ms, self.b.rtt_ms);
+            Some(!(ra >= 0 && rb >= 0 && rb < ra))
+        };
+        /* ICE pair: endpoints play no part, whichever side has the better
+         * link hosts. */
+        if self.is_ice() {
+            return rtt_pick();
+        }
         match (&self.a.relay_endpoint, &self.b.relay_endpoint) {
             (Some(_), None) => Some(true),
             (None, Some(_)) => Some(false),
             (None, None) => None,
-            (Some(_), Some(_)) => {
-                let (ra, rb) = (self.a.rtt_ms, self.b.rtt_ms);
-                Some(!(ra >= 0 && rb >= 0 && rb < ra))
-            }
+            (Some(_), Some(_)) => rtt_pick(),
         }
+    }
+
+    /// Does this pair run host-as-relay over ICE? Only when BOTH sides are
+    /// ICE-capable. A mixed pair (one legacy client offering an endpoint, one
+    /// ICE-only client) keeps the legacy endpoint-and-probe mode, relayed by
+    /// the side that offered the endpoint.
+    pub fn is_ice(&self) -> bool {
+        self.a.ice_relay && self.b.ice_relay
     }
 
     fn side(&self, player_id: &str) -> Option<bool> {
@@ -1002,9 +1019,10 @@ fn find_pair_pass(
     None
 }
 
-/// Can at least one of the two relay the match?
+/// Can at least one of the two relay the match? Either side offers an
+/// endpoint (legacy), or both are ICE-capable.
 fn relay_possible(a: &Ticket, b: &Ticket) -> bool {
-    a.relay_endpoint.is_some() || b.relay_endpoint.is_some()
+    a.relay_endpoint.is_some() || b.relay_endpoint.is_some() || (a.ice_relay && b.ice_relay)
 }
 
 /// Has this ticket either measured, or had its chance to?
@@ -1435,6 +1453,7 @@ mod tests {
             /* Offers to relay, so ordinary pairing tests pair. A test about
              * the choice or its absence sets this and says so. */
             relay_endpoint: Some("203.0.113.9:7777".into()),
+            ice_relay: false,
             queued_at: Instant::now(),
             /* Measured, because that is the path a real client takes: it
              * queues carrying the number. A test that wants the unmeasured

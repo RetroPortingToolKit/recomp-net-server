@@ -117,6 +117,46 @@ struct Lobby {
     automatch: bool,
 }
 
+/// Token bucket for one sender's `signal` traffic: a burst of
+/// `SIGNAL_BURST`, refilled at `SIGNAL_PER_SEC`. ICE gathers a handful of
+/// candidates at once, so a burst is normal; a sustained flood is not.
+#[derive(Clone, Copy, Debug)]
+struct SignalBucket {
+    tokens: f64,
+    last: Option<Instant>,
+}
+
+const SIGNAL_BURST: f64 = 60.0;
+const SIGNAL_PER_SEC: f64 = 60.0;
+/// `signal.text` cap in bytes (an SDP blob or a candidate line).
+const SIGNAL_TEXT_MAX: usize = 4096;
+/// The `signal` types the ICE exchange uses (inclusive). Spectators are
+/// not seated players and may not send these.
+const ICE_SIGNAL_TYPES: std::ops::RangeInclusive<i32> = 130..=136;
+
+impl Default for SignalBucket {
+    fn default() -> Self {
+        Self { tokens: SIGNAL_BURST, last: None }
+    }
+}
+
+impl SignalBucket {
+    /// Take one token at `now`; `false` means over the rate cap.
+    fn allow(&mut self, now: Instant) -> bool {
+        if let Some(last) = self.last {
+            let dt = now.saturating_duration_since(last).as_secs_f64();
+            self.tokens = (self.tokens + dt * SIGNAL_PER_SEC).min(SIGNAL_BURST);
+        }
+        self.last = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct ClientMeta {
     player_id: String,
     display_name: String,
@@ -156,6 +196,8 @@ struct ClientMeta {
     /// client-reported. Kept on the CONNECTION, not the ticket, so a client
     /// that measures before it queues does not have to measure again.
     probe_rtt_ms: i32,
+    /// Per-sender token bucket for `signal` (see `SignalBucket`).
+    signal_bucket: SignalBucket,
     tx: broadcast::Sender<String>,
 }
 
@@ -500,6 +542,9 @@ struct InMsg {
     /// Host STUN advertise update (`set_host_endpoint`).
     #[serde(default)]
     host_endpoint: Option<String>,
+    /// automatch `queue`: this client can run host-as-relay over ICE.
+    #[serde(default)]
+    ice_relay: Option<bool>,
     /// Optional LAN UDP endpoints alongside `set_host_endpoint`.
     #[serde(default)]
     lan_endpoints: Option<Vec<String>>,
@@ -549,6 +594,10 @@ struct InMsg {
     /// Waiting-room ICE path: `direct` | `relay` | `fail` (`path_report`).
     #[serde(default)]
     path: Option<String>,
+    /// `path_report` only: the ICE candidate type in use ("host" | "srflx" |
+    /// "prflx" | "relay"). Logged, never acted on.
+    #[serde(default)]
+    ice: Option<String>,
     #[serde(default)]
     error: Option<String>,
     /* ---- automatch ---- */
@@ -1249,8 +1298,9 @@ const HOST_RELAY_PATH_FRESH: std::time::Duration = std::time::Duration::from_sec
 /// through the relay host's own hub (`match_caps.relay = "host"`, WS_LOBBY.md
 /// "Host relay") or it does not start:
 ///
-/// - the ask must be there, and the relay host must have advertised an
-///   endpoint;
+/// - the ask must be there, and (legacy mode only) the relay host must have
+///   advertised an endpoint -- with `relay_via: "ice"` the guests reach the
+///   host through ICE and no endpoint is needed;
 /// - every OTHER seated player must have proven, in the waiting room, that it
 ///   reaches that endpoint (`path_report` "direct", within
 ///   `HOST_RELAY_PATH_FRESH`);
@@ -1259,6 +1309,16 @@ const HOST_RELAY_PATH_FRESH: std::time::Duration = std::time::Duration::from_sec
 ///
 /// `Err` carries the reason, for the log. Caps bits other than `relay` are
 /// ignored; `force_turn` remains a client delay-floor hint only.
+/// Whether the caps ask for host-as-relay carried over ICE
+/// (`{"relay":"host","relay_via":"ice"}`). Without `relay_via` the room is a
+/// legacy host-relay room (advertised endpoint + guest probe).
+fn caps_relay_via_ice(caps: &Option<Value>) -> bool {
+    caps.as_ref().is_some_and(|c| {
+        c.get("relay").and_then(|v| v.as_str()) == Some("host")
+            && c.get("relay_via").and_then(|v| v.as_str()) == Some("ice")
+    })
+}
+
 fn host_relay_decision(lobby: &Lobby, caps: &Option<Value>) -> Result<&'static str, &'static str> {
     let wants_host = caps
         .as_ref()
@@ -1268,7 +1328,7 @@ fn host_relay_decision(lobby: &Lobby, caps: &Option<Value>) -> Result<&'static s
     if !wants_host {
         return Err("no_host_relay_ask");
     }
-    if lobby.host_endpoint.is_empty() {
+    if lobby.host_endpoint.is_empty() && !caps_relay_via_ice(caps) {
         return Err("host_relay_no_endpoint");
     }
     if lobby.spectator_count() > 0 {
@@ -1579,6 +1639,7 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
                 pending_mod_lobby: None,
                 blocks: Default::default(),
             probe_rtt_ms: -1,
+            signal_bucket: SignalBucket::default(),
                 tx: tx.clone(),
             },
         );
@@ -3152,7 +3213,10 @@ async fn handle_set_host_endpoint(
         }
         /* A guest's path report proved the OLD address; a new one has to be
          * proven again before the host may relay (start_use_sfu). */
-        if lobby.host_endpoint != endpoint {
+        /* In ICE mode the endpoint is informational: guests prove the path
+         * through ICE, not by dialing this address, so a change does not
+         * invalidate their proofs. */
+        if lobby.host_endpoint != endpoint && !caps_relay_via_ice(&lobby.match_caps) {
             for s in lobby.slots.iter_mut().flatten() {
                 s.ice_path = None;
                 s.ice_path_at = None;
@@ -3204,7 +3268,11 @@ async fn handle_path_report(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
             if s.player_id == player_id {
                 s.ice_path = Some(kind.to_string());
                 s.ice_path_at = Some(Instant::now());
-                debug!(%player_id, path = kind, "lobby ICE path_report");
+                debug!(
+                    %player_id, path = kind,
+                    ice = msg.ice.as_deref().unwrap_or(""),
+                    "lobby ICE path_report"
+                );
                 break 'path None;
             }
         }
@@ -3558,6 +3626,9 @@ async fn start_lobby(
         });
         if let Some(caps) = &lobby.match_caps {
             launch["match_caps"] = caps.clone();
+        }
+        if caps_relay_via_ice(&lobby.match_caps) {
+            launch["relay_via"] = json!("ice");
         }
         StartOut::Ok {
             msg: launch.to_string(),
@@ -4052,6 +4123,7 @@ async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -
     let ticket = Ticket {
         blocks,
         relay_endpoint: relay_endpoint.clone(),
+        ice_relay: msg.ice_relay.unwrap_or(false),
         player_id: player_id.to_string(),
         account_id: account_id.clone(),
         handle,
@@ -4088,6 +4160,7 @@ async fn handle_automatch_queue(state: &AppState, player_id: &str, msg: InMsg) -
             /* Echoed so the client can see what it is offering: `null` means
              * "I cannot relay", and a pair then needs the other side to. */
             "relay_endpoint": relay_endpoint,
+            "ice_relay": msg.ice_relay.unwrap_or(false),
         })
         .to_string(),
     )
@@ -4328,6 +4401,9 @@ async fn form_match(state: &AppState, p: Pending) {
     let relay_endpoint = relay_ticket.relay_endpoint.clone().unwrap_or_default();
     if let Some(o) = floored_caps.as_object_mut() {
         o.insert("relay".into(), json!("host"));
+        if p.is_ice() {
+            o.insert("relay_via".into(), json!("ice"));
+        }
     }
 
     let lobby_id = Uuid::new_v4().to_string();
@@ -4402,7 +4478,7 @@ async fn form_match(state: &AppState, p: Pending) {
         /* Where the guests dial: the chosen relay's own advertised endpoint,
          * which the other side proves it can reach (`path_report`) before the
          * match may start. */
-        let host_endpoint = relay_endpoint.clone();
+        let host_endpoint = if p.is_ice() { String::new() } else { relay_endpoint.clone() };
         let guest_endpoint = own_endpoint(
             &p.b.guest_bind,
             &g.clients.get(&p.b.player_id).map(|c| c.peer_ip.clone()).unwrap_or_default(),
@@ -4496,6 +4572,7 @@ async fn form_match(state: &AppState, p: Pending) {
     let lid = lobby_id.clone();
     let match_id = p.match_id.clone();
     let tickets = [p.a.clone(), p.b.clone()];
+    let ice_pair = p.is_ice();
     tokio::spawn(async move {
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
@@ -4505,7 +4582,8 @@ async fn form_match(state: &AppState, p: Pending) {
          * "direct"). That proof arrives on the clients' schedule, so retry
          * until it does or the window closes. A refusal for any other reason
          * is final. */
-        let deadline = tokio::time::Instant::now() + AUTOMATCH_PROOF_WAIT;
+        let deadline = tokio::time::Instant::now()
+            + if ice_pair { AUTOMATCH_PROOF_WAIT_ICE } else { AUTOMATCH_PROOF_WAIT };
         let result = loop {
             match start_lobby(&st, &lid, None, None).await {
                 Err("relay_unavailable") if tokio::time::Instant::now() < deadline => {
@@ -4517,7 +4595,16 @@ async fn form_match(state: &AppState, p: Pending) {
         match result {
             Ok(()) => automatch::mark_launched(&st.pool, &match_id).await,
             Err("relay_unavailable") => {
-                warn!(lobby_id = %lid, "automatch: the relay was not reachable; requeueing both");
+                /* Why the gate refused: re-derive it from the room before it
+                 * is destroyed (start_lobby returns only the code). */
+                let reason = {
+                    let g = st.ws_lobby.inner.lock().await;
+                    g.lobbies.get(&lid).and_then(|l| host_relay_decision(l, &l.match_caps).err())
+                };
+                warn!(
+                    lobby_id = %lid, ice = ice_pair, reason = reason.unwrap_or("unknown"),
+                    "automatch: the relay was not reachable; requeueing both"
+                );
                 destroy_lobby(&st, &lid).await;
                 /* Nobody dodged: the network did not allow this pair. Both go
                  * back to the front of the queue, and the avoid-last-opponent
@@ -4561,6 +4648,10 @@ async fn form_match(state: &AppState, p: Pending) {
 /// reaches the relay, after the settle delay, before sending both players back
 /// to the queue.
 const AUTOMATCH_PROOF_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The same window for an ICE pair: gathering, exchanging candidates and
+/// connectivity checks take longer than a single UDP probe.
+const AUTOMATCH_PROOF_WAIT_ICE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Form what pairs can be formed and offer them.
 pub async fn run_pairing(state: &AppState) {
@@ -4915,22 +5006,53 @@ async fn handle_server_chat(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Re
 
 async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
     let (fwd, targets) = {
-        let g = hub.inner.lock().await;
+        let mut g = hub.inner.lock().await;
         let lid = msg
             .lobby_id
             .clone()
             .or_else(|| g.clients.get(player_id).and_then(|c| c.lobby_id.clone()))
             .ok_or_else(|| "no lobby".to_string())?;
-        let Some(lobby) = g.lobbies.get(&lid) else {
+        /* The sender must hold a seat in that lobby. Spectators sit in the
+         * gallery, which is not a seat: they may not send the ICE exchange
+         * types, which would let one poison a player's connection setup. */
+        let ty = msg.r#type.unwrap_or(0);
+        let allowed = g.lobbies.get(&lid).map(|l| match l.seat_of(player_id) {
+            Some(seat) => !(is_spectator_seat(seat) && ICE_SIGNAL_TYPES.contains(&ty)),
+            None => false,
+        });
+        match allowed {
+            None => return Ok(()),
+            Some(false) => {
+                debug!(%player_id, ty, "signal dropped: sender not seated");
+                metrics::ws_signal_dropped("not_seated");
+                return Ok(());
+            }
+            Some(true) => {}
+        }
+        let text = msg.text.unwrap_or_default();
+        if text.len() > SIGNAL_TEXT_MAX {
+            debug!(%player_id, len = text.len(), "signal dropped: text over cap");
+            metrics::ws_signal_dropped("too_big");
             return Ok(());
-        };
+        }
+        let within_rate = g
+            .clients
+            .get_mut(player_id)
+            .map(|c| c.signal_bucket.allow(Instant::now()))
+            .unwrap_or(false);
+        if !within_rate {
+            debug!(%player_id, "signal dropped: rate cap");
+            metrics::ws_signal_dropped("rate");
+            return Ok(());
+        }
+        let lobby = &g.lobbies[&lid];
         let fwd = json!({
             "op": "signal",
             "lobby_id": lid,
             "from_player_id": player_id,
-            "type": msg.r#type.unwrap_or(0),
+            "type": ty,
             "flag": msg.flag.unwrap_or(0),
-            "text": msg.text.unwrap_or_default(),
+            "text": text,
         })
         .to_string();
         let to = msg.to_player_id.unwrap_or_default();
@@ -5059,6 +5181,7 @@ mod game_scope_tests {
                 pending_mod_lobby: None,
                 blocks: Default::default(),
             probe_rtt_ms: -1,
+            signal_bucket: SignalBucket::default(),
                 tx,
             },
         );
@@ -5652,6 +5775,7 @@ mod list_scope_tests {
                 pending_mod_lobby: None,
                 blocks: Default::default(),
             probe_rtt_ms: -1,
+            signal_bucket: SignalBucket::default(),
                 tx,
             },
         );
@@ -5811,6 +5935,7 @@ mod hub_lock_tests {
                 pending_mod_lobby: None,
                 blocks: Default::default(),
                 probe_rtt_ms: -1,
+                signal_bucket: SignalBucket::default(),
                 tx,
             },
         );
@@ -5849,6 +5974,7 @@ mod hub_lock_tests {
                     pending_mod_lobby: None,
                     blocks: Default::default(),
                     probe_rtt_ms: -1,
+                    signal_bucket: SignalBucket::default(),
                     tx,
                 },
             );
