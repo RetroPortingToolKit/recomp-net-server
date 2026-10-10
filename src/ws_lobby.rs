@@ -763,6 +763,17 @@ fn sanitize_match_caps(caps: Option<Value>) -> Option<Value> {
     if !v.is_object() {
         return None;
     }
+    let mut v = v;
+    /* Every online match is carried by the host over ICE. A host that did not
+     * ask for it (an older launcher with the opt-in left off, a saved
+     * setting) or asked for the forwarded-port relay is put on it here, so
+     * the caps the room is told -- and the guests build their ICE agents
+     * from -- say so. Done before the size check: it only ever adds the two
+     * short keys. */
+    if let Some(o) = v.as_object_mut() {
+        o.insert("relay".into(), Value::from("host"));
+        o.insert("relay_via".into(), Value::from("ice"));
+    }
     let s = v.to_string();
     if s.len() > 4096 {
         return None;
@@ -6397,5 +6408,32 @@ mod hub_lock_tests {
             assert_eq!(l.host_endpoint, "203.0.113.9:7777", "accepted");
             assert_eq!(l.slots[1].as_ref().unwrap().ice_path.is_some(), kept, "ice={ice}");
         }
+    }
+}
+
+#[cfg(test)]
+mod match_caps_ice_tests {
+    use super::*;
+
+    #[test]
+    fn every_online_room_is_put_on_the_ice_host_relay() {
+        for sent in [
+            json!({ "v": 1, "input_delay": 3 }),
+            json!({ "v": 1, "relay": "host" }),
+            json!({ "v": 1, "relay": "sfu", "relay_via": "port" }),
+            json!({ "v": 1, "relay": "host", "relay_via": "ice" }),
+        ] {
+            let got = sanitize_match_caps(Some(sent.clone())).unwrap();
+            assert!(caps_relay_via_ice(&Some(got.clone())), "{sent}");
+            // The rest of the host's caps ride through untouched.
+            assert_eq!(got.get("v"), sent.get("v"));
+            assert_eq!(got.get("input_delay"), sent.get("input_delay"));
+        }
+    }
+
+    #[test]
+    fn a_missing_or_non_object_blob_stays_missing() {
+        assert_eq!(sanitize_match_caps(None), None);
+        assert_eq!(sanitize_match_caps(Some(json!("x"))), None);
     }
 }

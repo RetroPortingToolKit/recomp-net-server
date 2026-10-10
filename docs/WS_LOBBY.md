@@ -524,8 +524,13 @@ recomp-net's LAN hub in the host's game process and every guest dials it
 
 ### Host relay over ICE (`relay_via: "ice"`)
 
-A room opts in with `match_caps = {"relay": "host", "relay_via": "ice"}`.
-`relay: "host"` without `relay_via` is the legacy mode above, unchanged. In ICE
+Every online room is in this mode (2026-10-10). `sanitize_match_caps` sets
+`relay: "host"` and `relay_via: "ice"` on every `match_caps` object the server
+accepts -- create, `set_match_caps` and start -- whatever the host sent, so a
+client that left the old opt-in off, or asked for the forwarded-port relay, is
+still put on ICE and its guests are told to build their agents. The legacy
+mode above survives only in LAN / Direct IP rooms, which never reach the
+server, and in non-ICE automatch pairs. In ICE
 mode the guests reach the relay host through an ICE connection negotiated over
 `signal` (types 130..136) instead of dialing an advertised UDP endpoint, so:
 
