@@ -354,6 +354,11 @@ pub fn ws_signal_relayed() {
     counter!("recomp_ws_signals_total").increment(1);
 }
 
+/// A `signal` the server refused to forward (`not_seated`, `too_big`, `rate`).
+pub fn ws_signal_dropped(reason: &'static str) {
+    counter!("recomp_ws_signals_dropped_total", "reason" => reason).increment(1);
+}
+
 pub fn http_player_created() {
     bump(&HTTP_PLAYERS_CREATED);
     counter!("recomp_http_players_created_total").increment(1);
