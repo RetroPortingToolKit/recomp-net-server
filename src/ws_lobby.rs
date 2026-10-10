@@ -982,6 +982,12 @@ struct LobbyListRow<'a> {
     allow_spectators: bool,
     max_spectators: usize,
     spectator_count: usize,
+    /// The host's own round trip to this server in ms (what its client last
+    /// reported with `automatch_rtt`), -1 when unknown. A browser estimates a
+    /// room's latency as its own round trip plus this one: before joining
+    /// there is no direct link to measure, and an ICE host-relay room has no
+    /// host UDP port to probe. Additive: an older client ignores the key.
+    host_rtt_ms: i32,
 }
 
 /// One connected client, for the browser's "players online" panel.
@@ -1112,6 +1118,11 @@ fn lobby_list_json_filtered(
             allow_spectators: l.allow_spectators,
             max_spectators: l.spectators.len(),
             spectator_count: l.spectator_count(),
+            host_rtt_ms: hub
+                .clients
+                .get(&l.host_player_id)
+                .map(|c| c.probe_rtt_ms)
+                .unwrap_or(-1),
         })
         .collect();
     /* Everyone connected, browsing or seated, so a browser can show who is
@@ -6222,6 +6233,24 @@ mod hub_lock_tests {
         g.require_login = false;
         let v: Value = serde_json::from_str(&lobby_list_json_filtered(&g, Some("G"), None)).unwrap();
         assert_eq!(v["players"].as_array().unwrap().len(), 1);
+    }
+
+    /// A room row carries its host's round trip to this server (reported via
+    /// `automatch_rtt`), so a browser can estimate its own latency to the
+    /// host before joining; -1 until the host has reported one.
+    #[tokio::test]
+    async fn lobby_row_carries_the_host_rtt() {
+        let (hub, _rxs) = signal_hub().await;
+        let mut g = hub.inner.lock().await;
+        let row = |g: &HubInner| -> Value {
+            let v: Value =
+                serde_json::from_str(&lobby_list_json_filtered(g, Some("G"), None)).unwrap();
+            v["lobbies"][0].clone()
+        };
+        g.clients.get_mut("a").unwrap().probe_rtt_ms = -1;
+        assert_eq!(row(&g)["host_rtt_ms"], -1);
+        g.clients.get_mut("a").unwrap().probe_rtt_ms = 42;
+        assert_eq!(row(&g)["host_rtt_ms"], 42);
     }
 
     /// `handle_create` must answer a seated client and RETURN.
