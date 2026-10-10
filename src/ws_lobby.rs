@@ -133,6 +133,13 @@ const SIGNAL_TEXT_MAX: usize = 4096;
 /// The `signal` types the ICE exchange uses (inclusive). Spectators are
 /// not seated players and may not send these.
 const ICE_SIGNAL_TYPES: std::ops::RangeInclusive<i32> = 130..=136;
+/// `probe_signal` types: an ICE agent's own description (RNetSignalType
+/// LOCAL_SDP..SET_CONTROLLING), which the receiver turns into REMOTE_*.
+const PROBE_SIGNAL_TYPES: std::ops::RangeInclusive<i32> = 1..=6;
+/// How long after a browser's last probe signal the host may still answer it.
+const PROBE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+/// Rooms one browser may be probing at once.
+const PROBE_GRANTS_PER_CLIENT: usize = 32;
 
 impl Default for SignalBucket {
     fn default() -> Self {
@@ -251,6 +258,10 @@ struct HubInner {
     /// restart empties the ring, so an id from a previous process simply finds
     /// nothing and the report is refused rather than misattributed.
     next_chat_id: u64,
+    /// Open room-list latency probes: (browser, lobby) -> when the browser
+    /// last signalled that room's host. A host may answer only a browser
+    /// that probed it within `PROBE_GRANT_TTL`. See `handle_probe_signal`.
+    probe_grants: HashMap<(String, String), Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -328,6 +339,7 @@ impl Default for HubInner {
             chat_ring: VecDeque::new(),
             next_chat_id: 1,
             next_session: 1,
+            probe_grants: HashMap::new(),
         }
     }
 }
@@ -1998,6 +2010,7 @@ async fn handle_text(
             }
         }
         "signal" => handle_signal(hub, player_id, msg).await?,
+        "probe_signal" => handle_probe_signal(hub, player_id, msg).await?,
         "mod_signal" => handle_mod_signal(hub, player_id, msg).await?,
         "mod_xfer_start" => handle_mod_xfer_start(hub, player_id, msg).await?,
         "mod_xfer_cancel" => handle_mod_xfer_cancel(hub, player_id).await?,
@@ -5184,6 +5197,84 @@ async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<
     Ok(())
 }
 
+/// Room-list latency probe: relay one ICE exchange between a browser and a
+/// listed room's host, so the browser can time a direct link to the host
+/// before joining (the client pings over it a few times, then closes it).
+///
+/// `signal` cannot carry this: it is confined to seated members of one room,
+/// and a browser has no seat. This path is narrower than that one, not wider:
+/// a browser reaches only the HOST of a room it could see in the list -- not
+/// a password room, whose host's address stays behind the password, nor
+/// across a block -- and a host reaches only a browser that probed it within
+/// `PROBE_GRANT_TTL`. The sender is stamped here, as for `signal`.
+async fn handle_probe_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<(), String> {
+    let (fwd, target) = {
+        let mut g = hub.inner.lock().await;
+        let Some(lid) = msg.lobby_id.clone().filter(|s| !s.is_empty()) else {
+            return Ok(());
+        };
+        let ty = msg.r#type.unwrap_or(0);
+        let text = msg.text.unwrap_or_default();
+        if !PROBE_SIGNAL_TYPES.contains(&ty) || text.len() > SIGNAL_TEXT_MAX {
+            metrics::ws_signal_dropped("probe_bad");
+            return Ok(());
+        }
+        let within_rate = g
+            .clients
+            .get_mut(player_id)
+            .map(|c| c.signal_bucket.allow(Instant::now()))
+            .unwrap_or(false);
+        if !within_rate {
+            metrics::ws_signal_dropped("rate");
+            return Ok(());
+        }
+        let now = Instant::now();
+        g.probe_grants
+            .retain(|_, t| now.saturating_duration_since(*t) < PROBE_GRANT_TTL);
+        let Some(l) = g.lobbies.get(&lid) else {
+            return Ok(());
+        };
+        let host = l.host_player_id.clone();
+        let target = if host == player_id {
+            let to = msg.to_player_id.unwrap_or_default();
+            if !g.probe_grants.contains_key(&(to.clone(), lid.clone())) {
+                debug!(%player_id, %to, "probe signal dropped: no open probe");
+                metrics::ws_signal_dropped("probe_no_grant");
+                return Ok(());
+            }
+            to
+        } else {
+            let closed = l.automatch
+                || l.started
+                || l.password_hash.is_some()
+                || l.seat_of(player_id).is_some();
+            let key = (player_id.to_string(), lid.clone());
+            let at_cap = !g.probe_grants.contains_key(&key)
+                && g.probe_grants.keys().filter(|(b, _)| b == player_id).count()
+                    >= PROBE_GRANTS_PER_CLIENT;
+            if closed || at_cap || blocked_between(&g, player_id, &host) {
+                debug!(%player_id, %lid, "probe signal dropped: room not probeable");
+                metrics::ws_signal_dropped("probe_refused");
+                return Ok(());
+            }
+            g.probe_grants.insert(key, now);
+            host
+        };
+        let fwd = json!({
+            "op": "probe_signal",
+            "lobby_id": lid,
+            "from_player_id": player_id,
+            "type": ty,
+            "flag": msg.flag.unwrap_or(0),
+            "text": text,
+        })
+        .to_string();
+        (fwd, target)
+    };
+    send_to(hub, &target, fwd).await;
+    Ok(())
+}
+
 /// Unused helper kept for future structured Value replies.
 #[allow(dead_code)]
 fn err_json(code: &str) -> Value {
@@ -6396,6 +6487,55 @@ mod hub_lock_tests {
             out.push(serde_json::from_str(&l).unwrap());
         }
         out
+    }
+
+    fn probe(ty: i32, text: &str, to: Option<&str>) -> InMsg {
+        let mut v = json!({ "op": "probe_signal", "lobby_id": "L", "type": ty, "text": text });
+        if let Some(t) = to {
+            v["to_player_id"] = json!(t);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// A browser (x, unseated) reaches the room's host, stamped as itself;
+    /// the host may then answer x -- and only x, the one that probed it.
+    #[tokio::test]
+    async fn a_list_probe_reaches_the_host_and_only_its_prober_hears_back() {
+        let (hub, mut rxs) = signal_hub().await;
+        handle_probe_signal(&hub, "x", probe(1, "offer", None)).await.unwrap();
+        let at_host = drained(&mut rxs[0]);
+        assert_eq!(at_host.len(), 1);
+        assert_eq!(at_host[0]["op"], "probe_signal");
+        assert_eq!(at_host[0]["from_player_id"], "x");
+        assert_eq!(at_host[0]["text"], "offer");
+        for rx in rxs[1..].iter_mut() {
+            assert!(drained(rx).is_empty());
+        }
+        handle_probe_signal(&hub, "a", probe(1, "answer", Some("x"))).await.unwrap();
+        let at_x = drained(&mut rxs[3]);
+        assert_eq!(at_x.len(), 1);
+        assert_eq!(at_x[0]["from_player_id"], "a");
+        assert_eq!(at_x[0]["lobby_id"], "L");
+        // b never probed: the host cannot use this path to reach it.
+        handle_probe_signal(&hub, "a", probe(1, "answer", Some("b"))).await.unwrap();
+        assert!(drained(&mut rxs[1]).is_empty());
+    }
+
+    /// Nobody but the host answers, a seated member has its own link, and a
+    /// password room's host is not exposed to someone without the password.
+    #[tokio::test]
+    async fn a_list_probe_is_refused_where_it_does_not_belong() {
+        let (hub, mut rxs) = signal_hub().await;
+        handle_probe_signal(&hub, "x", probe(1, "offer", None)).await.unwrap();
+        drained(&mut rxs[0]);
+        handle_probe_signal(&hub, "b", probe(1, "answer", Some("x"))).await.unwrap();
+        handle_probe_signal(&hub, "b", probe(1, "offer", None)).await.unwrap();
+        handle_probe_signal(&hub, "x", probe(130, "not ice", None)).await.unwrap();
+        assert!(drained(&mut rxs[3]).is_empty());
+        assert!(drained(&mut rxs[0]).is_empty());
+        hub.inner.lock().await.lobbies.get_mut("L").unwrap().password_hash = Some([0; 32]);
+        handle_probe_signal(&hub, "x", probe(1, "offer", None)).await.unwrap();
+        assert!(drained(&mut rxs[0]).is_empty());
     }
 
     #[tokio::test]
