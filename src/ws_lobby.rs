@@ -1679,7 +1679,20 @@ async fn handle_socket(socket: WebSocket, peer_ip: String, state: AppState) {
         match msg {
             Message::Text(text) => {
                 if let Err(e) = handle_text(&state, &player_id, &peer_ip, &text).await {
-                    warn!(%player_id, error = %e, "ws lobby handler error");
+                    let op = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("op").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_default();
+                    warn!(%player_id, %op, bytes = text.len(), error = %e, "ws lobby handler error");
+                    /* Never leave a client waiting on an op that failed to
+                     * parse or run: say so, so a host is not left "linking". */
+                    send_to(
+                        &hub,
+                        &player_id,
+                        json!({ "op": "error", "code": "bad_request", "request_op": op, "ok": false })
+                            .to_string(),
+                    )
+                    .await;
                 }
                 if !signed_in {
                     let g = hub.inner.lock().await;
@@ -2096,6 +2109,7 @@ async fn handle_get_turn_credentials(hub: &WsLobbyHub, player_id: &str) -> Resul
     let cfg = match turn_credentials::TurnCredentialConfig::from_env() {
         Some(c) => c,
         None => {
+            warn!(%player_id, "turn credentials requested but coturn is not configured");
             send_to(
                 hub,
                 player_id,
@@ -2113,6 +2127,7 @@ async fn handle_get_turn_credentials(hub: &WsLobbyHub, player_id: &str) -> Resul
 
     match turn_credentials::issue_credentials(&cfg, &uuid) {
         Ok((username, password)) => {
+            info!(%player_id, turn_host = %cfg.turn_host, "turn credentials issued");
             metrics::http_turn_credentials_issued();
             send_to(
                 hub,
@@ -3404,10 +3419,12 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
     let lid = match lid {
         Ok(lid) => lid,
         Err(code) => {
+            warn!(%player_id, code, "lobby start rejected before launch");
             send_to(hub, player_id, am_err(code)).await;
             return Ok(());
         }
     };
+    info!(%player_id, lobby_id = %lid, "lobby start requested by host");
     let sent_caps = msg.match_caps.clone();
     if let Err(code) = start_lobby(state, &lid, msg.match_caps, Some(player_id), true).await {
         if code == "relay_unavailable" {
@@ -3435,6 +3452,7 @@ async fn handle_start(state: &AppState, player_id: &str, msg: InMsg) -> Result<(
                 return Ok(());
             }
         }
+        warn!(%player_id, lobby_id = %lid, code, "lobby start failed");
         send_to(hub, player_id, am_err(code)).await;
     }
     Ok(())
@@ -3486,11 +3504,24 @@ async fn start_lobby(
                 break 'prep Err("relay_unavailable");
             }
         };
+        let seats = lobby
+            .slots
+            .iter()
+            .flatten()
+            .map(|s| format!("{}={}", s.display_name, s.player_id))
+            .collect::<Vec<_>>()
+            .join(",");
         info!(
             lobby_id = %lid,
             seated = n,
+            spectators = lobby.spectator_count(),
             reason = path_why,
             transport = ?transport,
+            initiator = initiator.unwrap_or("server"),
+            host = %lobby.host_player_id,
+            host_endpoint = %lobby.host_endpoint,
+            guest_endpoint = %lobby.guest_endpoint,
+            seats = %seats,
             "lobby start transport decision"
         );
         /* The host may watch from the gallery and still run the match. It
@@ -3620,6 +3651,7 @@ async fn start_lobby(
             /* `members` is everyone who gets the launch; the metric wants
              * players. They stopped being the same number when the gallery
              * started launching with the match. */
+            info!(lobby_id = %lid, recipients = ?members, "lobby launch sent");
             for m in members {
                 send_to(hub, &m, msg.clone()).await;
             }
@@ -4195,7 +4227,7 @@ async fn handle_automatch_accept(state: &AppState, player_id: &str, msg: InMsg) 
     )
     .await;
 
-    let Some(p) = state.automatch.answer(player_id, accept).await else {
+    let Some(p) = state.automatch.answer_for(player_id, accept, msg.match_id.as_deref()).await else {
         /* Either not our offer, or the peer has not answered yet. Both are
          * ordinary; the accept_ok above already told the client we heard. */
         return Ok(());
@@ -4988,7 +5020,10 @@ async fn handle_signal(hub: &WsLobbyHub, player_id: &str, msg: InMsg) -> Result<
             .collect();
         (fwd, targets)
     };
-    if !targets.is_empty() {
+    if targets.is_empty() {
+        warn!(%player_id, "ice signal had no recipient");
+    } else {
+        debug!(%player_id, recipients = ?targets, "ice signal relayed");
         metrics::ws_signal_relayed();
     }
     for t in targets {

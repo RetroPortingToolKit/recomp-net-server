@@ -820,10 +820,26 @@ impl Queue {
 
     /// Record an answer. Returns the pending once both sides have spoken.
     pub async fn answer(&self, player_id: &str, accept: bool) -> Option<Pending> {
+        self.answer_for(player_id, accept, None).await
+    }
+
+    /// `answer`, except that a client naming the offer it is answering
+    /// (`match_id`) is ignored when that offer is no longer its pending one --
+    /// a late reply to a lapsed offer must not settle the next. A client that
+    /// names none (older builds) is taken to mean its current offer.
+    pub async fn answer_for(
+        &self,
+        player_id: &str,
+        accept: bool,
+        match_id: Option<&str>,
+    ) -> Option<Pending> {
         let mut g = self.0.lock().await;
         let idx = g.pending.iter().position(|p| p.side(player_id).is_some())?;
         {
             let p = &mut g.pending[idx];
+            if match_id.is_some_and(|m| m != p.match_id) {
+                return None;
+            }
             match p.side(player_id) {
                 Some(true) => p.a_accept = Some(accept),
                 Some(false) => p.b_accept = Some(accept),
