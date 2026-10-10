@@ -1345,6 +1345,14 @@ fn host_relay_decision(lobby: &Lobby, caps: &Option<Value>) -> Result<&'static s
     if lobby.spectator_count() > 0 {
         return Err("host_relay_spectators");
     }
+    /* A room of 3+ over ICE cannot be proven: the waiting-room probe pairs one
+     * peer and reports `path_report` only at two members, and there is no
+     * two-player ICE fallback to drop to. The guests build their agents to the
+     * host at launch (with TURN as the fallback), so the proof is not
+     * required there. Two-player rooms keep it: automatch requeues on it. */
+    if caps_relay_via_ice(caps) && player_count(lobby) > 2 {
+        return Ok("host_relay");
+    }
     for slot in lobby.slots.iter().flatten() {
         if slot.player_id == lobby.relay_host() {
             continue;
@@ -5551,6 +5559,47 @@ mod game_scope_tests {
             );
         }
         seat_path(&mut g, "L", 1, "g", Some("direct"), 1);
+        g.lobbies.get_mut("L").unwrap().spectators = vec![Some(Slot {
+            player_id: "s".into(),
+            display_name: "s".into(),
+            ready: false,
+            bios_offer: None,
+            mod_offer: None,
+            memcard_offer: None,
+            country: String::new(),
+            ice_path: None,
+            ice_path_at: None,
+        })];
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &ice_caps()), Err("host_relay_spectators"));
+    }
+
+    #[test]
+    fn ice_mode_rooms_of_three_or_more_need_no_path_proof() {
+        let mut g = hub_inner();
+        lobby(&mut g, "L", "G");
+        {
+            let l = g.lobbies.get_mut("L").unwrap();
+            l.host_player_id = "h".into();
+            l.max_slots = 4;
+            while l.slots.len() < 4 {
+                l.slots.push(None);
+            }
+        }
+        seat_path(&mut g, "L", 0, "h", None, 0);
+        seat_path(&mut g, "L", 1, "g1", Some("direct"), 1);
+        seat_path(&mut g, "L", 2, "g2", None, 0);
+        seat_path(&mut g, "L", 3, "g3", None, 0);
+        assert_eq!(host_relay_decision(&g.lobbies["L"], &ice_caps()), Ok("host_relay"));
+        assert_eq!(
+            start_transport(&g.lobbies["L"], &ice_caps(), true),
+            Ok((StartTransport::Host, "host_relay"))
+        );
+        // Legacy (non-ICE) caps keep today's refusal.
+        assert_eq!(
+            host_relay_decision(&g.lobbies["L"], &Some(json!({ "relay": "host" }))),
+            Err("host_relay_no_endpoint")
+        );
+        // Spectators are still refused.
         g.lobbies.get_mut("L").unwrap().spectators = vec![Some(Slot {
             player_id: "s".into(),
             display_name: "s".into(),
